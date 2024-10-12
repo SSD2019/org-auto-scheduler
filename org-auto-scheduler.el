@@ -57,7 +57,7 @@
   :type 'string
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-excluded-days '(0 6)
+(defcustom org-auto-scheduler-excluded-days '()
   "List of days to exclude from scheduling. 0 is Sunday, 6 is Saturday."
   :type '(repeat integer)
   :group 'org-auto-scheduler)
@@ -74,7 +74,7 @@
 
 (defcustom org-auto-scheduler-max-days-to-check 14
   "The maximum number of days to look ahead for an available slot."
-  :type 'integer
+  :type 'intege
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-debug nil
@@ -130,13 +130,13 @@ For non-AUTOSCH tasks, consider-for-conflicts is always true."
                                                         t)))
                          (if (string= scheduled-date date-string)
                              (progn
-                               (org-auto-scheduler--log-debug "Agenda item: Task: %s, ID: %s, Scheduled: %s, End: %s, Tags: %s, Consider for conflicts: %s"
-                                                              task-name
-                                                              task-id
-                                                              (format-time-string "%Y-%m-%d %H:%M" scheduled-time)
-                                                              (when task-end-time (format-time-string "%Y-%m-%d %H:%M" task-end-time))
-                                                              tags
-                                                              consider-for-conflicts)
+                               ;; (org-auto-scheduler--log-debug "Agenda item: Task: %s, ID: %s, Scheduled: %s, End: %s, Tags: %s, Consider for conflicts: %s"
+                               ;;                                task-name
+                               ;;                                task-id
+                               ;;                                (format-time-string "%Y-%m-%d %H:%M" scheduled-time)
+                               ;;                                (when task-end-time (format-time-string "%Y-%m-%d %H:%M" task-end-time))
+                               ;;                                tags
+                               ;;                                consider-for-conflicts)
                                (list task-id scheduled-time task-end-time tags consider-for-conflicts task-name))
                            (org-auto-scheduler--log-debug "Task not considered: %s (Scheduled for different date: %s)" task-name scheduled-date)))
                      (org-auto-scheduler--log-debug "Task not considered: %s (Not scheduled)" task-name))))
@@ -198,15 +198,15 @@ it to minutes."
   "Get the scheduled date of TASK."
   (org-entry-get task "SCHEDULED"))
 
-(defun org-auto-scheduler-time-slot-outside-scheduling-hours (start-time end-time)
-  "Check if the time slot from START-TIME to END-TIME is outside scheduling hours."
+(defun org-auto-scheduler-time-slot-within-scheduling-hours (start-time end-time)
+  "Check if the time slot from START-TIME to END-TIME is within scheduling hours."
   (let* ((start-minutes (org-duration-to-minutes (format-time-string "%H:%M" start-time)))
          (end-minutes (org-duration-to-minutes (format-time-string "%H:%M" end-time)))
          (scheduler-start-minutes (org-duration-to-minutes org-auto-scheduler-start-time))
          (scheduler-end-minutes (org-duration-to-minutes org-auto-scheduler-end-time)))
-    (or (< start-minutes scheduler-start-minutes)
-        (> end-minutes scheduler-end-minutes))))
-        
+    (and (>= start-minutes scheduler-start-minutes)
+         (<= end-minutes scheduler-end-minutes))))
+
 (defun org-auto-scheduler-get-clocked-time (marker)
   "Get the total clocked time for the task at MARKER in minutes, including current clock,
 but only considering time after the last DONE, NOTE, or DROPPED state change."
@@ -323,19 +323,20 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
           (setq current-pos (1+ current-pos)))
         current-pos))))
 
+(defun org-auto-scheduler-get-project-id (marker)
+  "Get the ID of the nearest ancestor with a :PROJECT: tag for the task at MARKER."
+  (save-excursion
+    (with-current-buffer (marker-buffer marker)
+      (goto-char (marker-position marker))
+      (let ((project-id nil))
+        (while (and (not project-id) (org-up-heading-safe))
+          (when (member "PROJECT" (org-get-tags nil t))
+            (setq project-id (org-id-get))))
+        project-id))))
+
 (defun org-auto-scheduler-sort-tasks (tasks)
-  "Sort TASKS based on their calculated scores, parent tasks, and sibling order."
+  "Sort TASKS based on their project, calculated scores, and sibling order within projects."
   (org-auto-scheduler--log-debug "Starting task sorting. Total tasks: %d" (length tasks))
-  
-  ;; Log all tasks before sorting
-  (org-auto-scheduler--log-debug "Tasks before sorting:")
-  (dolist (marker tasks)
-    (org-with-point-at marker
-      (let ((task-id (org-id-get))
-            (task-name (org-get-heading t t t t))
-            (tags (org-get-tags)))
-        (org-auto-scheduler--log-debug "  ID: %s, Name: %s, Tags: %s"
-                                       task-id task-name tags))))
   
   (let* ((tasks-with-info
           (mapcar (lambda (marker)
@@ -343,57 +344,79 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                       (let* ((task-id (org-id-get))
                              (task-name (org-get-heading t t t t))
                              (tags (org-get-tags))
-                             (score (org-auto-scheduler-calculate-score marker)))
+                             (score (org-auto-scheduler-calculate-score marker))
+                             (project-id (org-auto-scheduler-get-project-id marker))
+                             (hierarchy-position (org-auto-scheduler-get-hierarchy-position marker)))
                         (list marker
                               score
-                              (org-auto-scheduler-get-parent-id marker)
-                              (org-auto-scheduler-get-task-position marker)
+                              project-id
+                              hierarchy-position
                               task-id
                               task-name
                               tags))))
                   tasks))
-         (tasks-with-info-and-position
-          (cl-loop for task in tasks-with-info
-                   for pos from 0
-                   collect (cons pos task)))
          (sorted-tasks
-          (sort tasks-with-info-and-position
+          (sort tasks-with-info
                 (lambda (a b)
-                  (let ((score-a (nth 2 a))
-                        (score-b (nth 2 b))
-                        (parent-a (nth 3 a))
-                        (parent-b (nth 3 b))
-                        (sibling-pos-a (nth 4 a))
-                        (sibling-pos-b (nth 4 b))
-                        (file-pos-a (car a))
-                        (file-pos-b (car b)))
+                  (let ((project-a (nth 2 a))
+                        (project-b (nth 2 b))
+                        (hierarchy-a (nth 3 a))
+                        (hierarchy-b (nth 3 b))
+                        (score-a (nth 1 a))
+                        (score-b (nth 1 b)))
                     (cond
-                     ((and parent-a parent-b (equal parent-a parent-b))
-                      (< sibling-pos-a sibling-pos-b))
+                     ;; First, sort by project
+                     ((and project-a project-b (not (equal project-a project-b)))
+                      (string< project-a project-b))
+                     ;; Within the same project, sort by hierarchy
+                     ((and project-a project-b (equal project-a project-b))
+                      (org-auto-scheduler-compare-hierarchy hierarchy-a hierarchy-b))
+                     ;; If no project, sort by score
                      ((not (= score-a score-b))
                       (> score-a score-b))
-                     (t (< file-pos-a file-pos-b))))))))
+                     ;; If scores are equal, maintain original order
+                     (t nil)))))))
     
     ;; Log all tasks after sorting
     (org-auto-scheduler--log-debug "Tasks after sorting:")
     (dolist (task sorted-tasks)
-      (let ((task-info (cdr task)))
-        (org-auto-scheduler--log-debug "  ID: %s, Name: %s, Tags: %s, Score: %s"
-                                       (nth 5 task-info)
-                                       (nth 6 task-info)
-                                       (nth 7 task-info)
-                                       (nth 1 task-info))))
+      (org-auto-scheduler--log-debug "  ID: %s, Name: %s, Tags: %s, Score: %s, Project: %s, Hierarchy: %s"
+                                     (nth 4 task)
+                                     (nth 5 task)
+                                     (nth 6 task)
+                                     (nth 1 task)
+                                     (nth 2 task)
+                                     (nth 3 task)))
     
     (org-auto-scheduler--log-debug "Finished sorting tasks. Sorted tasks: %d" (length sorted-tasks))
-    (mapcar #'cadr sorted-tasks)))
+    (mapcar #'car sorted-tasks)))
 
-(defun org-auto-scheduler-time-in-range-p (time)
-  "Check if TIME is within the scheduling range."
-  (let* ((time-str (format-time-string "%H:%M" time))
-         (start (org-duration-to-minutes org-auto-scheduler-start-time))
-         (end (org-duration-to-minutes org-auto-scheduler-end-time))
-         (current (org-duration-to-minutes time-str)))
-    (and (>= current start) (< current end))))
+(defun org-auto-scheduler-get-hierarchy-position (marker)
+  "Get the hierarchical position of the task at MARKER within its project."
+  (save-excursion
+    (with-current-buffer (marker-buffer marker)
+      (goto-char (marker-position marker))
+      (let ((positions '()))
+        (while (and (org-up-heading-safe)
+                    (not (member "PROJECT" (org-get-tags nil t))))
+          (push (org-auto-scheduler-get-task-position (point-marker)) positions))
+        (nreverse positions)))))
+
+(defun org-auto-scheduler-compare-hierarchy (h1 h2)
+  "Compare two hierarchy positions H1 and H2."
+  (let ((result nil))
+    (while (and (not result) h1 h2)
+      (cond
+       ((< (car h1) (car h2)) (setq result 'less))
+       ((> (car h1) (car h2)) (setq result 'greater))
+       (t (setq h1 (cdr h1)
+                h2 (cdr h2)))))
+    (cond
+     ((eq result 'less) t)
+     ((eq result 'greater) nil)
+     (h1 nil)  ; h1 is longer, so it comes after h2
+     (h2 t)    ; h2 is longer, so it comes after h1
+     (t nil))))  ; They are equal, maintain original order
 
 (defun org-auto-scheduler-time-slot-occupied-p (start-time duration &optional ignore-id)
   "Check if the time slot starting at START-TIME for DURATION minutes is occupied."
@@ -424,46 +447,39 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
 
 (defun org-auto-scheduler-next-available-time (start-time duration)
   "Find the next available time slot starting from START-TIME for DURATION minutes."
+  (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Finding next available time after %s for %d minutes"
+                                 (format-time-string "%Y-%m-%d %H:%M" start-time) duration)
   (let ((current-time start-time)
-        (found-slot nil))
-    (while (and (not found-slot)
-                (time-less-p current-time (time-add start-time (days-to-time org-auto-scheduler-max-days-to-check))))
-      (let ((end-time (time-add current-time (seconds-to-time (* 60 duration)))))
-        (if (org-auto-scheduler-time-slot-outside-scheduling-hours current-time end-time)
-            (setq current-time (org-auto-scheduler-next-day-start current-time))
-          (if (not (org-auto-scheduler-time-slot-occupied-p current-time duration))
-              (setq found-slot current-time)
-            (setq current-time (org-auto-scheduler-next-valid-time 
-                                (time-add current-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))))))))
-    found-slot))
-
-(defun org-auto-scheduler-next-valid-time (time)
-  "Find the next valid time slot after TIME.
-This function moves the time forward to the next valid slot,
-skipping excluded days and times outside of working hours."
-  (org-auto-scheduler--log-debug "[org-auto-scheduler-next-valid-time] Finding next valid time after %s"
-                                 (format-time-string "%Y-%m-%d %H:%M" time))
-  (let* ((day-start (org-auto-scheduler-time-with-time-string time org-auto-scheduler-start-time))
-         (day-end (org-auto-scheduler-time-with-time-string time org-auto-scheduler-end-time))
-         (day-of-week (string-to-number (format-time-string "%w" time)))
-         (next-time (if (time-equal-p time day-start)
-                        time
-                      (time-add time (seconds-to-time (* 60 org-auto-scheduler-time-interval))))))
-    (cond
-     ((member day-of-week org-auto-scheduler-excluded-days)
-      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-valid-time] Day %d is excluded, moving to next day" day-of-week)
-      (org-auto-scheduler-next-valid-time (org-auto-scheduler-next-day time)))
-     ((time-less-p next-time day-start)
-      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-valid-time] Next time is before day start, setting to day start")
-      day-start)
-     ((time-less-p day-end next-time)
-      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-valid-time] Next time is after day end, moving to next day start")
-      (org-auto-scheduler-next-valid-time 
-       (org-auto-scheduler-time-with-time-string (org-auto-scheduler-next-day time) org-auto-scheduler-start-time)))
-     (t 
-      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-valid-time] Next valid time found: %s"
-                                     (format-time-string "%Y-%m-%d %H:%M" next-time))
-      next-time))))
+        (found-slot nil)
+        (max-time (time-add start-time (days-to-time org-auto-scheduler-max-days-to-check))))
+    (while (and (not found-slot) (time-less-p current-time max-time))
+      (let* ((day-start (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-start-time))
+             (day-end (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-end-time))
+             (day-of-week (string-to-number (format-time-string "%w" current-time)))
+             (end-time (time-add current-time (seconds-to-time (* 60 duration)))))
+        (cond
+         ((member day-of-week org-auto-scheduler-excluded-days)
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Day %d is excluded, moving to next day" day-of-week)
+          (setq current-time (org-auto-scheduler-next-day current-time)))
+         ((time-less-p current-time day-start)
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Current time is before day start, setting to day start")
+          (setq current-time day-start))
+         ((time-less-p day-end end-time)
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] End time is after day end, moving to next day start")
+          (setq current-time (org-auto-scheduler-next-day-start current-time)))
+         ((org-auto-scheduler-time-slot-occupied-p current-time duration)
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Time slot occupied, moving to next interval")
+          (setq current-time (time-add current-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))))
+         (t
+          (setq found-slot current-time)))))
+    (if found-slot
+        (progn
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Found available time slot: %s"
+                                         (format-time-string "%Y-%m-%d %H:%M" found-slot))
+          found-slot)
+      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] No available time slot found within %d days"
+                                     org-auto-scheduler-max-days-to-check)
+      nil)))
 
 (defun org-auto-scheduler-next-day (time)
   "Get the start of the next day after TIME."
@@ -595,10 +611,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
       (time-add now (seconds-to-time 900)))))
 
 (defun org-auto-scheduler-schedule-tasks ()
-  "Schedule all schedulable tasks.
-This function is the entry point for the auto-scheduling process.
-It clears previously auto-scheduled times, gets schedulable tasks,
-sorts them, and then attempts to schedule each task."
+  "Schedule all schedulable tasks, grouping them by project."
   (interactive)
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
   (condition-case err
@@ -608,12 +621,22 @@ sorts them, and then attempts to schedule each task."
                (sorted-tasks (org-auto-scheduler-sort-tasks tasks))
                (current-time (org-auto-scheduler-get-start-time))
                (tasks-scheduled 0)
-               (total-tasks (length sorted-tasks)))
+               (total-tasks (length sorted-tasks))
+               (previous-project nil)) ; Initialize previous-project
           (dolist (marker sorted-tasks)
-            (setq current-time (org-auto-scheduler-schedule-single-task marker current-time))
-            (setq tasks-scheduled (1+ tasks-scheduled))
-            (when (zerop (mod tasks-scheduled 10))
-              (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks)))
+            (let ((task-project (org-auto-scheduler-get-project-id marker)))
+              ;; Reset current-time if project changes OR if no project is set
+              (when (or (and task-project (not (equal task-project previous-project)))
+                        (and (null task-project) (not (null previous-project))))
+                (setq current-time (org-auto-scheduler-get-start-time))
+                (setq previous-project task-project) ; Update previous-project
+                (org-auto-scheduler--log-debug "Project changed or no project set. Resetting current time to %s"
+                                               (format-time-string "%Y-%m-%d %H:%M" current-time)))
+
+              (setq current-time (org-auto-scheduler-schedule-single-task marker current-time))
+              (setq tasks-scheduled (1+ tasks-scheduled))
+              (when (zerop (mod tasks-scheduled 10))
+                (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)))
     (error
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
@@ -651,7 +674,7 @@ existing scheduled tasks."
                                    10  ; Set to 10 minutes if clocked time exceeds total effort
                                  (max 10 (- total-effort clocked-time))))  ; Ensure minimum of 10 minutes
              (time-block (org-auto-scheduler-get-task-tag-block marker))
-             (available-time current-time)
+             (available-time (org-auto-scheduler-next-available-time current-time remaining-effort))
              (end-time nil)
              (attempts 0)
              (max-attempts (* 7 24 60)) ; 7 days in minutes
@@ -661,9 +684,6 @@ existing scheduled tasks."
                                        total-effort clocked-time remaining-effort time-block is-currently-clocked)
         (while (and (not end-time) (< attempts max-attempts))
           (setq attempts (1+ attempts))
-          (if time-block
-              (setq available-time (org-auto-scheduler-next-available-time-in-block available-time time-block))
-            (setq available-time (org-auto-scheduler-next-available-time available-time remaining-effort)))
           (when available-time
             (setq end-time (time-add available-time (seconds-to-time (* 60 remaining-effort))))
             (when (org-auto-scheduler-time-slot-occupied-p available-time remaining-effort task-id)
@@ -671,7 +691,9 @@ existing scheduled tasks."
                                              (format-time-string "%Y-%m-%d %H:%M" available-time)
                                              (format-time-string "%Y-%m-%d %H:%M" end-time))
               (setq end-time nil)
-              (setq available-time (time-add available-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))))))
+              (setq available-time (org-auto-scheduler-next-available-time
+                                    (time-add available-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))
+                                    remaining-effort)))))
         (if end-time
             (progn
               (let* ((start-day (format-time-string "%Y-%m-%d" available-time))
@@ -823,14 +845,5 @@ configuration variables and raises errors if any are found."
 
 ;; Call this function when the package is loaded
 (org-auto-scheduler-validate-config)
-
-(defun org-auto-scheduler-time-slot-outside-scheduling-hours (start-time end-time)
-  "Check if the time slot from START-TIME to END-TIME is outside scheduling hours."
-  (let* ((start-minutes (org-duration-to-minutes (format-time-string "%H:%M" start-time)))
-         (end-minutes (org-duration-to-minutes (format-time-string "%H:%M" end-time)))
-         (scheduler-start-minutes (org-duration-to-minutes org-auto-scheduler-start-time))
-         (scheduler-end-minutes (org-duration-to-minutes org-auto-scheduler-end-time)))
-    (or (< start-minutes scheduler-start-minutes)
-        (> end-minutes scheduler-end-minutes))))
 
 (provide 'org-auto-scheduler)
