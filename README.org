@@ -7,9 +7,10 @@ Org Auto Scheduler is an Emacs plugin that automatically schedules tasks in your
 - Automatically schedules tasks with the =AUTOSCH= tag
 - Considers task priority, deadline, effort, and current state
 - Supports custom time blocks for specific tags
-- Adaptive scheduling based on task completion history
 - Respects existing scheduled tasks and avoids conflicts
 - Customizable scheduling parameters
+- Handles project-based task grouping and ordering
+- Considers clocked time when calculating remaining effort
 
 ** Usage
 
@@ -25,10 +26,12 @@ You can also bind this command to a key combination, for example:
 
 *** General Settings
 
-- =org-auto-scheduler-start-time=: Start time for scheduling tasks (default: "05:00")
-- =org-auto-scheduler-end-time=: End time for scheduling tasks (default: "23:59")
-- =org-auto-scheduler-task-gap=: Gap between scheduled tasks in minutes (default: 10)
-- =org-auto-scheduler-max-days-to-check=: Maximum number of days to look ahead for scheduling (default: 7)
+- =org-auto-scheduler-start-time=: Start time for scheduling tasks (default: "09:00")
+- =org-auto-scheduler-end-time=: End time for scheduling tasks (default: "17:00")
+- =org-auto-scheduler-task-gap=: Gap between scheduled tasks in minutes (default: 5)
+- =org-auto-scheduler-max-days-to-check=: Maximum number of days to look ahead for scheduling (default: 14)
+- =org-auto-scheduler-time-interval=: Interval in minutes for checking time slots (default: 15)
+- =org-auto-scheduler-excluded-days=: List of days to exclude from scheduling (0 is Sunday, 6 is Saturday)
 
 *** Scoring Weights
 
@@ -40,7 +43,7 @@ You can also bind this command to a key combination, for example:
 *** Task States
 
 - =org-auto-scheduler-state-weights=: Alist of weights for different TODO states
-  Default: =(("TODO" . 0) ("NEXT" . 1) ("IN-PROGRESS" . 2) ("WRITE" . 0) ("LATER" . -10))=
+  Default: =(("TODO" . 0) ("NEXT" . 1) ("IN-PROGRESS" . 2) ("WRITE" . 0) ("LATER" . -10) ("BUY" . 0) ("READ" . 0))=
 
 *** Time Blocks
 
@@ -52,18 +55,21 @@ You can also bind this command to a key combination, for example:
     ("CHORES" . (("19:00" . "20:00"))))
   #+end_src
 
-*** Adaptive Scheduling
+*** Other Settings
 
-- =org-auto-scheduler-adaptive-factor=: Factor for adjusting adaptive scores (default: 0.1)
+- =org-auto-scheduler-inherited-priority-property=: Property name for setting inherited priority for subtasks (default: "INHERITED_PRIORITY")
+- =org-auto-scheduler-scheduled-property=: Property name to mark AUTOSCH tasks that have been scheduled in the current session (default: "AUTOSCH_SCHEDULED")
+- =org-auto-scheduler-default-task-duration=: Default duration in minutes for tasks without an explicit effort (default: 60)
 
 ** How It Works
 
 1. The plugin clears existing scheduled times for tasks with the =AUTOSCH= tag.
 2. It collects all schedulable tasks (those with =AUTOSCH= tag and valid TODO states).
-3. Tasks are sorted based on a calculated score considering priority, deadline, effort, and state.
+3. Tasks are sorted based on a calculated score considering priority, deadline, effort, state, and project grouping.
 4. Each task is scheduled in the next available time slot, respecting time blocks if applicable.
 5. The plugin avoids conflicts with existing scheduled tasks and maintains gaps between tasks.
-6. Adaptive scheduling adjusts task scores based on past completion times.
+6. It considers clocked time when calculating remaining effort for tasks.
+7. Project-based tasks are grouped and scheduled together.
 
 ** Debugging
 
@@ -78,4 +84,14 @@ This will run the scheduler with detailed logging and open the log buffer for in
 - Ensure that tasks have appropriate effort estimates for accurate scheduling.
 - The plugin respects existing scheduled tasks and will not overwrite them.
 - Time blocks allow you to restrict certain types of tasks to specific time ranges.
-- Adaptive scheduling learns from your task completion patterns and adjusts future scheduling accordingly.
+- The scheduler now considers project grouping and task hierarchy when scheduling.
+- Clocked time is taken into account when calculating remaining effort for tasks.
+- The plugin validates configuration settings to ensure consistency.
+
+** Recent Changes
+
+- Added project-based task grouping and ordering
+- Implemented consideration of clocked time for remaining effort calculation
+- Improved handling of tasks without explicit effort estimates
+- Enhanced debug logging for better troubleshooting
+- Added configuration validation to catch potential issues early
