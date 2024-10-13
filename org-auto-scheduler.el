@@ -503,24 +503,29 @@ If occupied, return the end time of the conflicting task. Otherwise, return nil.
   (let ((decoded (decode-time time)))
     (apply #'encode-time (append (list 0 0 hour) (nthcdr 3 decoded)))))
 
-(defun org-auto-scheduler-next-available-time-in-block (current-time time-block)
-  (when org-auto-scheduler-debug
-    (message "DEBUG [org-auto-scheduler-next-available-time-in-block]: Searching for next available time in block %s to %s from %s"
-             (car time-block) (cdr time-block) (format-time-string "%Y-%m-%d %H:%M" current-time)))
-  (let* ((block-start (org-auto-scheduler-parse-time-string (car time-block)))
-         (block-end (org-auto-scheduler-parse-time-string (cdr time-block)))
-         (next-time (org-auto-scheduler-next-time-in-block current-time block-start block-end)))
+(defun org-auto-scheduler-next-available-time-in-block (current-time blocks)
+  "Find the next available time in the specified BLOCKS after CURRENT-TIME. Returns nil if no time is found within the blocks."
+  (let* ((current-minutes (+ (* (nth 2 (decode-time current-time)) 60)
+                             (nth 1 (decode-time current-time))))
+         (current-day (time-to-days current-time))
+         (next-time nil)
+         (days-checked 0))
+    (while (and (not next-time) (< days-checked org-auto-scheduler-max-days-to-check))
+      (cl-loop for (start . end) in blocks
+               for start-minutes = (org-auto-scheduler-time-to-minutes start)
+               for end-minutes = (org-auto-scheduler-time-to-minutes end)
+               when (< current-minutes start-minutes)
+               do (setq next-time (org-auto-scheduler-minutes-to-time start-minutes))
+               and do (return)
+               finally (progn
+                         (setq current-minutes 0)
+                         (setq current-day (1+ current-day))
+                         (setq days-checked (1+ days-checked)))))
     (if next-time
-        (progn
-          (when org-auto-scheduler-debug
-            (message "DEBUG [org-auto-scheduler-next-available-time-in-block]: Next time in block found at %s"
-                     (format-time-string "%Y-%m-%d %H:%M" next-time)))
-          next-time)
-      (when org-auto-scheduler-debug
-        (message "DEBUG [org-auto-scheduler-next-available-time-in-block]: No time found in current block, moving to next day"))
-      (org-auto-scheduler-next-available-time-in-block
-       (org-auto-scheduler-next-day current-time)
-       time-block))))
+        (let ((date-str (format-time-string "%Y-%m-%d" (days-to-time current-day)))
+              (time-str next-time))
+          (org-time-string-to-time (concat date-str " " time-str)))
+      nil)))
 
 (defun org-auto-scheduler-calculate-task-end-time (&optional pom)
   "Get the end time of the entry at POM based on its scheduled time and effort.
@@ -647,7 +652,9 @@ existing scheduled tasks."
                                    10  ; Set to 10 minutes if clocked time exceeds total effort
                                  (max 10 (- total-effort clocked-time))))  ; Ensure minimum of 10 minutes
              (time-block (org-auto-scheduler-get-task-tag-block marker))
-             (available-time (org-auto-scheduler-next-available-time current-time remaining-effort))
+             (available-time (if time-block
+                                  (org-auto-scheduler-next-available-time-in-block current-time time-block)
+                                current-time))
              (end-time nil)
              (attempts 0)
              (max-attempts (* 7 24 60)) ; 7 days in minutes
@@ -665,7 +672,9 @@ existing scheduled tasks."
                                                (format-time-string "%Y-%m-%d %H:%M" available-time)
                                                (format-time-string "%Y-%m-%d %H:%M" occupied-result))
                 (setq end-time nil)
-                (setq available-time (org-auto-scheduler-next-available-time occupied-result remaining-effort))))))
+                (setq available-time (if time-block
+                                          (org-auto-scheduler-next-available-time-in-block occupied-result time-block)
+                                        (org-auto-scheduler-next-available-time occupied-result remaining-effort)))))))
         (if end-time
             (progn
               (let* ((start-day (format-time-string "%Y-%m-%d" available-time))
@@ -725,30 +734,6 @@ existing scheduled tasks."
                (when (member (car tag-block) tags)
                  (cdr tag-block)))
              org-auto-scheduler-time-blocks)))
-
-(defun org-auto-scheduler-next-available-time-in-block (current-time blocks)
-  "Find the next available time in the specified BLOCKS after CURRENT-TIME."
-  (let* ((current-minutes (+ (* (nth 2 (decode-time current-time)) 60)
-                             (nth 1 (decode-time current-time))))
-         (current-day (time-to-days current-time))
-         (next-time nil)
-         (days-checked 0))
-    (while (and (not next-time) (< days-checked org-auto-scheduler-max-days-to-check))  ;; Use customizable variable
-      (cl-loop for (start . end) in blocks
-               for start-minutes = (org-auto-scheduler-time-to-minutes start)
-               for end-minutes = (org-auto-scheduler-time-to-minutes end)
-               when (< current-minutes start-minutes)
-               do (setq next-time (org-auto-scheduler-minutes-to-time start-minutes))
-               and return nil
-               finally (progn
-                         (setq current-minutes 0)
-                         (setq current-day (1+ current-day))
-                         (setq days-checked (1+ days-checked)))))
-    (if next-time
-        (org-time-string-to-time (format "<%Y-%m-%d %s>"
-                                         (format-time-string "%Y-%m-%d" (days-to-time current-day))
-                                         next-time))
-      (org-auto-scheduler-next-available-time current-time 15)))) ; Fallback to regular scheduling
 
 (defun org-auto-scheduler-time-fits-block-p (start-time end-time block)
   "Check if the time range fits within the given block."
