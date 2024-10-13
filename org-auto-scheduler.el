@@ -108,28 +108,43 @@ Times should be in 24-hour format."
   "List of AUTOSCH tasks that have been scheduled in the current process.")
 
 (defun org-auto-scheduler-get-agenda-items (date)
-  "Get agenda items for DATE.
-Returns a list of (task-id scheduled-time end-time tags consider-for-conflicts task-name) for each scheduled task.
-For AUTOSCH tasks, consider-for-conflicts is true if the task is not marked as scheduled.
-For non-AUTOSCH tasks, consider-for-conflicts is always true."
+  "Get agenda items for DATE.  Includes tasks with active timestamps."
   (condition-case err
       (let* ((date-string (format-time-string "%Y-%m-%d" date))
              (agenda-items
               (delq nil
-                    (org-map-entries
-                     (lambda ()
-                       (let* ((task-name (org-get-heading t t t t))
-                              (scheduled-time-str (org-entry-get nil "SCHEDULED"))
-                              (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
-                              (task-id (org-id-get))
-                              (tags (org-get-tags)))
-                         (when (and scheduled-time (not (member "AUTOSCH" tags)))
-                           (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
-                                  (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
-                             (when (string= scheduled-date date-string)
-                               (list task-id scheduled-time task-end-time tags t task-name))))))
-                     nil
-                     'agenda))))
+                    (append
+                     ;; Scheduled tasks
+                     (org-map-entries
+                      (lambda ()
+                        (let* ((task-name (org-get-heading t t t t))
+                               (scheduled-time-str (org-entry-get nil "SCHEDULED"))
+                               (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
+                               (task-id (org-id-get))
+                               (tags (org-get-tags)))
+                          (when (and scheduled-time (not (member "AUTOSCH" tags)))
+                            (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
+                                   (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                              (when (string= scheduled-date date-string)
+                                (list task-id scheduled-time task-end-time tags t task-name))))))
+                      nil
+                      'agenda)
+                     ;; Tasks with active timestamps
+                     (org-map-entries
+                      (lambda ()
+                        (let* ((task-name (org-get-heading t t t t))
+                               (scheduled-time-str (org-entry-get nil "TIMESTAMP"))
+                               (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
+                               (task-id (org-id-get))
+                               (tags (org-get-tags)))
+                          (when (and scheduled-time (not (member "AUTOSCH" tags)))
+                            (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
+                                   (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                              (when (string= scheduled-date date-string)
+                                (list task-id scheduled-time task-end-time tags t task-name))))))
+                      nil
+                      'agenda)
+                      ))))
         ;; Add completed AUTOSCH tasks for the current date
         (dolist (task org-auto-scheduler-completed-tasks)
           (let ((task-date (format-time-string "%Y-%m-%d" (nth 1 task))))
@@ -417,8 +432,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
      (t nil))))  ; They are equal, maintain original order
      
 (defun org-auto-scheduler-time-slot-occupied-p (start-time duration &optional ignore-id)
-  "Check if the time slot starting at START-TIME for DURATION minutes is occupied.
-If occupied, return the end time of the conflicting task. Otherwise, return nil."
+  "Check if the time slot is occupied, considering active timestamps and ignoring all-day tasks."
   (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
          (agenda-items (org-auto-scheduler-get-agenda-items start-time))
          (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
@@ -440,17 +454,15 @@ If occupied, return the end time of the conflicting task. Otherwise, return nil.
                (consider-for-conflicts (nth 4 item))
                (task-name (nth 5 item))
                (is-autosch (member "AUTOSCH" tags))
+               (has-time (string-match "[0-9][0-9]:[0-9][0-9]" (format-time-string "%H:%M" task-start)))
                (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
                (task-end-with-gap (time-add task-end (seconds-to-time (* 60 org-auto-scheduler-task-gap)))))
-          (org-auto-scheduler--log-debug "  Comparing with task: %s (%s to %s)" 
-                                         task-name
-                                         (format-time-string "%Y-%m-%d %H:%M" task-start-with-gap)
-                                         (format-time-string "%Y-%m-%d %H:%M" task-end-with-gap))
           (when (and (not (equal task-id ignore-id))
                      (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                     has-time
                      (time-less-p start-time task-end-with-gap)
                      (time-less-p task-start-with-gap end-time))
-            (org-auto-scheduler--log-debug "    Conflict detected")
+            (org-auto-scheduler--log-debug "    Conflict detected with task: %s" task-name)
             task-end-with-gap)))
       agenda-items))))
 
@@ -532,7 +544,7 @@ If occupied, return the end time of the conflicting task. Otherwise, return nil.
 If POM is nil, use the current point."
   (save-excursion
     (when pom (goto-char pom))
-    (let* ((scheduled-string (org-entry-get nil "SCHEDULED"))
+    (let* ((scheduled-string (or (org-entry-get nil "SCHEDULED") (org-entry-get nil "TIMESTAMP")))
            (effort (or (org-auto-scheduler-get-effort nil) 60)))
       (when scheduled-string
         (cond
