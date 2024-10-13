@@ -415,44 +415,44 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
      (h1 nil)  ; h1 is longer, so it comes after h2
      (h2 t)    ; h2 is longer, so it comes after h1
      (t nil))))  ; They are equal, maintain original order
-
+     
 (defun org-auto-scheduler-time-slot-occupied-p (start-time duration &optional ignore-id)
-  "Check if the time slot starting at START-TIME for DURATION minutes is occupied."
+  "Check if the time slot starting at START-TIME for DURATION minutes is occupied.
+If occupied, return the end time of the conflicting task. Otherwise, return nil."
   (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
-         (start-with-gap (time-subtract start-time (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
-         (end-with-gap (time-add end-time (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
          (agenda-items (org-auto-scheduler-get-agenda-items start-time))
          (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
          (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time)))
-    (org-auto-scheduler--log-debug "In org-auto-scheduler-time-slot-occupied-p: Agenda items for time slot %s to %s:"
+    (org-auto-scheduler--log-debug "Checking time slot %s to %s"
                                    (format-time-string "%Y-%m-%d %H:%M" start-time)
                                    (format-time-string "%Y-%m-%d %H:%M" end-time))
-    (dolist (item agenda-items)
-      (org-auto-scheduler--log-debug "  Task ID: %s, Scheduled: %s, End: %s, Tags: %s, Consider for conflicts: %s, Task Name: %s"
-                                     (nth 0 item)
-                                     (format-time-string "%Y-%m-%d %H:%M" (nth 1 item))
-                                     (when (nth 2 item) (format-time-string "%Y-%m-%d %H:%M" (nth 2 item)))
-                                     (nth 3 item)
-                                     (nth 4 item)))
-    (or (time-less-p start-time day-start)
-        (time-less-p day-end end-time)
-        (cl-some (lambda (item)
-                   (let* ((task-id (nth 0 item))
-                          (task-start (nth 1 item))
-                          (task-end (nth 2 item))
-                          (tags (nth 3 item))
-                          (consider-for-conflicts (nth 4 item))
-                          (task-name (nth 5 item))
-                          (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
-                          (task-end-with-gap (time-add task-end (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
-                          (is-autosch (member "AUTOSCH" tags)))
-                     (and (not (equal task-id ignore-id))
-                          (or (not is-autosch) (and is-autosch consider-for-conflicts))
-                          (or (and (time-less-p start-with-gap task-end-with-gap)
-                                   (time-less-p task-start-with-gap end-with-gap))
-                              (and (time-less-p task-start-with-gap start-with-gap)
-                                   (time-less-p start-with-gap task-end-with-gap))))))
-                 agenda-items))))
+    (or 
+     ;; Check day boundaries
+     (and (time-less-p start-time day-start) day-start)
+     (and (time-less-p day-end end-time) day-end)
+     ;; Check conflicts with existing tasks
+     (cl-some 
+      (lambda (item)
+        (let* ((task-id (nth 0 item))
+               (task-start (nth 1 item))
+               (task-end (nth 2 item))
+               (tags (nth 3 item))
+               (consider-for-conflicts (nth 4 item))
+               (task-name (nth 5 item))
+               (is-autosch (member "AUTOSCH" tags))
+               (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
+               (task-end-with-gap (time-add task-end (seconds-to-time (* 60 org-auto-scheduler-task-gap)))))
+          (org-auto-scheduler--log-debug "  Comparing with task: %s (%s to %s)" 
+                                         task-name
+                                         (format-time-string "%Y-%m-%d %H:%M" task-start-with-gap)
+                                         (format-time-string "%Y-%m-%d %H:%M" task-end-with-gap))
+          (when (and (not (equal task-id ignore-id))
+                     (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                     (time-less-p start-time task-end-with-gap)
+                     (time-less-p task-start-with-gap end-time))
+            (org-auto-scheduler--log-debug "    Conflict detected")
+            task-end-with-gap)))
+      agenda-items))))
 
 (defun org-auto-scheduler-next-available-time (start-time duration)
   "Find the next available time slot starting from START-TIME for DURATION minutes."
@@ -465,7 +465,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
       (let* ((day-start (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-start-time))
              (day-end (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-end-time))
              (day-of-week (string-to-number (format-time-string "%w" current-time)))
-             (end-time (time-add current-time (seconds-to-time (* 60 duration)))))
+             (end-time (time-add current-time (seconds-to-time (* 60 duration))))
+             (occupied-result (org-auto-scheduler-time-slot-occupied-p current-time duration)))
+        (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Attempting to find next available time slot starting from %s for %d minutes, original start %s"
+                                       (format-time-string "%Y-%m-%d %H:%M" current-time) duration (format-time-string "%Y-%m-%d %H:%M" start-time))
         (cond
          ((member day-of-week org-auto-scheduler-excluded-days)
           (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Day %d is excluded, moving to next day" day-of-week)
@@ -476,9 +479,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
          ((time-less-p day-end end-time)
           (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] End time is after day end, moving to next day start")
           (setq current-time (org-auto-scheduler-next-day-start current-time)))
-         ((org-auto-scheduler-time-slot-occupied-p current-time duration)
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Time slot occupied, moving to next interval")
-          (setq current-time (time-add current-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))))
+         (occupied-result
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Time slot occupied, moving to %s"
+                                         (format-time-string "%Y-%m-%d %H:%M" occupied-result))
+          (setq current-time occupied-result))
          (t
           (setq found-slot current-time)))))
     (if found-slot
@@ -553,31 +557,6 @@ If POM is nil, use the current point."
          (start-time-str (concat next-day-str " " org-auto-scheduler-start-time)))
     (org-time-string-to-time start-time-str)))
 
-(defun org-auto-scheduler-clear-scheduled-times ()
-  "Clear scheduled times for all tasks with the 'AUTOSCH' tag and reset the AUTOSCH_SCHEDULED property."
-  (let ((cleared-count 0)
-        (modified-buffers '()))
-    (org-map-entries
-     (lambda ()
-       (when (member "AUTOSCH" (org-get-tags))
-         (let ((buffer (current-buffer)))
-           (org-entry-delete (point) "SCHEDULED")
-           (org-auto-scheduler--log-debug "[org-auto-scheduler-clear-scheduled-times] Cleared SCHEDULED for task: %s"
-                                          (org-get-heading t t t t))
-           (org-entry-delete (point) org-auto-scheduler-scheduled-property)
-           (org-auto-scheduler--log-debug "[org-auto-scheduler-clear-scheduled-times] Cleared %s for task: %s"
-                                          org-auto-scheduler-scheduled-property
-                                          (org-get-heading t t t t))
-           (setq cleared-count (1+ cleared-count))
-           (unless (memq buffer modified-buffers)
-             (push buffer modified-buffers)))))
-     "+AUTOSCH" 'agenda)
-    ;; Update the org-element cache for modified buffers
-    ;; ((dolist (buffer modified-buffers)
-    ;;     (with-current-buffer buffer
-    ;;       (org-element-cache-reset)
-    ;;       (org-element-cache-refresh (point-min)))))
-    (org-auto-scheduler--log-info "Cleared scheduled times and reset properties for %d tasks" cleared-count)))
 
 (defun org-auto-scheduler-get-start-time ()
   "Get the starting time for scheduling tasks.
@@ -612,7 +591,6 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   (condition-case err
       (progn
         (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
-        (org-auto-scheduler-clear-scheduled-times)
         (let* ((tasks (org-auto-scheduler-get-schedulable-tasks))
                (sorted-tasks (org-auto-scheduler-sort-tasks tasks))
                (current-time (org-auto-scheduler-get-start-time))
@@ -681,14 +659,13 @@ existing scheduled tasks."
           (setq attempts (1+ attempts))
           (when available-time
             (setq end-time (time-add available-time (seconds-to-time (* 60 remaining-effort))))
-            (when (org-auto-scheduler-time-slot-occupied-p available-time remaining-effort task-id)
-              (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Time slot occupied: %s to %s"
-                                             (format-time-string "%Y-%m-%d %H:%M" available-time)
-                                             (format-time-string "%Y-%m-%d %H:%M" end-time))
-              (setq end-time nil)
-              (setq available-time (org-auto-scheduler-next-available-time
-                                    (time-add available-time (seconds-to-time (* 60 org-auto-scheduler-time-interval)))
-                                    remaining-effort)))))
+            (let ((occupied-result (org-auto-scheduler-time-slot-occupied-p available-time remaining-effort task-id)))
+              (when occupied-result
+                (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Time slot occupied: %s to %s"
+                                               (format-time-string "%Y-%m-%d %H:%M" available-time)
+                                               (format-time-string "%Y-%m-%d %H:%M" occupied-result))
+                (setq end-time nil)
+                (setq available-time (org-auto-scheduler-next-available-time occupied-result remaining-effort))))))
         (if end-time
             (progn
               (let* ((start-day (format-time-string "%Y-%m-%d" available-time))
