@@ -114,6 +114,14 @@ Times should be in 24-hour format."
 (defvar org-auto-scheduler-completed-tasks '()
   "List of AUTOSCH tasks that have been scheduled in the current process.")
 
+(defcustom org-auto-scheduler-tag-weights
+  '(("URGENT" . 10)
+    ("IMPORTANT" . 5)
+    ("QUICK" . 2))
+  "Alist of weights for different tags."
+  :type '(alist :key-type string :value-type number)
+  :group 'org-auto-scheduler)
+
 (defun org-auto-scheduler-get-agenda-items (date)
   "Get agenda items for DATE.  Includes tasks with active timestamps."
   (condition-case err
@@ -355,7 +363,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
         project-id))))
 
 (defun org-auto-scheduler-sort-tasks (tasks)
-  "Sort TASKS based on their project, scheduled date, calculated scores, and file weights."
+  "Sort TASKS based on their project, scheduled date, calculated scores, tag weights, and file weights."
   (org-auto-scheduler--log-debug "Starting task sorting. Total tasks: %d" (length tasks))
 
   (let* ((tasks-with-info
@@ -366,7 +374,12 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                         (let* ((task-id (org-id-get))
                                (task-name (org-get-heading t t t t))
                                (tags (org-get-tags))
-                               (score (* (org-auto-scheduler-calculate-score marker) weight))
+                               (tag-weight (if (and tags org-auto-scheduler-tag-weights)
+                                               (apply #'+ (mapcar (lambda (tag)
+                                                                   (or (cdr (assoc tag org-auto-scheduler-tag-weights)) 0))
+                                                                 tags))
+                                             0))
+                               (score (* (+ (org-auto-scheduler-calculate-score marker) tag-weight) weight))
                                (project-id (org-auto-scheduler-get-project-id marker))
                                (hierarchy-position (org-auto-scheduler-get-hierarchy-position marker))
                                (scheduled-date (org-entry-get nil "SCHEDULED")))
@@ -402,7 +415,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                      ;; Within the same project, sort by hierarchy
                      ((and project-a project-b (equal project-a project-b))
                       (org-auto-scheduler-compare-hierarchy hierarchy-a hierarchy-b))
-                     ;; If no project, sort by weighted score
+                     ;; If no project, sort by weighted score (including tag weights)
                      ((not (= score-a score-b))
                       (> score-a score-b))
                      ;; If scores are equal, maintain original order
