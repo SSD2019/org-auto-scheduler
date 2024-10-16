@@ -54,8 +54,29 @@ You can also bind this command to a key combination, for example:
 
 *** Task States
 
-- =org-auto-scheduler-state-weights=: Alist of weights for different TODO states
-  Default: =(("TODO" . 0) ("NEXT" . 1) ("IN-PROGRESS" . 2) ("WRITE" . 0) ("LATER" . -10) ("BUY" . 0) ("READ" . 0))=
+- =org-auto-scheduler-state-weights=: Alist of weights for different TODO states. The keys of this alist are considered valid states for auto-scheduling.
+  Default: 
+  #+begin_src emacs-lisp
+  '(("TODO" . 0)
+    ("NEXT" . 1)
+    ("IN-PROGRESS" . 2)
+    ("WRITE" . 0)
+    ("LATER" . -10)
+    ("BUY" . 0)
+    ("READ" . 0))
+  #+end_src
+
+  You can customize this list to match your workflow. For example:
+
+  #+begin_src emacs-lisp
+  (setq org-auto-scheduler-state-weights
+        '(("TODO" . 0)
+          ("NEXT" . 1)
+          ("IN-PROGRESS" . 2)
+          ("WAITING" . -1)))
+  #+end_src
+
+  The auto-scheduler will consider tasks with TODO states that match any key in this alist.
 
 *** Time Blocks
 
@@ -72,6 +93,35 @@ You can also bind this command to a key combination, for example:
 - =org-auto-scheduler-inherited-priority-property=: Property name for setting inherited priority for subtasks (default: "INHERITED_PRIORITY")
 - =org-auto-scheduler-scheduled-property=: Property name to mark AUTOSCH tasks that have been scheduled in the current session (default: "AUTOSCH_SCHEDULED")
 - =org-auto-scheduler-default-task-duration=: Default duration in minutes for tasks without an explicit effort (default: 60)
+
+*** Files to Consider
+
+- =org-auto-scheduler-files=: Specifies which files to consider for auto-scheduling, with optional weights. Can be one of:
+  - =(agenda . WEIGHT)=: Use all files in =org-agenda-files= with the specified weight (default)
+  - An alist of =(FILE . WEIGHT)= pairs
+  - A function that returns an alist of =(FILE . WEIGHT)= pairs
+
+  WEIGHT is a float value used to adjust task scores from the corresponding file.
+
+  Example of custom configuration:
+  #+begin_src emacs-lisp
+  ;; Use agenda files with default weight
+  (setq org-auto-scheduler-files '(agenda . 1.0))
+
+  ;; Use specific files with custom weights
+  (setq org-auto-scheduler-files
+        '(("~/org/work.org" . 1.2)
+          ("~/org/personal.org" . 0.8)))
+
+  ;; Or use a custom function
+  (setq org-auto-scheduler-files
+        (lambda ()
+          (mapcar (lambda (file)
+                    (cons file (if (string-match "work" file) 1.2 0.8)))
+                  (directory-files "~/org" t "\\.org$"))))
+  #+end_src
+
+  Tasks from files with higher weights will be given higher priority in scheduling.
 
 ** How It Works
 
