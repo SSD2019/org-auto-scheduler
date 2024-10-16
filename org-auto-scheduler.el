@@ -641,9 +641,12 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
               (tags (org-get-tags))
               (is-autosch (member "AUTOSCH" tags))
               (is-valid-state (member state valid-states))
-              (headline (org-get-heading t t t t)))
+              (headline (org-get-heading t t t t))
+              (not-before (org-entry-get nil "NOT_BEFORE")))
          (when (and is-autosch is-valid-state)
-           (push (point-marker) tasks))))
+           (push (point-marker) tasks)
+           (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s)"
+                                          headline state (or not-before "Not set")))))
      nil)
     (org-auto-scheduler--log-info "Found %d schedulable tasks" (length tasks))
     (nreverse tasks)))
@@ -664,16 +667,21 @@ existing scheduled tasks."
                                    10  ; Set to 10 minutes if clocked time exceeds total effort
                                  (max 10 (- total-effort clocked-time))))  ; Ensure minimum of 10 minutes
              (time-block (org-auto-scheduler-get-task-tag-block marker))
+             (not-before (org-auto-scheduler-get-not-before marker))
+             (start-time (if (and not-before (time-less-p current-time not-before))
+                             not-before
+                           current-time))
              (available-time (if time-block
-                                  (org-auto-scheduler-next-available-time-in-block current-time time-block)
-                                current-time))
+                                 (org-auto-scheduler-next-available-time-in-block start-time time-block)
+                               start-time))
              (end-time nil)
              (attempts 0)
              (max-attempts (* 7 24 60)) ; 7 days in minutes
              (is-currently-clocked (org-clock-is-active)))
         (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Task: %s" headline)
-        (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s"
-                                       total-effort clocked-time remaining-effort time-block is-currently-clocked)
+        (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
+                                       total-effort clocked-time remaining-effort time-block is-currently-clocked
+                                       (if not-before (format-time-string "%Y-%m-%d %H:%M" not-before) "Not set"))
         (while (and (not end-time) (< attempts max-attempts))
           (setq attempts (1+ attempts))
           (when available-time
@@ -811,6 +819,12 @@ configuration variables and raises errors if any are found."
     (dolist (day org-auto-scheduler-excluded-days)
       (unless (and (integerp day) (<= 0 day 6))
         (error "org-auto-scheduler-excluded-days must contain integers from 0 to 6")))))
+
+(defun org-auto-scheduler-get-not-before (marker)
+  "Get the NOT_BEFORE property for the task at MARKER."
+  (let ((not-before-string (org-entry-get marker "NOT_BEFORE")))
+    (when not-before-string
+      (org-time-string-to-time not-before-string))))
 
 ;; Call this function when the package is loaded
 (org-auto-scheduler-validate-config)

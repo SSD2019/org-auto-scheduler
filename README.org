@@ -11,10 +11,22 @@ Org Auto Scheduler is an Emacs plugin that automatically schedules tasks in your
 - Customizable scheduling parameters
 - Handles project-based task grouping and ordering
 - Considers clocked time when calculating remaining effort
+- Supports "NOT_BEFORE" property to set the earliest scheduling time for a task
 
 ** Usage
 
-To use Org Auto Scheduler, add the =AUTOSCH= tag to any task you want to be automatically scheduled. Then run the command:
+To use Org Auto Scheduler, add the =AUTOSCH= tag to any task you want to be automatically scheduled. You can also set a "NOT_BEFORE" property to specify the earliest date and time the task should be scheduled. For example:
+
+#+BEGIN_SRC org
+* TODO Task with NOT_BEFORE property :AUTOSCH:
+  :PROPERTIES:
+  :NOT_BEFORE: <2023-05-15 Mon 09:00>
+  :END:
+
+This task will not be scheduled before May 15, 2023, at 9:00 AM.
+#+END_SRC
+
+Then run the command:
 
 =M-x org-auto-scheduler-schedule-tasks=
 
@@ -90,6 +102,7 @@ This will run the scheduler with detailed logging and open the log buffer for in
 
 ** Recent Changes
 
+- Added support for "NOT_BEFORE" property to set the earliest scheduling time for tasks
 - Added project-based task grouping and ordering
 - Implemented consideration of clocked time for remaining effort calculation
 - Improved handling of tasks without explicit effort estimates
