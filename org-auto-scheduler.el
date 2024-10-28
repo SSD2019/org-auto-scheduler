@@ -122,6 +122,37 @@ Times should be in 24-hour format."
   :type '(alist :key-type string :value-type number)
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-project-priority-property "PROJECT_PRIORITY"
+  "Property name for setting project priority."
+  :type 'string
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-project-interleave-property "PROJECT_INTERLEAVE"
+  "Property name for controlling project interleaving.
+Values can be:
+- \"t\" or \"yes\": allow interleaving
+- \"nil\" or \"no\": prevent interleaving
+- not set: use default from org-auto-scheduler-interleave-projects"
+  :type 'string
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-interleave-projects t
+  "When non-nil, interleave tasks between different projects by default.
+This can be overridden on a per-project basis using the PROJECT_INTERLEAVE property."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defun org-auto-scheduler-get-project-priority (marker)
+  "Get the priority of the project that contains the task at MARKER."
+  (save-excursion
+    (with-current-buffer (marker-buffer marker)
+      (goto-char (marker-position marker))
+      (let ((priority nil))
+        (while (and (not priority) (org-up-heading-safe))
+          (when (member "PROJECT" (org-get-tags nil t))
+            (setq priority (org-entry-get nil org-auto-scheduler-project-priority-property))))
+        (or (and priority (string-to-number priority)) 0)))))
+
 (defun org-auto-scheduler-get-agenda-items (date)
   "Get agenda items for DATE.  Includes tasks with active timestamps."
   (condition-case err
@@ -362,79 +393,95 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
             (setq project-id (org-id-get))))
         project-id))))
 
-(defun org-auto-scheduler-sort-tasks (tasks)
-  "Sort TASKS based on their project, scheduled date, calculated scores, tag weights, and file weights."
-  (org-auto-scheduler--log-debug "Starting task sorting. Total tasks: %d" (length tasks))
+(defun org-auto-scheduler-project-allows-interleave (marker)
+  "Check if the project containing task at MARKER allows interleaving."
+  (save-excursion
+    (with-current-buffer (marker-buffer marker)
+      (goto-char (marker-position marker))
+      (let ((interleave-setting nil))
+        (while (and (not interleave-setting) (org-up-heading-safe))
+          (when (member "PROJECT" (org-get-tags nil t))
+            (setq interleave-setting 
+                  (org-entry-get nil org-auto-scheduler-project-interleave-property))))
+        (cond
+         ((or (equal interleave-setting "t") 
+              (equal interleave-setting "yes")) t)
+         ((or (equal interleave-setting "nil") 
+              (equal interleave-setting "no")) nil)
+         (t org-auto-scheduler-interleave-projects))))))
 
+(defun org-auto-scheduler-sort-tasks (tasks)
+  "Sort TASKS based on their project, scheduled date, calculated scores, and position."
   (let* ((tasks-with-info
           (mapcar (lambda (task-weight)
-                    (let ((marker (car task-weight))
-                          (weight (cdr task-weight)))
-                      (org-with-point-at marker
-                        (let* ((task-id (org-id-get))
-                               (task-name (org-get-heading t t t t))
-                               (tags (org-get-tags))
-                               (tag-weight (if (and tags org-auto-scheduler-tag-weights)
-                                               (apply #'+ (mapcar (lambda (tag)
-                                                                   (or (cdr (assoc tag org-auto-scheduler-tag-weights)) 0))
-                                                                 tags))
-                                             0))
-                               (score (* (+ (org-auto-scheduler-calculate-score marker) tag-weight) weight))
-                               (project-id (org-auto-scheduler-get-project-id marker))
-                               (hierarchy-position (org-auto-scheduler-get-hierarchy-position marker))
-                               (scheduled-date (org-entry-get nil "SCHEDULED")))
-                          (list marker
-                                score
-                                project-id
-                                hierarchy-position
-                                task-id
-                                task-name
-                                tags
-                                scheduled-date)))))
-                  tasks))
-         (sorted-tasks
-          (sort tasks-with-info
-                (lambda (a b)
-                  (let ((project-a (nth 2 a))
-                        (project-b (nth 2 b))
-                        (hierarchy-a (nth 3 a))
-                        (hierarchy-b (nth 3 b))
-                        (score-a (nth 1 a))
-                        (score-b (nth 1 b))
-                        (scheduled-a (nth 7 a))
-                        (scheduled-b (nth 7 b)))
-                    (cond
-                     ;; First, sort by scheduled date if present
-                     ((and scheduled-a scheduled-b)
-                      (string< scheduled-a scheduled-b))
-                     (scheduled-a t)
-                     (scheduled-b nil)
-                     ;; Then, sort by project
-                     ((and project-a project-b (not (equal project-a project-b)))
-                      (string< project-a project-b))
-                     ;; Within the same project, sort by hierarchy
-                     ((and project-a project-b (equal project-a project-b))
-                      (org-auto-scheduler-compare-hierarchy hierarchy-a hierarchy-b))
-                     ;; If no project, sort by weighted score (including tag weights)
-                     ((not (= score-a score-b))
-                      (> score-a score-b))
-                     ;; If scores are equal, maintain original order
-                     (t nil)))))))
-
-    ;; Log all tasks after sorting
+                    (let* ((marker (car task-weight))
+                           (weight (cdr task-weight))
+                           (task-id (org-with-point-at marker 
+                                    (or (org-id-get) 
+                                        (org-id-get-create))))
+                           (task-name (org-with-point-at marker 
+                                      (org-get-heading t t t t)))
+                           (tags (org-with-point-at marker 
+                                 (org-get-tags)))
+                           (score (org-auto-scheduler-calculate-score marker))
+                           (project-id (org-auto-scheduler-get-project-id marker))
+                           (project-priority (org-auto-scheduler-get-project-priority marker))
+                           (allows-interleave (org-auto-scheduler-project-allows-interleave marker))
+                           (task-position (org-auto-scheduler-get-task-position marker))
+                           (scheduled (org-with-point-at marker 
+                                      (org-entry-get nil "SCHEDULED"))))
+                      (org-auto-scheduler--log-debug 
+                       "Task info: Name: %s, ID: %s, Project: %s, Score: %f, Position: %d"
+                       task-name task-id project-id score task-position)
+                      (list marker
+                            (* score weight)
+                            project-id
+                            project-priority
+                            task-position
+                            task-id
+                            task-name
+                            tags
+                            scheduled
+                            allows-interleave)))
+                  tasks)))
     (org-auto-scheduler--log-debug "Tasks after sorting:")
-    (dolist (task sorted-tasks)
-      (org-auto-scheduler--log-debug "  ID: %s, Name: %s, Tags: %s, Score: %s, Project: %s, Hierarchy: %s, Scheduled: %s"
-                                     (nth 4 task)
-                                     (nth 5 task)
-                                     (nth 6 task)
-                                     (nth 1 task)
-                                     (nth 2 task)
-                                     (nth 3 task)
-                                     (nth 7 task)))
-
-    (org-auto-scheduler--log-debug "Finished sorting tasks. Sorted tasks: %d" (length sorted-tasks))
-    (mapcar #'car sorted-tasks)))
+    (let ((sorted-tasks (sort tasks-with-info
+                             (lambda (a b)
+                               (let* ((project-priority-a (nth 3 a))
+                                      (project-priority-b (nth 3 b))
+                                      (project-a (nth 2 a))
+                                      (project-b (nth 2 b))
+                                      (position-a (nth 4 a))
+                                      (position-b (nth 4 b))
+                                      (score-a (nth 1 a))
+                                      (score-b (nth 1 b))
+                                      (allows-interleave-a (nth 9 a))
+                                      (allows-interleave-b (nth 9 b)))
+                                 (cond
+                                  ((not (= project-priority-a project-priority-b))
+                                   (> project-priority-a project-priority-b))
+                                  ((and project-a project-b
+                                        (not (equal project-a project-b)))
+                                   (if (and allows-interleave-a allows-interleave-b)
+                                       (< position-a position-b)
+                                     (string< project-a project-b)))
+                                  ((and project-a project-b
+                                        (equal project-a project-b))
+                                   (< position-a position-b))
+                                  ((not (= score-a score-b))
+                                   (> score-a score-b))
+                                  (t nil)))))))
+      (dolist (task sorted-tasks)
+        (org-auto-scheduler--log-debug 
+         "  ID: %s, Name: %s, Tags: %s, Score: %f, Project: %s, Position: %d, Scheduled: %s"
+         (nth 5 task)  ; task-id
+         (nth 6 task)  ; task-name
+         (nth 7 task)  ; tags
+         (nth 1 task)  ; score
+         (nth 2 task)  ; project-id
+         (nth 4 task)  ; position
+         (nth 8 task))) ; scheduled
+      (mapcar #'car sorted-tasks))))
 
 (defun org-auto-scheduler-get-hierarchy-position (marker)
   "Get the hierarchical position of the task at MARKER within its project."
