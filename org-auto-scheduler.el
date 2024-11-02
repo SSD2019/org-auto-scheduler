@@ -537,10 +537,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 org-auto-scheduler-task-gap))))
                (task-end-with-gap (time-add task-end (seconds-to-time (* 60 org-auto-scheduler-task-gap)))))
           (when (and (not (equal task-id ignore-id))
-                     (or (not is-autosch) (and is-autosch consider-for-conflicts))
-                     has-time
-                     (time-less-p start-time task-end-with-gap)
-                     (time-less-p task-start-with-gap end-time))
+                    (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                    has-time
+                    (time-less-p start-time task-end-with-gap)
+                    (time-less-p task-start-with-gap end-time))
             (org-auto-scheduler--log-debug "    Conflict detected with task: %s" task-name)
             task-end-with-gap)))
       agenda-items))))
@@ -595,28 +595,53 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
     (apply #'encode-time (append (list 0 0 hour) (nthcdr 3 decoded)))))
 
 (defun org-auto-scheduler-next-available-time-in-block (current-time blocks)
-  "Find the next available time in the specified BLOCKS after CURRENT-TIME. Returns nil if no time is found within the blocks."
-  (let* ((current-minutes (+ (* (nth 2 (decode-time current-time)) 60)
-                             (nth 1 (decode-time current-time))))
+  "Find the next available time in the specified BLOCKS after CURRENT-TIME.
+Returns nil if no time is found within the blocks within max-days-to-check.
+If no slot is found within blocks after max-days-to-check, returns current-time."
+  (let* ((current-decoded (decode-time current-time))
+         (current-minutes (+ (* (nth 2 current-decoded) 60)
+                            (nth 1 current-decoded)))
          (current-day (time-to-days current-time))
-         (next-time nil)
-         (days-checked 0))
-    (while (and (not next-time) (< days-checked org-auto-scheduler-max-days-to-check))
-      (cl-loop for (start . end) in blocks
-               for start-minutes = (org-auto-scheduler-time-to-minutes start)
-               for end-minutes = (org-auto-scheduler-time-to-minutes end)
-               when (< current-minutes start-minutes)
-               do (setq next-time (org-auto-scheduler-minutes-to-time start-minutes))
-               and do (return)
-               finally (progn
-                         (setq current-minutes 0)
-                         (setq current-day (1+ current-day))
-                         (setq days-checked (1+ days-checked)))))
-    (if next-time
-        (let ((date-str (format-time-string "%Y-%m-%d" (days-to-time current-day)))
-              (time-str next-time))
-          (org-time-string-to-time (concat date-str " " time-str)))
-      nil)))
+         (days-checked 0)
+         (found-time nil))
+    
+    ;; Try to find a slot within blocks
+    (while (and (not found-time) 
+                (< days-checked org-auto-scheduler-max-days-to-check))
+      (dolist (block blocks)
+        (let* ((start-minutes (org-auto-scheduler-time-to-minutes (car block)))
+               (end-minutes (org-auto-scheduler-time-to-minutes (cdr block))))
+          (when (and (= days-checked 0)  ; Only check current minutes on first day
+                    (>= current-minutes end-minutes))
+            (setq start-minutes nil))  ; Skip this block for today
+          
+          (when start-minutes  ; If we haven't skipped this block
+            (let* ((day-time (encode-time 0 0 0 
+                                        (nth 3 current-decoded)
+                                        (nth 4 current-decoded)
+                                        (nth 5 current-decoded)))
+                   (day-with-offset (time-add day-time 
+                                            (days-to-time days-checked)))
+                   (block-start-time (time-add day-with-offset 
+                                             (seconds-to-time (* 60 start-minutes)))))
+              (unless found-time  ; Only set if we haven't found a time yet
+                (setq found-time block-start-time))))))
+      
+      (setq days-checked (1+ days-checked))
+      (setq current-minutes 0))  ; Reset minutes for next day
+    
+    (if found-time
+        (progn
+          (org-auto-scheduler--log-debug 
+           "Found next available block time: %s" 
+           (format-time-string "%Y-%m-%d %H:%M" found-time))
+          found-time)
+      ;; If no slot found within blocks after max days, return original time
+      (progn
+        (org-auto-scheduler--log-debug 
+         "No available block time found within %d days, scheduling outside block"
+         org-auto-scheduler-max-days-to-check)
+        current-time))))
 
 (defun org-auto-scheduler-calculate-task-end-time (&optional pom)
   "Get the end time of the entry at POM based on its scheduled time and effort.
@@ -668,7 +693,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
          (end-hour (car end-time-components))
          (end-minute (cadr end-time-components)))
     (if (or (> current-hour end-hour)
-            (and (= current-hour end-hour) (>= current-minute end-minute)))
+        (and (= current-hour end-hour) (>= current-minute end-minute)))
         ;; If it's after the end time, start from the configured start time the next day
         (let* ((tomorrow (time-add now (seconds-to-time (* 24 3600))))
                (tomorrow-start (apply #'encode-time
