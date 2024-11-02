@@ -142,6 +142,20 @@ This can be overridden on a per-project basis using the PROJECT_INTERLEAVE prope
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-category-weights
+  '(("Work" . 10)
+    ("Personal" . 5)
+    ("Errands" . 2))
+  "Alist of weights for different categories."
+  :type '(alist :key-type string :value-type number)
+  :group 'org-auto-scheduler)
+
+(defun org-auto-scheduler-get-category-weight (marker)
+  "Get the weight for the category of the task at MARKER."
+  (let ((category (org-with-point-at marker (org-get-category))))
+    (or (cdr (assoc category org-auto-scheduler-category-weights))
+        1)))  ; Default weight if category not found
+
 (defun org-auto-scheduler-get-project-priority (marker)
   "Get the priority of the project that contains the task at MARKER."
   (save-excursion
@@ -343,25 +357,27 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
              (state (org-entry-get marker "TODO"))
              (state-weight (or (cdr (assoc state org-auto-scheduler-state-weights)) 0))
              (priority-score (cond ((equal priority "A") 10)
-                                   ((equal priority "B") 0)
-                                   ((equal priority "C") -5)
-                                   (t 0)))
+                                 ((equal priority "B") 0)
+                                 ((equal priority "C") -5)
+                                 (t 0)))
              (inherited-priority (org-auto-scheduler-get-inherited-priority marker))
              (days-to-deadline (if deadline
-                                   (max 0 (floor (- (time-to-days deadline)
-                                                    (time-to-days (current-time)))))
-                                 30))
-             (urgency-factor (/ 1.0 (1+ days-to-deadline))))
+                                 (max 0 (floor (- (time-to-days deadline)
+                                                (time-to-days (current-time)))))
+                               30))
+             (urgency-factor (/ 1.0 (1+ days-to-deadline)))
+             (category-weight (org-auto-scheduler-get-category-weight marker)))
         (org-auto-scheduler--log-debug "Calculating score for task %s" (org-id-get))
-        (+ (* effort org-auto-scheduler-effort-weight)
-           (* (+ priority-score inherited-priority) org-auto-scheduler-priority-weight)
-           (* urgency-factor org-auto-scheduler-urgency-weight)
-           state-weight))
+           (+ (* effort org-auto-scheduler-effort-weight)
+              (* (+ priority-score inherited-priority) org-auto-scheduler-priority-weight)
+              (* urgency-factor org-auto-scheduler-urgency-weight)
+              (* category-weight 10)  ; Add category weight multiplied by 10
+              state-weight))  ; State weight
     (error
      (org-auto-scheduler--log-error "Error calculating score: %s\nMarker: %s\nBacktrace: %s"
-                                    err
-                                    marker
-                                    (with-output-to-string (backtrace)))
+                                   err
+                                   marker
+                                   (with-output-to-string (backtrace)))
      0)))  ; Return 0 score on error
 
 (defun org-auto-scheduler-get-parent-id (marker)
@@ -413,10 +429,8 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
 (defun org-auto-scheduler-sort-tasks (tasks)
   "Sort TASKS based on their project, scheduled date, calculated scores, and position."
   (let* ((tasks-with-info
-          (mapcar (lambda (task-weight)
-                    (let* ((marker (car task-weight))
-                           (weight (cdr task-weight))
-                           (task-id (org-with-point-at marker 
+          (mapcar (lambda (marker)
+                    (let* ((task-id (org-with-point-at marker 
                                     (or (org-id-get) 
                                         (org-id-get-create))))
                            (task-name (org-with-point-at marker 
@@ -434,7 +448,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                        "Task info: Name: %s, ID: %s, Project: %s, Score: %f, Position: %d"
                        task-name task-id project-id score task-position)
                       (list marker
-                            (* score weight)
+                            score
                             project-id
                             project-priority
                             task-position
@@ -600,7 +614,7 @@ Returns nil if no time is found within the blocks within max-days-to-check.
 If no slot is found within blocks after max-days-to-check, returns current-time."
   (let* ((current-decoded (decode-time current-time))
          (current-minutes (+ (* (nth 2 current-decoded) 60)
-                            (nth 1 current-decoded)))
+                              (nth 1 current-decoded)))
          (current-day (time-to-days current-time))
          (days-checked 0)
          (found-time nil))
@@ -615,16 +629,16 @@ If no slot is found within blocks after max-days-to-check, returns current-time.
                     (>= current-minutes end-minutes))
             (setq start-minutes nil))  ; Skip this block for today
           
-          (when start-minutes  ; If we haven't skipped this block
-            (let* ((day-time (encode-time 0 0 0 
-                                        (nth 3 current-decoded)
-                                        (nth 4 current-decoded)
-                                        (nth 5 current-decoded)))
-                   (day-with-offset (time-add day-time 
-                                            (days-to-time days-checked)))
-                   (block-start-time (time-add day-with-offset 
-                                             (seconds-to-time (* 60 start-minutes)))))
-              (unless found-time  ; Only set if we haven't found a time yet
+            (when start-minutes  ; If we haven't skipped this block
+              (let* ((day-time (encode-time 0 0 0 
+                                          (nth 3 current-decoded)
+                                          (nth 4 current-decoded)
+                                          (nth 5 current-decoded)))
+                     (day-with-offset (time-add day-time 
+                                                 (days-to-time days-checked)))
+                     (block-start-time (time-add day-with-offset 
+                                                  (seconds-to-time (* 60 start-minutes)))))
+                (unless found-time  ; Only set if we haven't found a time yet
                 (setq found-time block-start-time))))))
       
       (setq days-checked (1+ days-checked))
@@ -736,46 +750,35 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
 
 (defun org-auto-scheduler-get-schedulable-tasks ()
-  "Get a list of markers for schedulable tasks from specified files, including recurring task instances."
+  "Get a list of markers for schedulable tasks from the agenda files, including recurring task instances."
   (let ((tasks '())
-        (valid-states (mapcar #'car org-auto-scheduler-state-weights))
-        (files-with-weights
-         (cond
-          ((eq (car org-auto-scheduler-files) 'agenda)
-           (mapcar (lambda (file) (cons file (cdr org-auto-scheduler-files)))
-                   (org-agenda-files)))
-          ((functionp org-auto-scheduler-files)
-           (funcall org-auto-scheduler-files))
-          (t org-auto-scheduler-files))))
-    (dolist (file-weight files-with-weights)
-      (let ((file (car file-weight))
-            (weight (cdr file-weight)))
-        (with-current-buffer (or (find-buffer-visiting file)
-                                 (find-file-noselect file))
-          (org-map-entries
-           (lambda ()
-             (let* ((state (org-get-todo-state))
-                    (tags (org-get-tags))
-                    (is-autosch (member "AUTOSCH" tags))
-                    (is-valid-state (member state valid-states))
-                    (headline (org-get-heading t t t t))
-                    (not-before (org-entry-get nil "NOT_BEFORE"))
-                    (recurring (org-entry-get nil "RECURRING"))
-                    (scheduled (org-entry-get nil "SCHEDULED")))
-               (when (and is-autosch is-valid-state)
-                 (if recurring
-                     (progn
-                       (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
-                       (org-auto-scheduler-create-recurring-instances headline recurring scheduled not-before tasks weight))
-                   (org-auto-scheduler--log-debug "Adding non-recurring task: %s from file %s" headline file)
-                   (push (cons (point-marker) weight) tasks))
-                 (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
-                                                headline state (or not-before "Not set") (or recurring "Not set") file))))
-           nil))))
-    (org-auto-scheduler--log-info "Found %d schedulable tasks across specified files" (length tasks))
+        (valid-states (mapcar #'car org-auto-scheduler-state-weights)))
+    (org-map-entries
+     (lambda ()
+       (let* ((state (org-get-todo-state))
+              (tags (org-get-tags))
+              (is-autosch (member "AUTOSCH" tags))
+              (is-valid-state (member state valid-states))
+              (headline (org-get-heading t t t t))
+              (not-before (org-entry-get nil "NOT_BEFORE"))
+              (recurring (org-entry-get nil "RECURRING"))
+              (scheduled (org-entry-get nil "SCHEDULED"))
+              (file (buffer-file-name)))
+         (when (and is-autosch is-valid-state)
+           (if recurring
+               (progn
+                 (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
+                 (org-auto-scheduler-create-recurring-instances headline recurring scheduled not-before tasks))
+             (org-auto-scheduler--log-debug "Adding non-recurring task: %s from file %s" headline file)
+             (push (point-marker) tasks)))
+         (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
+                                        headline state (or not-before "Not set") (or recurring "Not set") file)))
+     nil
+     'agenda)
+    (org-auto-scheduler--log-info "Found %d schedulable tasks across the agenda" (length tasks))
     (nreverse tasks)))
 
-(defun org-auto-scheduler-create-recurring-instances (headline recurring scheduled not-before tasks weight)
+(defun org-auto-scheduler-create-recurring-instances (headline recurring scheduled not-before tasks)
   "Create recurring instances for a task and add them to TASKS list."
   (let* ((start-date (if scheduled
                          (org-time-string-to-time scheduled)
@@ -789,7 +792,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
              (existing-instance (org-auto-scheduler-find-existing-instance instance-headline)))
         (unless existing-instance
           (let ((new-task (org-auto-scheduler-create-subtask instance-headline current-date)))
-            (push (cons new-task weight) tasks)))
+            (push new-task tasks)))
         (setq current-date (org-auto-scheduler-next-recurring-date current-date recurring))
         (setq last-instance-date current-date)))
     ;; Update the SCHEDULED property of the main task
@@ -1016,20 +1019,6 @@ configuration variables and raises errors if any are found."
     (when not-before-string
       (org-time-string-to-time not-before-string))))
 
-(defcustom org-auto-scheduler-files
-  '(agenda . 1.0)
-  "Files to be considered for auto-scheduling, with optional weights.
-Can be one of the following:
-- (agenda . WEIGHT): use `org-agenda-files' with the specified weight
-- An alist of (FILE . WEIGHT) pairs
-- A function that returns an alist of (FILE . WEIGHT) pairs
-WEIGHT is a float value used to adjust task scores from the corresponding file."
-  :type '(choice
-          (cons :tag "Agenda files" (const agenda) (float :tag "Weight"))
-          (alist :key-type (file :tag "File")
-                 :value-type (float :tag "Weight"))
-          (function :tag "Function returning alist of files and weights"))
-  :group 'org-auto-scheduler)
 
 ;; Call this function when the package is loaded
 (org-auto-scheduler-validate-config)
