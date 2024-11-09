@@ -5,6 +5,7 @@
 (require 'parse-time)
 (require 'org-agenda)
 (require 'org-duration)
+(require 'time-date)
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
 (org-auto-scheduler--log-set-level 'debug)
 
@@ -608,54 +609,42 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
   (let ((decoded (decode-time time)))
     (apply #'encode-time (append (list 0 0 hour) (nthcdr 3 decoded)))))
 
-(defun org-auto-scheduler-next-available-time-in-block (current-time blocks)
+(defun time-to-minutes (time)
+  "Convert TIME duration to minutes."
+  (/ (time-to-seconds time) 60))
+
+(defun org-auto-scheduler-next-available-time-in-block (current-time blocks remaining-effort)
   "Find the next available time in the specified BLOCKS after CURRENT-TIME.
-Returns nil if no time is found within the blocks within max-days-to-check.
-If no slot is found within blocks after max-days-to-check, returns current-time."
-  (let* ((current-decoded (decode-time current-time))
-         (current-minutes (+ (* (nth 2 current-decoded) 60)
-                              (nth 1 current-decoded)))
-         (current-day (time-to-days current-time))
-         (days-checked 0)
+Returns the next available time if found within the blocks and max-days-to-check,
+and if the task with REMAINING-EFFORT fits within the block.
+If no slot is found within blocks after max-days-to-check, returns nil."
+  (let* ((days-checked 0)
          (found-time nil))
     
     ;; Try to find a slot within blocks
     (while (and (not found-time) 
                 (< days-checked org-auto-scheduler-max-days-to-check))
-      (dolist (block blocks)
-        (let* ((start-minutes (org-auto-scheduler-time-to-minutes (car block)))
-               (end-minutes (org-auto-scheduler-time-to-minutes (cdr block))))
-          (when (and (= days-checked 0)  ; Only check current minutes on first day
-                    (>= current-minutes end-minutes))
-            (setq start-minutes nil))  ; Skip this block for today
-          
-            (when start-minutes  ; If we haven't skipped this block
-              (let* ((day-time (encode-time 0 0 0 
-                                          (nth 3 current-decoded)
-                                          (nth 4 current-decoded)
-                                          (nth 5 current-decoded)))
-                     (day-with-offset (time-add day-time 
-                                                 (days-to-time days-checked)))
-                     (block-start-time (time-add day-with-offset 
-                                                  (seconds-to-time (* 60 start-minutes)))))
-                (unless found-time  ; Only set if we haven't found a time yet
-                (setq found-time block-start-time))))))
+      (let ((day-start (time-add current-time (days-to-time days-checked))))
+        (dolist (block blocks)
+          (let* ((block-start (org-auto-scheduler-time-with-time-string day-start (car block)))
+                 (block-end (org-auto-scheduler-time-with-time-string day-start (cdr block))))
+            (when (and (time-less-p current-time block-end)
+                       (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort))
+              (setq found-time (if (time-less-p current-time block-start)
+                                   block-start
+                                 current-time))
+              (return)))))
       
+      ;; Move to the next day
       (setq days-checked (1+ days-checked))
-      (setq current-minutes 0))  ; Reset minutes for next day
+      (setq current-time (org-auto-scheduler-next-day-start current-time)))
     
-    (if found-time
-        (progn
-          (org-auto-scheduler--log-debug 
-           "Found next available block time: %s" 
-           (format-time-string "%Y-%m-%d %H:%M" found-time))
-          found-time)
-      ;; If no slot found within blocks after max days, return original time
-      (progn
-        (org-auto-scheduler--log-debug 
-         "No available block time found within %d days, scheduling outside block"
-         org-auto-scheduler-max-days-to-check)
-        current-time))))
+    (when found-time
+      (org-auto-scheduler--log-debug 
+       "Found next available block time: %s" 
+       (format-time-string "%Y-%m-%d %H:%M" found-time)))
+    
+    found-time))
 
 (defun org-auto-scheduler-calculate-task-end-time (&optional pom)
   "Get the end time of the entry at POM based on its scheduled time and effort.
@@ -764,7 +753,8 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
               (recurring (org-entry-get nil "RECURRING"))
               (scheduled (org-entry-get nil "SCHEDULED"))
               (file (buffer-file-name)))
-         (when (and is-autosch is-valid-state)
+         ;; Check if the task is not in an archived state by checking tags
+         (when (and is-autosch is-valid-state (not (member "ARCHIVE" tags)))
            (if recurring
                (progn
                  (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
@@ -848,7 +838,8 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   "Schedule a single task at MARKER, starting from CURRENT-TIME.
 This function attempts to find an available time slot for the task,
 respecting time blocks if specified, and avoiding conflicts with
-existing scheduled tasks."
+existing scheduled tasks. If no available time slot is found within
+the time block, it schedules the task outside the time block."
   (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Attempting to schedule task at marker %s" marker)
   (when (markerp marker)
     (org-with-point-at marker
@@ -865,7 +856,7 @@ existing scheduled tasks."
                              not-before
                            current-time))
              (available-time (if time-block
-                                 (org-auto-scheduler-next-available-time-in-block start-time time-block)
+                                 (org-auto-scheduler-next-available-time-in-block start-time time-block remaining-effort)
                                start-time))
              (end-time nil)
              (attempts 0)
@@ -875,6 +866,17 @@ existing scheduled tasks."
         (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
                                        total-effort clocked-time remaining-effort time-block is-currently-clocked
                                        (if not-before (format-time-string "%Y-%m-%d %H:%M" not-before) "Not set"))
+        (when (and time-block (null available-time))
+          ;; Log that no available time slot was found
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] No available time slot found within the time block. Scheduling outside the time block.")
+          ;; Reset time block since no available time was found
+          (setq time-block nil)
+          ;; Log task information
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] outside time block Task: %s" headline)
+          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
+                                       total-effort clocked-time remaining-effort time-block is-currently-clocked
+                                       (if not-before (format-time-string "%Y-%m-%d %H:%M" not-before) "Not set"))
+          (setq available-time start-time))
         (while (and (not end-time) (< attempts max-attempts))
           (setq attempts (1+ attempts))
           (when available-time
@@ -948,18 +950,10 @@ existing scheduled tasks."
                  (cdr tag-block)))
              org-auto-scheduler-time-blocks)))
 
-(defun org-auto-scheduler-time-fits-block-p (start-time end-time block)
-  "Check if the time range fits within the given block."
-  (let ((start-minutes (+ (* (nth 2 (decode-time start-time)) 60)
-                          (nth 1 (decode-time start-time))))
-        (end-minutes (+ (* (nth 2 (decode-time end-time)) 60)
-                        (nth 1 (decode-time end-time)))))
-    (cl-some (lambda (block-range)
-               (let ((block-start (org-auto-scheduler-time-to-minutes (car block-range)))
-                     (block-end (org-auto-scheduler-time-to-minutes (cdr block-range))))
-                 (and (>= start-minutes block-start)
-                      (<= end-minutes block-end))))
-             block)))
+(defun org-auto-scheduler-time-fits-block-p (block-start block-end remaining-effort)
+  "Check if the task with REMAINING-EFFORT fits within the time block from BLOCK-START to BLOCK-END."
+  (let ((block-duration (time-to-seconds (time-subtract block-end block-start))))
+    (>= (/ block-duration 60) remaining-effort)))
 
 (defun org-auto-scheduler-safe-get-property (marker property)
   "Safely get PROPERTY for task at MARKER, returning nil if invalid."
