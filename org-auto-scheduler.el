@@ -733,19 +733,19 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                (previous-project nil))
           (dolist (marker sorted-tasks)
             (let ((task-project (org-auto-scheduler-get-project-id marker)))
-              (when (or (and task-project (not (equal task-project previous-project)))
-                        (and (null task-project) (not (null previous-project))))
+              (when (or (not (equal task-project previous-project))
+                        (null task-project))
                 (setq current-time (org-auto-scheduler-get-start-time))
                 (setq previous-project task-project)
-                (org-auto-scheduler--log-debug "Project changed or no project set. Resetting current time to %s"
+                (org-auto-scheduler--log-debug "Project changed or is null. Resetting current time to %s"
                                              (format-time-string "%Y-%m-%d %H:%M" current-time)))
 
               (setq current-time (org-auto-scheduler-schedule-single-task marker current-time))
-              (setq tasks-scheduled (1+ tasks-scheduled))
+              (setq tasks-scheduled (1+ tasks-scheduled)) 
               (when (zerop (mod tasks-scheduled 10))
                 (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)))
-    (error
+    (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
 
 (defun org-auto-scheduler-get-schedulable-tasks ()
