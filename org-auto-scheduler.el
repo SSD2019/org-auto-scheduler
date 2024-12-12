@@ -635,6 +635,16 @@ If no slot is found within blocks after max-days-to-check, returns nil."
                                  current-time))
               (return)))))
       
+      ;; If no slot found in the current day, check the immediate next day
+      (when (and (not found-time) (= days-checked 0))
+        (let ((next-day-start (org-auto-scheduler-next-day-start current-time)))
+          (dolist (block blocks)
+            (let* ((block-start (org-auto-scheduler-time-with-time-string next-day-start (car block)))
+                   (block-end (org-auto-scheduler-time-with-time-string next-day-start (cdr block))))
+              (when (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort)
+                (setq found-time block-start)
+                (return))))))
+      
       ;; Move to the next day
       (setq days-checked (1+ days-checked))
       (setq current-time (org-auto-scheduler-next-day-start current-time)))
@@ -888,7 +898,7 @@ the time block, it schedules the task outside the time block."
                                                (format-time-string "%Y-%m-%d %H:%M" occupied-result))
                 (setq end-time nil)
                 (setq available-time (if time-block
-                                        (org-auto-scheduler-next-available-time-in-block occupied-result time-block)
+                                        (org-auto-scheduler-next-available-time-in-block occupied-result time-block remaining-effort)
                                       (org-auto-scheduler-next-available-time occupied-result remaining-effort)))))))
         (if end-time
             (progn
