@@ -633,7 +633,7 @@ If no slot is found within blocks after max-days-to-check, returns nil."
               (setq found-time (if (time-less-p current-time block-start)
                                    block-start
                                  current-time))
-              (return)))))
+              (cl-return)))))
       
       ;; If no slot found in the current day, check the immediate next day
       (when (and (not found-time) (= days-checked 0))
@@ -643,8 +643,8 @@ If no slot is found within blocks after max-days-to-check, returns nil."
                    (block-end (org-auto-scheduler-time-with-time-string next-day-start (cdr block))))
               (when (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort)
                 (setq found-time block-start)
-                (return))))))
-      
+                (cl-return))))))
+
       ;; Move to the next day
       (setq days-checked (1+ days-checked))
       (setq current-time (org-auto-scheduler-next-day-start current-time)))
