@@ -629,11 +629,10 @@ If no slot is found within blocks after max-days-to-check, returns nil."
           (let* ((block-start (org-auto-scheduler-time-with-time-string day-start (car block)))
                  (block-end (org-auto-scheduler-time-with-time-string day-start (cdr block))))
             (when (and (time-less-p current-time block-end)
-                       (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort))
+                      (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort))
               (setq found-time (if (time-less-p current-time block-start)
-                                   block-start
-                                 current-time))
-              (cl-return)))))
+                                  block-start
+                                current-time))))))
       
       ;; If no slot found in the current day, check the immediate next day
       (when (and (not found-time) (= days-checked 0))
@@ -642,8 +641,7 @@ If no slot is found within blocks after max-days-to-check, returns nil."
             (let* ((block-start (org-auto-scheduler-time-with-time-string next-day-start (car block)))
                    (block-end (org-auto-scheduler-time-with-time-string next-day-start (cdr block))))
               (when (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort)
-                (setq found-time block-start)
-                (cl-return))))))
+                (setq found-time block-start))))))
 
       ;; Move to the next day
       (setq days-checked (1+ days-checked))
@@ -935,8 +933,8 @@ the time block, it schedules the task outside the time block."
      (save-excursion
        (when (markerp pom)
          (set-buffer (marker-buffer pom)))
-       (goto-char (or (marker-position pom) pom))
-       ,@body)))
+         (goto-char (or (marker-position pom) pom))
+         ,@body)))
 
 (defun org-auto-scheduler-setup ()
   "Set up the Org Auto Scheduler."
@@ -954,16 +952,18 @@ the time block, it schedules the task outside the time block."
 
 (defun org-auto-scheduler-get-task-tag-block (marker)
   "Get the time block for the task at MARKER based on its tags."
-  (let ((tags (org-get-tags marker)))
-    (cl-some (lambda (tag-block)
-               (when (member (car tag-block) tags)
-                 (cdr tag-block)))
-             org-auto-scheduler-time-blocks)))
+  (let* ((tags (org-get-tags marker))
+         (matching-block nil))
+    (dolist (tag-block org-auto-scheduler-time-blocks)
+      (when (and (not matching-block)
+                 (member (car tag-block) tags))
+        (setq matching-block (cdr tag-block))))
+    matching-block))
 
 (defun org-auto-scheduler-time-fits-block-p (block-start block-end remaining-effort)
   "Check if the task with REMAINING-EFFORT fits within the time block from BLOCK-START to BLOCK-END."
   (let ((block-duration (time-to-seconds (time-subtract block-end block-start))))
-    (>= (/ block-duration 60) remaining-effort)))
+        (>= (/ block-duration 60) remaining-effort)))
 
 (defun org-auto-scheduler-safe-get-property (marker property)
   "Safely get PROPERTY for task at MARKER, returning nil if invalid."
@@ -1003,24 +1003,28 @@ if no effort is specified."
   "Validate the configuration variables for org-auto-scheduler.
 This function checks for inconsistencies or invalid values in the
 configuration variables and raises errors if any are found."
-  (let ((start-time (org-duration-to-minutes org-auto-scheduler-start-time))
-        (end-time (org-duration-to-minutes org-auto-scheduler-end-time)))
+  (let* ((start-time (org-duration-to-minutes org-auto-scheduler-start-time))
+         (end-time (org-duration-to-minutes org-auto-scheduler-end-time))
+         (time-interval org-auto-scheduler-time-interval)
+         (task-gap org-auto-scheduler-task-gap)
+         (max-days-to-check org-auto-scheduler-max-days-to-check)
+         (excluded-days org-auto-scheduler-excluded-days))
     (when (>= start-time end-time)
       (error "org-auto-scheduler-start-time must be earlier than org-auto-scheduler-end-time"))
-    (when (< org-auto-scheduler-time-interval 1)
+    (when (< time-interval 1)
       (error "org-auto-scheduler-time-interval must be at least 1 minute"))
-    (when (< org-auto-scheduler-task-gap 0)
+    (when (< task-gap 0)
       (error "org-auto-scheduler-task-gap cannot be negative"))
-    (when (< org-auto-scheduler-max-days-to-check 1)
+    (when (< max-days-to-check 1)
       (error "org-auto-scheduler-max-days-to-check must be at least 1"))
-    (dolist (day org-auto-scheduler-excluded-days)
+    (dolist (day excluded-days)
       (unless (and (integerp day) (<= 0 day 6))
         (error "org-auto-scheduler-excluded-days must contain integers from 0 to 6")))))
 
 (defun org-auto-scheduler-get-not-before (marker)
   "Get the NOT_BEFORE property for the task at MARKER."
-  (let ((not-before-string (org-entry-get marker "NOT_BEFORE")))
-    (when not-before-string
+      (let ((not-before-string (org-entry-get marker "NOT_BEFORE")))
+        (when not-before-string
       (org-time-string-to-time not-before-string))))
 
 
