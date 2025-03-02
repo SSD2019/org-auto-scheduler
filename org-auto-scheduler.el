@@ -353,7 +353,8 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
       inherited-priority)))
 
 (defun org-auto-scheduler-calculate-score (marker)
-  "Calculate a score for a task at MARKER based on its properties and state."
+  "Calculate a score for a task at MARKER based on its properties and state.
+Returns a list containing the total score and individual score components."
   (condition-case err
       (let* ((effort (or (org-auto-scheduler-get-effort marker) 60))
              (priority (org-entry-get marker "PRIORITY"))
@@ -370,19 +371,25 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                                                 (time-to-days (current-time)))))
                                30))
              (urgency-factor (/ 1.0 (1+ days-to-deadline)))
-             (category-weight (org-auto-scheduler-get-category-weight marker)))
+             (category-weight (org-auto-scheduler-get-category-weight marker))
+             (effort-score (* effort org-auto-scheduler-effort-weight))
+             (priority-total (* (+ priority-score inherited-priority) org-auto-scheduler-priority-weight))
+             (urgency-score (* urgency-factor org-auto-scheduler-urgency-weight))
+             (category-score (* category-weight 10))
+             (total-score (+ effort-score 
+                            priority-total
+                            urgency-score
+                            category-score
+                            state-weight)))
         (org-auto-scheduler--log-debug "Calculating score for task %s" (org-id-get))
-           (+ (* effort org-auto-scheduler-effort-weight)
-              (* (+ priority-score inherited-priority) org-auto-scheduler-priority-weight)
-              (* urgency-factor org-auto-scheduler-urgency-weight)
-              (* category-weight 10)  ; Add category weight multiplied by 10
-              state-weight))  ; State weight
+        (list total-score effort-score priority-total urgency-score category-score state-weight
+              effort priority-score inherited-priority days-to-deadline category-weight state))
     (error
      (org-auto-scheduler--log-error "Error calculating score: %s\nMarker: %s\nBacktrace: %s"
                                    err
                                    marker
                                    (with-output-to-string (backtrace)))
-     0)))  ; Return 0 score on error
+     (list 0 0 0 0 0 0 0 0 0 0 0 ""))))  ; Return all zeroes on error
 
 (defun org-auto-scheduler-get-parent-id (marker)
   "Get the ID of the parent heading for the task at MARKER."
@@ -441,7 +448,8 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                                       (org-get-heading t t t t)))
                            (tags (org-with-point-at marker 
                                  (org-get-tags)))
-                           (score (org-auto-scheduler-calculate-score marker))
+                           (score-info (org-auto-scheduler-calculate-score marker))
+                           (score (car score-info))
                            (project-id (org-auto-scheduler-get-project-id marker))
                            (project-priority (org-auto-scheduler-get-project-priority marker))
                            (allows-interleave (org-auto-scheduler-project-allows-interleave marker))
@@ -466,7 +474,8 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                             allows-interleave
                             not-before
                             time-block
-                            effort)))
+                            effort
+                            (cdr score-info))))
                   tasks)))
     (org-auto-scheduler--log-debug "Tasks after sorting:")
     (let ((sorted-tasks (sort tasks-with-info
@@ -866,9 +875,11 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
       (org-mode)
       (insert "#+TITLE: Org Auto Scheduler Report\n")
       (insert "#+DATE: " (format-time-string "%Y-%m-%d %H:%M:%S") "\n\n")
-      (insert "| Task | Score | Scheduled | Not Before | Time Block | Effort (min) | Project |\n")
-      (insert "|------|-------|-----------|------------|------------|--------------|--------|\n"))
+      (insert "| Task | Score | Scheduled | Not Before | Time Block | Effort | Project | Effort Score | Priority Score | Urgency Score | Category Score | State |\n")
+      (insert "|------|-------|-----------|------------|------------|--------|---------|--------------|----------------|---------------|---------------|-------|\n"))
     buffer))
+
+
 
 (defun org-auto-scheduler-add-to-report (task scheduled)
   "Add a task to the report buffer.
@@ -877,9 +888,17 @@ TASK is the task info list, SCHEDULED is the scheduled timestamp."
     (when buffer
       (with-current-buffer buffer
         (goto-char (point-max))
-        (insert "| " 
+        (let* ((score-components (nth 13 task))
+               (effort-score (nth 0 score-components))
+               (priority-score (nth 1 score-components))
+               (urgency-score (nth 2 score-components))
+               (category-score (nth 3 score-components))
+               (state-weight (nth 4 score-components))
+               (state (nth 11 score-components))
+               (score (nth 1 task)))
+          (insert "| " 
                 (nth 6 task) " | " ; Task name
-                (format "%.2f" (nth 1 task)) " | " ; Score
+                (format "%.2f" score) " | " ; Score
                 (or (and scheduled 
                      (format-time-string "%Y-%m-%d %H:%M" scheduled)) 
                     "Not scheduled") " | "
@@ -892,7 +911,12 @@ TASK is the task info list, SCHEDULED is the scheduled timestamp."
                 (or (and (nth 12 task) 
                      (format "%d" (nth 12 task)))
                     "60") " | "
-                (or (nth 2 task) "None") " |\n")))))
+                (or (nth 2 task) "None") " | "
+                (format "%.2f" effort-score) " | "
+                (format "%.2f" priority-score) " | "
+                (format "%.2f" urgency-score) " | "
+                (format "%.2f" category-score) " | "
+                (or state "None") " |\n"))))))    
 
 (defun org-auto-scheduler-schedule-single-task (marker current-time)
   "Schedule a single task at MARKER, starting from CURRENT-TIME.
