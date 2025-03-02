@@ -151,6 +151,9 @@ This can be overridden on a per-project basis using the PROJECT_INTERLEAVE prope
   :type '(alist :key-type string :value-type number)
   :group 'org-auto-scheduler)
 
+(defvar org-auto-scheduler-report-buffer-name "*Org Auto Scheduler Report*"
+  "Name of the buffer for the Org Auto Scheduler Report.")
+
 (defun org-auto-scheduler-get-category-weight (marker)
   "Get the weight for the category of the task at MARKER."
   (let ((category (org-with-point-at marker (org-get-category))))
@@ -444,7 +447,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                            (allows-interleave (org-auto-scheduler-project-allows-interleave marker))
                            (task-position (org-auto-scheduler-get-task-position marker))
                            (scheduled (org-with-point-at marker 
-                                      (org-entry-get nil "SCHEDULED"))))
+                                      (org-entry-get nil "SCHEDULED")))
+                           (not-before (org-auto-scheduler-get-not-before marker))
+                           (time-block (org-auto-scheduler-get-task-tag-block marker))
+                           (effort (org-auto-scheduler-get-effort marker)))
                       (org-auto-scheduler--log-debug 
                        "Task info: Name: %s, ID: %s, Project: %s, Score: %f, Position: %d"
                        task-name task-id project-id score task-position)
@@ -457,7 +463,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                             task-name
                             tags
                             scheduled
-                            allows-interleave)))
+                            allows-interleave
+                            not-before
+                            time-block
+                            effort)))
                   tasks)))
     (org-auto-scheduler--log-debug "Tasks after sorting:")
     (let ((sorted-tasks (sort tasks-with-info
@@ -496,7 +505,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
          (nth 2 task)  ; project-id
          (nth 4 task)  ; position
          (nth 8 task))) ; scheduled
-      (mapcar #'car sorted-tasks))))
+      sorted-tasks)))
 
 (defun org-auto-scheduler-get-hierarchy-position (marker)
   "Get the hierarchical position of the task at MARKER within its project."
@@ -723,14 +732,18 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   (condition-case err
       (progn
         (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
+        (org-auto-scheduler-create-report-buffer)      ; Create the report buffer
         (let* ((tasks (org-auto-scheduler-get-schedulable-tasks))
-               (sorted-tasks (org-auto-scheduler-sort-tasks tasks))
+               (sorted-tasks-info (org-auto-scheduler-sort-tasks tasks))
                (current-time (org-auto-scheduler-get-start-time))
                (tasks-scheduled 0)
-               (total-tasks (length sorted-tasks))
+               (total-tasks (length sorted-tasks-info))
                (previous-project nil))
-          (dolist (marker sorted-tasks)
-            (let ((task-project (org-auto-scheduler-get-project-id marker)))
+          
+          (dolist (task-info sorted-tasks-info)
+            (let* ((marker (car task-info))
+                   (task-project (nth 2 task-info)))
+              
               (when (or (not (equal task-project previous-project))
                         (null task-project))
                 (setq current-time (org-auto-scheduler-get-start-time))
@@ -739,9 +752,12 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                                              (format-time-string "%Y-%m-%d %H:%M" current-time)))
 
               (setq current-time (org-auto-scheduler-schedule-single-task marker current-time))
+              (org-auto-scheduler-add-to-report task-info current-time)
               (setq tasks-scheduled (1+ tasks-scheduled)) 
               (when (zerop (mod tasks-scheduled 10))
                 (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
+          
+          (org-auto-scheduler-display-report)
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)))
     (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
@@ -841,6 +857,42 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
       (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
     (setf (nth 3 decoded) (min day (calendar-last-day-of-month (nth 4 decoded) (nth 5 decoded))))
     (apply #'encode-time decoded)))
+
+(defun org-auto-scheduler-create-report-buffer ()
+  "Create or clear the report buffer."
+  (let ((buffer (get-buffer-create org-auto-scheduler-report-buffer-name)))
+    (with-current-buffer buffer
+      (erase-buffer)
+      (org-mode)
+      (insert "#+TITLE: Org Auto Scheduler Report\n")
+      (insert "#+DATE: " (format-time-string "%Y-%m-%d %H:%M:%S") "\n\n")
+      (insert "| Task | Score | Scheduled | Not Before | Time Block | Effort (min) | Project |\n")
+      (insert "|------|-------|-----------|------------|------------|--------------|--------|\n"))
+    buffer))
+
+(defun org-auto-scheduler-add-to-report (task scheduled)
+  "Add a task to the report buffer.
+TASK is the task info list, SCHEDULED is the scheduled timestamp."
+  (let ((buffer (get-buffer org-auto-scheduler-report-buffer-name)))
+    (when buffer
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert "| " 
+                (nth 6 task) " | " ; Task name
+                (format "%.2f" (nth 1 task)) " | " ; Score
+                (or (and scheduled 
+                     (format-time-string "%Y-%m-%d %H:%M" scheduled)) 
+                    "Not scheduled") " | "
+                (or (and (nth 10 task) 
+                     (format-time-string "%Y-%m-%d %H:%M" (nth 10 task)))
+                    "None") " | "
+                (if (nth 11 task)
+                    (format "%s" (nth 11 task))
+                  "None") " | "
+                (or (and (nth 12 task) 
+                     (format "%d" (nth 12 task)))
+                    "60") " | "
+                (or (nth 2 task) "None") " |\n")))))
 
 (defun org-auto-scheduler-schedule-single-task (marker current-time)
   "Schedule a single task at MARKER, starting from CURRENT-TIME.
@@ -1030,5 +1082,21 @@ configuration variables and raises errors if any are found."
 
 ;; Call this function when the package is loaded
 (org-auto-scheduler-validate-config)
+
+(defun org-auto-scheduler-display-report ()
+  "Format and display the scheduler report."
+  (let ((buffer (get-buffer org-auto-scheduler-report-buffer-name)))
+    (when buffer
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert "\n\n* Summary\n")
+        (insert (format "- Total tasks scheduled: %d\n" 
+                        (length org-auto-scheduler-completed-tasks)))
+        ;; Final alignment of the entire table
+        (goto-char (point-min))
+        (search-forward "|" nil t)
+        (beginning-of-line)
+        (org-table-align))
+      (pop-to-buffer buffer))))
 
 (provide 'org-auto-scheduler)
