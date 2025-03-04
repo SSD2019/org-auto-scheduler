@@ -7,7 +7,7 @@
 (require 'org-duration)
 (require 'time-date)
 (require 'org-clock)
-(require 'org-caldav)
+
 
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
 (org-auto-scheduler--log-set-level 'debug)
@@ -179,6 +179,14 @@ This can be overridden on a per-project basis using the PROJECT_INTERLEAVE prope
 
 (defvar org-auto-scheduler--idle-timer nil
   "Timer for background auto-scheduling.")
+
+(defvar org-auto-scheduler--background-running nil
+  "Flag to prevent concurrent background scheduling runs.")
+
+(defcustom org-auto-scheduler-sync-caldav t
+  "When non-nil, automatically sync with CalDAV before and after scheduling tasks."
+  :type 'boolean
+  :group 'org-auto-scheduler)
 
 (defun org-auto-scheduler-get-category-weight (marker)
   "Get the weight for the category of the task at MARKER."
@@ -764,7 +772,9 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   "Schedule all schedulable tasks, grouping them by project."
   (interactive)
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
-  (org-caldav-sync)
+  (when org-auto-scheduler-sync-caldav
+    (require 'org-caldav)
+    (org-caldav-sync))
   (condition-case err
       (progn
         (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
@@ -794,8 +804,9 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                 (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
           
           (org-auto-scheduler-display-report)
-          (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)))
-          (org-caldav-sync)
+          (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)
+          (when org-auto-scheduler-sync-caldav
+            (org-caldav-sync))))
     (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
 
@@ -891,7 +902,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (setf (nth 4 decoded) (+ month months))
     (when (> (nth 4 decoded) 12)
       (setf (nth 5 decoded) (1+ year))
-      (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
+            (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
     (setf (nth 3 decoded) (min day (calendar-last-day-of-month (nth 4 decoded) (nth 5 decoded))))
     (apply #'encode-time decoded)))
 
@@ -1088,7 +1099,7 @@ the time block, it schedules the task outside the time block."
   (let* ((decoded (decode-time time))
          (hour-minute (mapcar #'string-to-number (split-string time-string ":"))))
     (apply #'encode-time
-           (append (list 0 (nth 1 hour-minute) (nth 0 hour-minute))
+                      (append (list 0 (nth 1 hour-minute) (nth 0 hour-minute))
                    (nthcdr 3 decoded)))))
 
 (defun org-auto-scheduler-calculate-remaining-effort (marker)
@@ -1155,18 +1166,21 @@ configuration variables and raises errors if any are found."
 
 (defun org-auto-scheduler-background-run ()
   "Run the scheduler silently in the background."
-  (when org-auto-scheduler-background-enabled
-    (condition-case nil
-        (let ((original-log-level (org-auto-scheduler--log-get-level))
-              (org-auto-scheduler-silent-mode t))
-          ;; Temporarily set log level to 'error to suppress most output
-          (org-auto-scheduler--log-set-level 'error)
+  (interactive)
+  (when (and org-auto-scheduler-background-enabled
+             (not org-auto-scheduler--background-running)
+             (not (minibufferp))
+             (not (and (boundp 'org-clock-current-task) org-clock-current-task)))
+    (setq org-auto-scheduler--background-running t)
+    (org-auto-scheduler--log-info "Starting background auto-scheduler run...")
+    (condition-case err
+        (let ((org-auto-scheduler-silent-mode t))
           ;; Run scheduler in silent mode
-          (org-auto-scheduler-schedule-tasks)
-          ;; Restore original log level
-          (org-auto-scheduler--log-set-level original-log-level))
-      (error nil))
-    (org-auto-scheduler--log-info "Background auto-scheduler run completed.")))
+          (org-auto-scheduler-schedule-tasks))
+      (error 
+       (org-auto-scheduler--log-error "Error in background scheduler: %s" err)))
+    (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
+    (setq org-auto-scheduler--background-running nil)))
 
 (defun org-auto-scheduler-toggle-background ()
   "Toggle background auto-scheduling."
@@ -1180,17 +1194,35 @@ configuration variables and raises errors if any are found."
 (defun org-auto-scheduler-setup-background ()
   "Set up or cancel the background auto-scheduling timer based on the current setting."
   (interactive)
+  (org-auto-scheduler--log-info "Setting up background scheduler. Enabled: %s" 
+                               org-auto-scheduler-background-enabled)
+  
+  ;; Cancel existing timer if present
   (when org-auto-scheduler--idle-timer
+    (org-auto-scheduler--log-debug "Canceling existing background timer")
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
+  
+  ;; Create new timer if enabled
   (when org-auto-scheduler-background-enabled
+    (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds"
+                                 org-auto-scheduler-idle-time
+                                 org-auto-scheduler-background-interval)
     (setq org-auto-scheduler--idle-timer
           (run-with-idle-timer 
            org-auto-scheduler-idle-time
            org-auto-scheduler-background-interval
-           #'org-auto-scheduler-background-run))))
+           #'org-auto-scheduler-background-run))
+    (add-hook 'kill-emacs-hook #'org-auto-scheduler-cleanup-background)))
 
 ;; Ensure background scheduler is set up when Emacs is running in daemon mode
 (add-hook 'emacs-startup-hook 'org-auto-scheduler-setup-background)
+
+(defun org-auto-scheduler-cleanup-background ()
+  "Clean up background scheduler resources when Emacs is shutting down."
+  (when org-auto-scheduler--idle-timer
+    (cancel-timer org-auto-scheduler--idle-timer)
+    (setq org-auto-scheduler--idle-timer nil))
+  (setq org-auto-scheduler--background-running nil))
 
 (provide 'org-auto-scheduler)
