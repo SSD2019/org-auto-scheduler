@@ -6,6 +6,9 @@
 (require 'org-agenda)
 (require 'org-duration)
 (require 'time-date)
+(require 'org-clock)
+(require 'org-caldav)
+
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
 (org-auto-scheduler--log-set-level 'debug)
 
@@ -153,6 +156,29 @@ This can be overridden on a per-project basis using the PROJECT_INTERLEAVE prope
 
 (defvar org-auto-scheduler-report-buffer-name "*Org Auto Scheduler Report*"
   "Name of the buffer for the Org Auto Scheduler Report.")
+
+(defcustom org-auto-scheduler-silent-mode nil
+  "When non-nil, suppress report creation and display."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-background-enabled nil
+  "When non-nil, enable background auto-scheduling when Emacs is idle."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-idle-time 300
+  "Number of idle seconds before running the background scheduler."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-background-interval 300
+  "Interval in seconds for background scheduling (default: 5 minutes)."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--idle-timer nil
+  "Timer for background auto-scheduling.")
 
 (defun org-auto-scheduler-get-category-weight (marker)
   "Get the weight for the category of the task at MARKER."
@@ -738,6 +764,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   "Schedule all schedulable tasks, grouping them by project."
   (interactive)
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
+  (org-caldav-sync)
   (condition-case err
       (progn
         (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
@@ -768,6 +795,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
           
           (org-auto-scheduler-display-report)
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)))
+          (org-caldav-sync)
     (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
 
@@ -828,13 +856,13 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (org-back-to-heading t)  ; Move to the parent heading
     (let ((parent-state (org-get-todo-state)))
       (org-insert-heading-respect-content)  ; Insert a new heading after the current heading
-      (org-do-demote)  ; Demote the new heading to make it a child of the parent heading
-      (insert headline)  ; Insert the headline text
-      (when parent-state
-        (org-todo parent-state))  ; Set the TODO state
-      (org-set-tags-to '("AUTOSCH"))  ; Set the tags
-      (org-set-property "NOT_BEFORE" (format-time-string "[%Y-%m-%d %a]" date))  
-      (point-marker))))  ; Return the point marker
+            (org-do-demote)  ; Demote the new heading to make it a child of the parent heading
+            (insert headline)  ; Insert the headline text
+            (when parent-state
+              (org-todo parent-state))  ; Set the TODO state
+            (org-set-tags-to '("AUTOSCH"))  ; Set the tags
+            (org-set-property "NOT_BEFORE" (format-time-string "[%Y-%m-%d %a]" date))  
+            (point-marker))))  ; Return the point marker
 
 (defun org-auto-scheduler-find-existing-instance (headline)
   "Find an existing instance of a recurring task with HEADLINE."
@@ -965,15 +993,15 @@ the time block, it schedules the task outside the time block."
           (setq attempts (1+ attempts))
           (when available-time
             (setq end-time (time-add available-time (seconds-to-time (* 60 remaining-effort))))
-            (let ((occupied-result (org-auto-scheduler-time-slot-occupied-p available-time remaining-effort task-id)))
-              (when occupied-result
-                (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Time slot occupied: %s to %s"
-                                               (format-time-string "%Y-%m-%d %H:%M" available-time)
-                                               (format-time-string "%Y-%m-%d %H:%M" occupied-result))
-                (setq end-time nil)
-                (setq available-time (if time-block
-                                        (org-auto-scheduler-next-available-time-in-block occupied-result time-block remaining-effort)
-                                      (org-auto-scheduler-next-available-time occupied-result remaining-effort)))))))
+              (let ((occupied-result (org-auto-scheduler-time-slot-occupied-p available-time remaining-effort task-id)))
+                (when occupied-result
+                  (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Time slot occupied: %s to %s"
+                                                 (format-time-string "%Y-%m-%d %H:%M" available-time)
+                                                 (format-time-string "%Y-%m-%d %H:%M" occupied-result))
+                  (setq end-time nil)
+                  (setq available-time (if time-block
+                                          (org-auto-scheduler-next-available-time-in-block occupied-result time-block remaining-effort)
+                                        (org-auto-scheduler-next-available-time occupied-result remaining-effort)))))))
         (if end-time
             (progn
               (let* ((start-day (format-time-string "%Y-%m-%d" available-time))
@@ -1107,20 +1135,62 @@ configuration variables and raises errors if any are found."
 ;; Call this function when the package is loaded
 (org-auto-scheduler-validate-config)
 
+
 (defun org-auto-scheduler-display-report ()
   "Format and display the scheduler report."
-  (let ((buffer (get-buffer org-auto-scheduler-report-buffer-name)))
-    (when buffer
-      (with-current-buffer buffer
-        (goto-char (point-max))
-        (insert "\n\n* Summary\n")
-        (insert (format "- Total tasks scheduled: %d\n" 
-                        (length org-auto-scheduler-completed-tasks)))
-        ;; Final alignment of the entire table
-        (goto-char (point-min))
-        (search-forward "|" nil t)
-        (beginning-of-line)
-        (org-table-align))
-      (pop-to-buffer buffer))))
+  (when (not org-auto-scheduler-silent-mode)
+    (let ((buffer (get-buffer org-auto-scheduler-report-buffer-name)))
+      (when buffer
+        (with-current-buffer buffer
+          (goto-char (point-max))
+            (insert "\n\n* Summary\n")
+            (insert (format "- Total tasks scheduled: %d\n" 
+                            (length org-auto-scheduler-completed-tasks)))
+            ;; Final alignment of the entire table
+            (goto-char (point-min))
+            (search-forward "|" nil t)
+            (beginning-of-line)
+            (org-table-align))
+          (pop-to-buffer buffer)))))
+
+(defun org-auto-scheduler-background-run ()
+  "Run the scheduler silently in the background."
+  (when org-auto-scheduler-background-enabled
+    (condition-case nil
+        (let ((original-log-level (org-auto-scheduler--log-get-level))
+              (org-auto-scheduler-silent-mode t))
+          ;; Temporarily set log level to 'error to suppress most output
+          (org-auto-scheduler--log-set-level 'error)
+          ;; Run scheduler in silent mode
+          (org-auto-scheduler-schedule-tasks)
+          ;; Restore original log level
+          (org-auto-scheduler--log-set-level original-log-level))
+      (error nil))
+    (org-auto-scheduler--log-info "Background auto-scheduler run completed.")))
+
+(defun org-auto-scheduler-toggle-background ()
+  "Toggle background auto-scheduling."
+  (interactive)
+  (setq org-auto-scheduler-background-enabled 
+        (not org-auto-scheduler-background-enabled))
+  (org-auto-scheduler-setup-background)
+  (message "Background auto-scheduling %s" 
+           (if org-auto-scheduler-background-enabled "enabled" "disabled")))
+
+(defun org-auto-scheduler-setup-background ()
+  "Set up or cancel the background auto-scheduling timer based on the current setting."
+  (interactive)
+  (when org-auto-scheduler--idle-timer
+    (cancel-timer org-auto-scheduler--idle-timer)
+    (setq org-auto-scheduler--idle-timer nil))
+  (when org-auto-scheduler-background-enabled
+    (setq org-auto-scheduler--idle-timer
+          (run-with-idle-timer 
+           org-auto-scheduler-idle-time
+           org-auto-scheduler-background-interval
+           #'org-auto-scheduler-background-run))))
+
+;; Ensure background scheduler is set up when Emacs is running in daemon mode
+(add-hook 'emacs-startup-hook 'org-auto-scheduler-setup-background)
 
 (provide 'org-auto-scheduler)
