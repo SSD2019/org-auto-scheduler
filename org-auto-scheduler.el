@@ -188,6 +188,16 @@ This can be overridden on a per-project basis using the PROJECT_INTERLEAVE prope
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-allowed-hostnames nil
+  "List of hostnames allowed to run background auto-scheduling.
+When nil, background scheduling can run on any computer if enabled.
+When set to a list of strings, background scheduling will only run
+if the current system's hostname matches one in this list.
+Example: '(\"work-laptop\" \"home-desktop\")"
+  :type '(choice (const :tag "Any computer" nil)
+                 (repeat :tag "Specific computers" string))
+  :group 'org-auto-scheduler)
+
 (defun org-auto-scheduler-get-category-weight (marker)
   "Get the weight for the category of the task at MARKER."
   (let ((category (org-with-point-at marker (org-get-category))))
@@ -902,7 +912,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (setf (nth 4 decoded) (+ month months))
     (when (> (nth 4 decoded) 12)
       (setf (nth 5 decoded) (1+ year))
-            (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
+      (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
     (setf (nth 3 decoded) (min day (calendar-last-day-of-month (nth 4 decoded) (nth 5 decoded))))
     (apply #'encode-time decoded)))
 
@@ -1168,6 +1178,7 @@ configuration variables and raises errors if any are found."
   "Run the scheduler silently in the background."
   (interactive)
   (when (and org-auto-scheduler-background-enabled
+             (org-auto-scheduler-allowed-on-this-computer-p)
              (not org-auto-scheduler--background-running)
              (not (minibufferp))
              (not (and (boundp 'org-clock-current-task) org-clock-current-task)))
@@ -1182,14 +1193,24 @@ configuration variables and raises errors if any are found."
     (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
     (setq org-auto-scheduler--background-running nil)))
 
+(defun org-auto-scheduler-allowed-on-this-computer-p ()
+  "Check if background scheduling is allowed on this computer.
+Returns t if org-auto-scheduler-allowed-hostnames is nil or
+if the current system's hostname is in the list."
+  (or (null org-auto-scheduler-allowed-hostnames)
+      (member (system-name) org-auto-scheduler-allowed-hostnames)))
+
 (defun org-auto-scheduler-toggle-background ()
   "Toggle background auto-scheduling."
   (interactive)
   (setq org-auto-scheduler-background-enabled 
         (not org-auto-scheduler-background-enabled))
   (org-auto-scheduler-setup-background)
-  (message "Background auto-scheduling %s" 
-           (if org-auto-scheduler-background-enabled "enabled" "disabled")))
+  (message "Background auto-scheduling %s%s" 
+           (if org-auto-scheduler-background-enabled "enabled" "disabled")
+           (if (and org-auto-scheduler-background-enabled
+                    (not (org-auto-scheduler-allowed-on-this-computer-p)))
+               " (but not allowed on this computer)" "")))
 
 (defun org-auto-scheduler-setup-background ()
   "Set up or cancel the background auto-scheduling timer based on the current setting."
