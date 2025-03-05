@@ -816,6 +816,11 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
           (org-auto-scheduler-display-report)
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)
           (when org-auto-scheduler-sync-caldav
+            ;; Save all org agenda buffers before syncing with CalDAV
+            (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV sync")
+            (save-some-buffers t (lambda () 
+                                   (and (buffer-file-name)
+                                        (member (buffer-file-name) (org-agenda-files t)))))
             (org-caldav-sync))))
     (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
