@@ -211,3 +211,79 @@ If recurring tasks are not being scheduled as expected:
 2. Ensure that the `AUTOSCH` tag is present on the task.
 3. Check the `NOT_BEFORE` property to confirm it does not conflict with your desired scheduling.
 4. Use the debugging command `M-x org-auto-scheduler-debug` to inspect detailed logs for any issues related to recurring task scheduling.
+
+** Repeater Tasks Integration
+
+Org Auto Scheduler now supports integration with any repeater tasks (including org-habits) to prevent scheduling conflicts. When enabled, the scheduler will automatically detect tasks with repeater intervals and project their future occurrences to ensure AUTOSCH tasks are not scheduled at the same time.
+
+**Example Repeater Tasks:**
+
+#+BEGIN_SRC org
+* TODO GYM (Habit style)
+  SCHEDULED: <2024-01-15 Mon 07:00 +1d>
+  :PROPERTIES:
+  :STYLE: habit
+  :Effort: 1:00
+  :END:
+
+* TODO Weekly Meeting (Regular repeater)
+  SCHEDULED: <2024-01-15 Mon 14:00 ++1w>
+  :PROPERTIES:
+  :Effort: 0:30
+  :END:
+
+* TODO Daily Standup (With explicit end time)
+  SCHEDULED: <2025-08-16 Sat 15:54-17:24 ++1d>
+
+* TODO Monthly Review (Restart type)
+  SCHEDULED: <2024-01-15 Mon 09:00 .+1m>
+  :PROPERTIES:
+  :Effort: 2:00
+  :END:
+#+END_SRC
+
+**Customization Options:**
+
+- =org-auto-scheduler-repeater-integration=: Enable/disable repeater integration (default: t)
+- =org-auto-scheduler-repeater-look-days-ahead=: Days to project repeater occurrences (default: uses max of other settings)
+
+**Supported Repeater Types and Intervals:**
+
+***Repeater Types:***
+- =+=: Simple repeater (reschedules from original date)
+- =++=: Catch-up repeater (reschedules to today if overdue) 
+- =.+=: Restart repeater (reschedules from completion date)
+
+***Interval Units:***
+- =d=: Days (e.g., +1d, ++2d, .+3d)
+- =w=: Weeks (e.g., +1w, ++2w, .+1w)
+- =m=: Months (e.g., +1m, ++1m, .+2m)
+- =y=: Years (e.g., +1y, ++1y, .+1y)
+
+**Supported Scheduled Formats:**
+
+- =<2024-01-15 Mon 09:00 +1d>=: Basic repeater with effort-based duration
+- =<2025-08-16 Sat 15:54-17:24 ++1d>=: Repeater with explicit end time
+- =<2024-01-01 Mon 09:00>--<2024-01-01 Mon 10:00> +1w=: Range format with repeater
+
+**Interactive Commands:**
+
+- =M-x org-auto-scheduler-show-repeater-projections=: Display projected repeater occurrences for debugging
+- =M-x org-auto-scheduler-clear-repeater-cache=: Clear repeater projections cache to force regeneration
+
+*For backward compatibility, the old habit-specific commands are still available as aliases.*
+
+**How It Works:**
+
+1. The system scans all agenda files for tasks with repeater intervals (+, ++, .+)
+2. Projects future occurrences based on the scheduled time and repeater interval
+3. Includes these projections in conflict detection when scheduling AUTOSCH tasks
+4. Uses caching to improve performance when checking multiple time slots
+5. Supports both effort-based duration and explicit end times
+
+**Notes:**
+
+- Repeater tasks are excluded from being treated as regular scheduled tasks to avoid double-counting
+- The system projects repeaters up to the maximum of `org-auto-scheduler-max-days-to-check` or `org-auto-scheduler-recurring-look-days-ahead`
+- Repeater projections are cached for 10 minutes to improve performance during scheduling sessions
+- All three repeater types (+, ++, .+) are projected the same way for conflict detection - their differences only matter when marking tasks as done

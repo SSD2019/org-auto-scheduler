@@ -115,8 +115,35 @@ Times should be in 24-hour format."
   :type 'integer
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-repeater-integration t
+  "When non-nil, integrate repeater tasks (including habits) into conflict detection.
+This will project repeater task occurrences into the future to prevent
+AUTOSCH tasks from being scheduled at the same time as repeater tasks.
+Supports +, ++, and .+ repeater types with d/w/m/y intervals."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-repeater-look-days-ahead nil
+  "Number of days to look ahead for projecting repeater task occurrences.
+If nil, uses the maximum of org-auto-scheduler-max-days-to-check 
+and org-auto-scheduler-recurring-look-days-ahead."
+  :type '(choice (const :tag "Use max of other settings" nil)
+                 (integer :tag "Specific number of days"))
+  :group 'org-auto-scheduler)
+
+;; Keep habit-related variables for backward compatibility
+(defvaralias 'org-auto-scheduler-habit-integration 'org-auto-scheduler-repeater-integration)
+(defvaralias 'org-auto-scheduler-habit-look-days-ahead 'org-auto-scheduler-repeater-look-days-ahead)
+
 (defvar org-auto-scheduler-completed-tasks '()
   "List of AUTOSCH tasks that have been scheduled in the current process.")
+
+(defvar org-auto-scheduler--repeater-projections-cache nil
+  "Cache for repeater projections to improve performance.
+Format: ((end-date . projections) ...)")
+
+(defvar org-auto-scheduler--repeater-cache-valid-until nil
+  "Time until which the repeater projections cache is valid.")
 
 (defcustom org-auto-scheduler-tag-weights
   '(("URGENT" . 10)
@@ -216,48 +243,71 @@ Example: '(\"work-laptop\" \"home-desktop\")"
         (or (and priority (string-to-number priority)) 0)))))
 
 (defun org-auto-scheduler-get-agenda-items (date)
-  "Get agenda items for DATE.  Includes tasks with active timestamps."
+  "Get agenda items for DATE.  Includes tasks with active timestamps and projected habit occurrences."
   (condition-case err
       (let* ((date-string (format-time-string "%Y-%m-%d" date))
              (agenda-items
               (delq nil
                     (append
-                     ;; Scheduled tasks
+                     ;; Scheduled tasks (excluding habit tasks to avoid double-counting)
                      (org-map-entries
                       (lambda ()
                         (let* ((task-name (org-get-heading t t t t))
                                (scheduled-time-str (org-entry-get nil "SCHEDULED"))
                                (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
                                (task-id (org-id-get))
-                               (tags (org-get-tags)))
-                          (when (and scheduled-time (not (member "AUTOSCH" tags)))
+                               (tags (org-get-tags))
+                               (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
+                          ;; Exclude AUTOSCH tags and repeater tasks (repeaters are handled separately)
+                          (when (and scheduled-time 
+                                   (not (member "AUTOSCH" tags))
+                                   (not has-repeater))
                             (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                                    (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
                               (when (string= scheduled-date date-string)
                                 (list task-id scheduled-time task-end-time tags t task-name))))))
                       nil
                       'agenda)
-                     ;; Tasks with active timestamps
+                     ;; Tasks with active timestamps (excluding habit tasks)
                      (org-map-entries
                       (lambda ()
                         (let* ((task-name (org-get-heading t t t t))
                                (scheduled-time-str (org-entry-get nil "TIMESTAMP"))
                                (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
                                (task-id (org-id-get))
-                               (tags (org-get-tags)))
-                          (when (and scheduled-time (not (member "AUTOSCH" tags)))
+                               (tags (org-get-tags))
+                               (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
+                          ;; Exclude AUTOSCH tags and repeater tasks
+                          (when (and scheduled-time 
+                                   (not (member "AUTOSCH" tags))
+                                   (not has-repeater))
                             (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                                    (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
                               (when (string= scheduled-date date-string)
                                 (list task-id scheduled-time task-end-time tags t task-name))))))
                       nil
-                      'agenda)
-                      ))))
+                      'agenda)))))
+        
         ;; Add completed AUTOSCH tasks for the current date
         (dolist (task org-auto-scheduler-completed-tasks)
           (let ((task-date (format-time-string "%Y-%m-%d" (nth 1 task))))
             (when (string= task-date date-string)
               (push task agenda-items))))
+
+        ;; Add projected repeater occurrences for the current date
+        (when org-auto-scheduler-repeater-integration
+          (let* ((look-ahead-days (or org-auto-scheduler-repeater-look-days-ahead
+                                    (max org-auto-scheduler-max-days-to-check
+                                         org-auto-scheduler-recurring-look-days-ahead)))
+                 (end-date (time-add (current-time) (days-to-time look-ahead-days)))
+                 (repeater-projections (org-auto-scheduler-get-all-repeater-projections end-date)))
+            (dolist (repeater-item repeater-projections)
+              (let ((repeater-date (format-time-string "%Y-%m-%d" (nth 1 repeater-item))))
+                (when (string= repeater-date date-string)
+                  (push repeater-item agenda-items)
+                  (org-auto-scheduler--log-debug "Added projected repeater occurrence: %s at %s"
+                                                 (nth 5 repeater-item)
+                                                 (format-time-string "%Y-%m-%d %H:%M" (nth 1 repeater-item))))))))
 
         (org-auto-scheduler--log-debug "Agenda items considered for conflicts:")
         (dolist (item agenda-items)
@@ -1156,6 +1206,204 @@ configuration variables and raises errors if any are found."
       (let ((not-before-string (org-entry-get marker "NOT_BEFORE")))
         (when not-before-string
       (org-time-string-to-time not-before-string))))
+
+(defun org-auto-scheduler-has-repeater-task (marker)
+  "Check if the task at MARKER has a repeater interval.
+Returns t if the task has a scheduled time with repeater (+, ++, or .+)."
+  (when marker
+    (let ((scheduled-string (org-entry-get marker "SCHEDULED")))
+      (and scheduled-string 
+           (string-match "\\([.+]*\\+\\+?\\)\\([0-9]+\\)\\([dwmy]\\)" scheduled-string)))))
+
+(defun org-auto-scheduler-parse-repeater-interval (scheduled-string)
+  "Parse the repeater interval from a SCHEDULED string.
+Supports formats like:
+  '<2024-01-01 Mon 09:00 +1d>'
+  '<2024-01-01 Mon 09:00 ++1w>'
+  '<2024-01-01 Mon 09:00 .+1m>'
+  '<2025-08-16 Sat 15:54-17:24 ++1d>'
+Returns a list (repeater-type interval-number interval-unit) where:
+  - repeater-type is '+', '++', or '.+'
+  - interval-number is the numeric part
+  - interval-unit is 'd', 'w', 'm', or 'y'"
+  (when (and scheduled-string 
+             (string-match "\\([.+]*\\+\\+?\\)\\([0-9]+\\)\\([dwmy]\\)" scheduled-string))
+    (list (match-string 1 scheduled-string)
+          (string-to-number (match-string 2 scheduled-string))
+          (match-string 3 scheduled-string))))
+
+(defun org-auto-scheduler-parse-scheduled-time-range (scheduled-string)
+  "Parse scheduled string to extract start time, end time, and repeater info.
+Supports formats like:
+  '<2024-01-01 Mon 09:00 +1d>' -> (start-time nil repeater-info)
+  '<2025-08-16 Sat 15:54-17:24 ++1d>' -> (start-time end-time repeater-info)
+  '<2024-01-01 Mon 09:00>--<2024-01-01 Mon 10:00>' -> (start-time end-time nil)
+Returns a list (start-time end-time repeater-info) where repeater-info is from parse-repeater-interval."
+  (when scheduled-string
+    (cond
+     ;; Format with explicit end time and repeater: <2025-08-16 Sat 15:54-17:24 ++1d>
+     ((string-match "<\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\} [A-Za-z]+ [0-9]\\{2\\}:[0-9]\\{2\\}\\)-\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)\\([^>]*\\)>" scheduled-string)
+      (let* ((start-part (match-string 1 scheduled-string))
+             (end-time-part (match-string 2 scheduled-string))
+             (repeater-part (match-string 3 scheduled-string))
+             (start-time (org-time-string-to-time start-part))
+             (full-end-time-str (concat (substring start-part 0 11) end-time-part))
+             (end-time (org-time-string-to-time full-end-time-str))
+             (repeater-info (when (string-match "\\([.+]*\\+\\+?\\)\\([0-9]+\\)\\([dwmy]\\)" repeater-part)
+                            (list (match-string 1 repeater-part)
+                                  (string-to-number (match-string 2 repeater-part))
+                                  (match-string 3 repeater-part)))))
+        (list start-time end-time repeater-info)))
+     
+     ;; Format with range and repeater: <2023-05-01 Mon 09:00>--<2023-05-01 Mon 10:00> +1d
+     ((string-match "\\(<[^>]+>\\)--\\(<[^>]+>\\)\\s*\\([.+]*\\+\\+?[0-9]+[dwmy]\\)?" scheduled-string)
+      (let* ((start-time (org-time-string-to-time (match-string 1 scheduled-string)))
+             (end-time (org-time-string-to-time (match-string 2 scheduled-string)))
+             (repeater-part (match-string 3 scheduled-string))
+             (repeater-info (when repeater-part
+                            (org-auto-scheduler-parse-repeater-interval repeater-part))))
+        (list start-time end-time repeater-info)))
+     
+     ;; Standard format with repeater: <2024-01-01 Mon 09:00 +1d>
+     (t 
+      (let* ((start-time (org-time-string-to-time scheduled-string))
+             (repeater-info (org-auto-scheduler-parse-repeater-interval scheduled-string)))
+        (list start-time nil repeater-info))))))
+
+(defun org-auto-scheduler-calculate-next-repeater-occurrence (base-time interval-info)
+  "Calculate the next occurrence of a repeater task from BASE-TIME using INTERVAL-INFO.
+INTERVAL-INFO is a list (repeater-type number unit) where:
+  - repeater-type is '+', '++', or '.+'
+  - number is the interval number
+  - unit is 'd', 'w', 'm', or 'y'
+For '+' type: simple repetition from the base time
+For '++' type: catch-up repetition (same as + for future projections)  
+For '.+' type: restart from completion time (same as + for future projections)"
+  (when interval-info
+    (let ((repeater-type (car interval-info))
+          (number (cadr interval-info))
+          (unit (caddr interval-info)))
+      ;; For projection purposes, all repeater types work the same way
+      ;; The difference is in how they behave when marked done, which doesn't affect projection
+      (cond
+       ((string= unit "d") (time-add base-time (days-to-time number)))
+       ((string= unit "w") (time-add base-time (days-to-time (* number 7))))
+       ((string= unit "m") (org-auto-scheduler-add-months base-time number))
+       ((string= unit "y") (org-auto-scheduler-add-months base-time (* number 12)))
+       (t base-time)))))
+
+(defun org-auto-scheduler-get-repeater-task-info (marker)
+  "Get repeater task information from MARKER.
+Returns a list (start-time end-time repeater-info effort) or nil if not a repeater task."
+  (when (org-auto-scheduler-has-repeater-task marker)
+    (let* ((scheduled-string (org-entry-get marker "SCHEDULED"))
+           (time-range-info (when scheduled-string (org-auto-scheduler-parse-scheduled-time-range scheduled-string)))
+           (start-time (car time-range-info))
+           (end-time (cadr time-range-info))
+           (repeater-info (caddr time-range-info))
+           (effort (or (org-auto-scheduler-get-effort marker) 60)))
+      (when (and start-time repeater-info)
+        ;; If no explicit end time, calculate from effort
+        (let ((calculated-end-time (or end-time 
+                                     (time-add start-time (seconds-to-time (* effort 60))))))
+          (list start-time calculated-end-time repeater-info effort))))))
+
+(defun org-auto-scheduler-project-repeater-occurrences (marker end-date)
+  "Project all occurrences of a repeater task at MARKER up to END-DATE.
+Returns a list of agenda items compatible with org-auto-scheduler-get-agenda-items format."
+  (let ((repeater-info (org-auto-scheduler-get-repeater-task-info marker)))
+    (when repeater-info
+      (let* ((start-time (car repeater-info))
+             (task-end-time (cadr repeater-info))
+             (interval-info (caddr repeater-info))
+             (effort (cadddr repeater-info))
+             (task-id (org-with-point-at marker (or (org-id-get) (org-id-get-create))))
+             (task-name (org-with-point-at marker (org-get-heading t t t t)))
+             (tags (org-with-point-at marker (org-get-tags)))
+             (current-start-time start-time)
+             (occurrences '()))
+        ;; Project occurrences starting from the base time
+        (while (time-less-p current-start-time end-date)
+          (let* ((current-end-time (time-add current-start-time 
+                                           (time-subtract task-end-time start-time)))
+                 (agenda-item (list task-id current-start-time current-end-time tags t task-name)))
+            (push agenda-item occurrences)
+            (setq current-start-time (org-auto-scheduler-calculate-next-repeater-occurrence current-start-time interval-info))))
+        (nreverse occurrences)))))
+
+(defun org-auto-scheduler-get-all-repeater-projections (end-date)
+  "Get all projected repeater task occurrences up to END-DATE.
+Returns a list of agenda items for all repeater tasks found in agenda files.
+Uses caching to improve performance when called multiple times with same end-date."
+  (when org-auto-scheduler-repeater-integration
+    ;; Check if we have a valid cached result
+    (let* ((cache-key (format-time-string "%Y-%m-%d" end-date))
+           (cached-result (assoc cache-key org-auto-scheduler--repeater-projections-cache))
+           (cache-expired (or (null org-auto-scheduler--repeater-cache-valid-until)
+                            (time-less-p org-auto-scheduler--repeater-cache-valid-until (current-time)))))
+      
+      (if (and cached-result (not cache-expired))
+          ;; Return cached result
+          (progn
+            (org-auto-scheduler--log-debug "Using cached repeater projections for %s" cache-key)
+            (cdr cached-result))
+        ;; Generate new projections
+        (org-auto-scheduler--log-debug "Generating new repeater projections for %s" cache-key)
+        (let ((repeater-occurrences '()))
+          (org-map-entries
+           (lambda ()
+             (when (org-auto-scheduler-has-repeater-task (point-marker))
+               (let ((projections (org-auto-scheduler-project-repeater-occurrences (point-marker) end-date)))
+                 (setq repeater-occurrences (append repeater-occurrences projections)))))
+           nil
+           'agenda)
+          
+          ;; Cache the result (cache expires in 10 minutes)
+          (setq org-auto-scheduler--repeater-cache-valid-until 
+                (time-add (current-time) (seconds-to-time 600)))
+          (setq org-auto-scheduler--repeater-projections-cache
+                (cons (cons cache-key repeater-occurrences)
+                      (cl-remove-if (lambda (item) (string= (car item) cache-key))
+                                    org-auto-scheduler--repeater-projections-cache)))
+          
+          repeater-occurrences)))))
+
+(defun org-auto-scheduler-clear-repeater-cache ()
+  "Clear the repeater projections cache.
+This is useful when repeater tasks have been modified and you want
+to ensure fresh projections are generated."
+  (interactive)
+  (setq org-auto-scheduler--repeater-projections-cache nil)
+  (setq org-auto-scheduler--repeater-cache-valid-until nil)
+  (org-auto-scheduler--log-info "Cleared repeater projections cache")
+  (when (called-interactively-p 'interactive)
+    (message "Repeater projections cache cleared")))
+
+;; Keep old function names for backward compatibility
+(defalias 'org-auto-scheduler-clear-habit-cache 'org-auto-scheduler-clear-repeater-cache)
+
+(defun org-auto-scheduler-show-repeater-projections ()
+  "Show projected repeater occurrences for debugging purposes."
+  (interactive)
+  (let* ((look-ahead-days (or org-auto-scheduler-repeater-look-days-ahead
+                            (max org-auto-scheduler-max-days-to-check
+                                 org-auto-scheduler-recurring-look-days-ahead)))
+         (end-date (time-add (current-time) (days-to-time look-ahead-days)))
+         (projections (org-auto-scheduler-get-all-repeater-projections end-date)))
+    (with-output-to-temp-buffer "*Repeater Projections*"
+      (princ (format "Repeater projections for the next %d days:\n\n" look-ahead-days))
+      (if projections
+          (dolist (projection projections)
+            (princ (format "- %s: %s to %s\n"
+                           (nth 5 projection) ; task name
+                           (format-time-string "%Y-%m-%d %H:%M" (nth 1 projection)) ; start
+                           (format-time-string "%H:%M" (nth 2 projection))))) ; end
+        (princ "No repeater tasks found or repeater integration is disabled.\n"))
+      (princ (format "\nRepeater integration enabled: %s\n" org-auto-scheduler-repeater-integration))
+      (princ (format "Look-ahead days: %d\n" look-ahead-days)))))
+
+;; Keep old function name for backward compatibility
+(defalias 'org-auto-scheduler-show-habit-projections 'org-auto-scheduler-show-repeater-projections)
 
 
 ;; Call this function when the package is loaded
