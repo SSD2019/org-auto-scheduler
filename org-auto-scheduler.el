@@ -258,9 +258,10 @@ Example: '(\"work-laptop\" \"home-desktop\")"
                                (task-id (org-id-get))
                                (tags (org-get-tags))
                                (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-                          ;; Exclude AUTOSCH tags and repeater tasks (repeaters are handled separately)
+                          ;; Exclude AUTOSCH tags, ARCHIVE tags, and repeater tasks (repeaters are handled separately)
                           (when (and scheduled-time 
                                    (not (member "AUTOSCH" tags))
+                                   (not (member "ARCHIVE" tags))
                                    (not has-repeater))
                             (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                                    (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
@@ -277,9 +278,10 @@ Example: '(\"work-laptop\" \"home-desktop\")"
                                (task-id (org-id-get))
                                (tags (org-get-tags))
                                (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-                          ;; Exclude AUTOSCH tags and repeater tasks
+                          ;; Exclude AUTOSCH tags, ARCHIVE tags, and repeater tasks
                           (when (and scheduled-time 
                                    (not (member "AUTOSCH" tags))
+                                   (not (member "ARCHIVE" tags))
                                    (not has-repeater))
                             (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                                    (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
@@ -475,7 +477,8 @@ Returns a list containing the total score and individual score components."
                             urgency-score
                             category-score
                             state-weight)))
-        (org-auto-scheduler--log-debug "Calculating score for task %s" (org-id-get))
+        (org-auto-scheduler--log-debug "Calculating score for task %s"
+                                       (org-with-point-at marker (or (org-id-get) "NO-ID")))
         (list total-score effort-score priority-total urgency-score category-score state-weight
               effort priority-score inherited-priority days-to-deadline category-weight state))
     (error
@@ -552,7 +555,15 @@ Returns a list containing the total score and individual score components."
                                       (org-entry-get nil "SCHEDULED")))
                            (not-before (org-auto-scheduler-get-not-before marker))
                            (time-block (org-auto-scheduler-get-task-tag-block marker))
-                           (effort (org-auto-scheduler-get-effort marker)))
+                           (effort (org-auto-scheduler-get-effort marker))
+                           (task-position (org-auto-scheduler-get-task-position marker))
+                           (parent-node (save-excursion
+                                          (with-current-buffer (marker-buffer marker)
+                                            (goto-char (marker-position marker))
+                                            (if (org-up-heading-safe)
+                                                (cons (current-buffer) (point))
+                                              nil))))
+                           (position-info (cons parent-node task-position)))
                       (org-auto-scheduler--log-debug 
                        "Task info: Name: %s, ID: %s, Project: %s, Score: %f, Position: %d"
                        task-name task-id project-id score task-position)
@@ -560,7 +571,7 @@ Returns a list containing the total score and individual score components."
                             score
                             project-id
                             project-priority
-                            task-position
+                            position-info
                             task-id
                             task-name
                             tags
@@ -570,34 +581,68 @@ Returns a list containing the total score and individual score components."
                             time-block
                             effort
                             (cdr score-info))))
-                  tasks)))
-    (org-auto-scheduler--log-debug "Tasks after sorting:")
-    (let ((sorted-tasks (sort tasks-with-info
-                             (lambda (a b)
-                               (let* ((project-priority-a (nth 3 a))
-                                      (project-priority-b (nth 3 b))
-                                      (project-a (nth 2 a))
-                                      (project-b (nth 2 b))
-                                      (position-a (nth 4 a))
-                                      (position-b (nth 4 b))
-                                      (score-a (nth 1 a))
-                                      (score-b (nth 1 b))
-                                      (allows-interleave-a (nth 9 a))
-                                      (allows-interleave-b (nth 9 b)))
-                                 (cond
-                                  ((not (= project-priority-a project-priority-b))
-                                   (> project-priority-a project-priority-b))
-                                  ((and project-a project-b
-                                        (not (equal project-a project-b)))
-                                   (if (and allows-interleave-a allows-interleave-b)
-                                       (< position-a position-b)
-                                     (string< project-a project-b)))
-                                  ((and project-a project-b
-                                        (equal project-a project-b))
-                                   (< position-a position-b))
-                                  ((not (= score-a score-b))
-                                   (> score-a score-b))
-                                  (t nil)))))))
+                  tasks))
+           ;; Calculate max score per project
+           (project-max-scores (make-hash-table :test 'equal)))
+      
+      ;; First pass: find max score for each project
+      (dolist (task tasks-with-info)
+        (let ((project-id (nth 2 task))
+              (score (nth 1 task)))
+          (when project-id
+            (let ((current-max (gethash project-id project-max-scores -999999.0)))
+              (when (> score current-max)
+                (puthash project-id score project-max-scores))))))
+
+      (org-auto-scheduler--log-debug "Tasks after sorting:")
+      (let ((sorted-tasks (sort tasks-with-info
+                               (lambda (a b)
+                                 (let* ((project-priority-a (nth 3 a))
+                                        (project-priority-b (nth 3 b))
+                                        (project-a (nth 2 a))
+                                        (project-b (nth 2 b))
+                                        (position-info-a (nth 4 a))
+                                        (position-info-b (nth 4 b))
+                                        (parent-node-a (car position-info-a))
+                                        (parent-node-b (car position-info-b))
+                                        (task-pos-a (cdr position-info-a))
+                                        (task-pos-b (cdr position-info-b))
+                                        (score-a (nth 1 a))
+                                        (score-b (nth 1 b))
+                                        (allows-interleave-a (nth 9 a))
+                                        (allows-interleave-b (nth 9 b))
+                                        (max-score-a (if project-a (gethash project-a project-max-scores) -999999.0))
+                                        (max-score-b (if project-b (gethash project-b project-max-scores) -999999.0)))
+                                   (cond
+                                    ;; 1. Explicit project priority
+                                    ((not (= project-priority-a project-priority-b))
+                                     (> project-priority-a project-priority-b))
+                                     
+                                    ;; 2. Different projects
+                                    ((and project-a project-b
+                                          (not (equal project-a project-b)))
+                                     (if (and allows-interleave-a allows-interleave-b)
+                                         ;; If interleaving, sort purely by score for distinct projects
+                                         (> score-a score-b)
+                                       ;; Non-interleaving: Compare max score of projects instead of string<
+                                       (if (= max-score-a max-score-b)
+                                           (> score-a score-b)
+                                         (> max-score-a max-score-b))))
+                                         
+                                    ;; 3. Same project
+                                    ((and project-a project-b
+                                          (equal project-a project-b))
+                                     (if (equal parent-node-a parent-node-b)
+                                         ;; Direct siblings keep their relative textual order
+                                         (< task-pos-a task-pos-b)
+                                       ;; Tasks across different subtrees sort by their score prioritizing highest impact
+                                       (> score-a score-b)))
+                                     
+                                    ;; 4. Fallback to individual scores
+                                    ((not (= score-a score-b))
+                                     (> score-a score-b))
+                                     
+                                    (t nil)))))))
       (dolist (task sorted-tasks)
         (org-auto-scheduler--log-debug 
          "  ID: %s, Name: %s, Tags: %s, Score: %f, Project: %s, Position: %d, Scheduled: %s"
@@ -606,7 +651,7 @@ Returns a list containing the total score and individual score components."
          (nth 7 task)  ; tags
          (nth 1 task)  ; score
          (nth 2 task)  ; project-id
-         (nth 4 task)  ; position
+         (cdr (nth 4 task))  ; position
          (nth 8 task))) ; scheduled
       sorted-tasks)))
 
@@ -1352,9 +1397,11 @@ Uses caching to improve performance when called multiple times with same end-dat
         (let ((repeater-occurrences '()))
           (org-map-entries
            (lambda ()
-             (when (org-auto-scheduler-has-repeater-task (point-marker))
-               (let ((projections (org-auto-scheduler-project-repeater-occurrences (point-marker) end-date)))
-                 (setq repeater-occurrences (append repeater-occurrences projections)))))
+             (let ((tags (org-get-tags)))
+               (when (and (not (member "ARCHIVE" tags))
+                        (org-auto-scheduler-has-repeater-task (point-marker)))
+                 (let ((projections (org-auto-scheduler-project-repeater-occurrences (point-marker) end-date)))
+                   (setq repeater-occurrences (append repeater-occurrences projections))))))
            nil
            'agenda)
           
