@@ -1,289 +1,431 @@
 * Org Auto Scheduler
 
-Org Auto Scheduler is an Emacs plugin that automatically schedules tasks in your Org mode files based on various factors such as priority, deadline, effort, and custom time blocks.
+Org Auto Scheduler is an Emacs plugin that automatically schedules tasks in your Org mode files. It scores tasks by priority, deadline, effort, state, and category; sorts them using a dependency-aware topological algorithm; and packs them into your available time windows—respecting time blocks, repeater conflicts, and task blockers.
 
-** Features
+** Table of Contents
 
-- Automatically schedules tasks with the =AUTOSCH= tag
-- Considers task priority, deadline, effort, and current state
-- Supports custom time blocks for specific tags
-- Respects existing scheduled tasks and avoids conflicts
-- Customizable scheduling parameters
-- Handles project-based task grouping and ordering
-- Considers clocked time when calculating remaining effort
-- Supports "NOT_BEFORE" property to set the earliest scheduling time for a task
+- [[#quick-start][Quick Start]]
+- [[#how-tasks-are-selected][How Tasks Are Selected]]
+- [[#task-properties][Task Properties]]
+- [[#how-scoring-works][How Scoring Works]]
+- [[#how-sorting-works][How Sorting Works]]
+- [[#interactive-commands][Interactive Commands]]
+- [[#review-and-apply-buffer][Review & Apply Buffer]]
+- [[#background-scheduling][Background Scheduling]]
+- [[#historical-effort-tracking][Historical Effort Tracking]]
+- [[#repeater--habit-integration][Repeater / Habit Integration]]
+- [[#recurring-tasks][Recurring Tasks]]
+- [[#agenda-bump][Agenda Bump]]
+- [[#customization-reference][Customization Reference]]
+- [[#file-weights][File Weights]]
+- [[#debugging][Debugging]]
 
-** Usage
+** Quick Start
 
-To use Org Auto Scheduler, add the =AUTOSCH= tag to any task you want to be automatically scheduled. You can also set a "NOT_BEFORE" property to specify the earliest date and time the task should be scheduled. For example:
+1. Add the =AUTOSCH= tag to any task you want auto-scheduled.
+2. Run =M-x org-auto-scheduler-review-and-apply= to preview the schedule, then
+   press =x= in the review buffer to apply it.
 
-#+BEGIN_SRC org
-* TODO Task with NOT_BEFORE property :AUTOSCH:
+Or apply directly without review:
+
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-schedule-tasks
+#+end_src
+
+Recommended key binding:
+
+#+begin_src emacs-lisp
+(global-set-key (kbd "C-c a s") 'org-auto-scheduler-schedule-tasks)
+(global-set-key (kbd "C-c a r") 'org-auto-scheduler-review-and-apply)
+#+end_src
+
+** How Tasks Are Selected
+
+A task is eligible for scheduling when it has:
+- The =AUTOSCH= tag, *and*
+- A TODO state that appears as a key in =org-auto-scheduler-state-weights=, *and*
+- Does *not* carry the =ARCHIVE= tag.
+
+Tasks blocked by incomplete =BLOCKER= / =DEPENDS_ON= dependencies are skipped unless all blocking tasks have already been scheduled in the current session.
+
+** Task Properties
+
+These properties go inside the task's =:PROPERTIES:= drawer.
+
+| Property                  | Values                                          | Description                                                                        |
+|---------------------------+-------------------------------------------------+------------------------------------------------------------------------------------|
+| =NOT_BEFORE=              | Org timestamp (e.g. =<2025-06-01 Sun 09:00>=)  | Earliest allowed scheduling time for this task.                                    |
+| =RECURRING=               | =daily= / =weekly= / =bi-weekly= / =monthly=   | Creates sub-task instances for each upcoming occurrence.                           |
+| =BLOCKER=                 | Space-separated org-id strings                  | This task won't be scheduled before all listed tasks are DONE or scheduled.        |
+| =DEPENDS_ON=              | Space-separated org-id strings                  | Alias for =BLOCKER=. Both properties are combined.                                 |
+| =INHERITED_PRIORITY=      | Integer                                         | Adds a flat bonus to the task's priority score. Inherited from parent headings.    |
+| =PROJECT_PRIORITY=        | Integer                                         | Explicit priority for the whole project (set on the =:PROJECT:= heading).          |
+| =PROJECT_INTERLEAVE=      | =t= / =yes= / =nil= / =no=                     | Override interleaving policy for this project. Unset = use global default.         |
+
+*** Example
+
+#+begin_src org
+* TODO Deploy feature :AUTOSCH:
   :PROPERTIES:
-  :NOT_BEFORE: <2023-05-15 Mon 09:00>
+  :NOT_BEFORE: <2026-04-01 Wed 10:00>
+  :BLOCKER:   abc123-id-of-review-task
+  :Effort:    1:30
   :END:
+#+end_src
 
-This task will not be scheduled before May 15, 2023, at 9:00 AM.
-#+END_SRC
+** How Scoring Works
 
-Then run the command:
+Each task receives a composite score:
 
-=M-x org-auto-scheduler-schedule-tasks=
+#+begin_example
+score = (effort × effort_weight)
+      + ((priority_score + inherited_priority) × priority_weight)
+      + (1 / (1 + days_to_deadline) × urgency_weight)
+      + (category_weight × 10)
+      + state_weight
+      + hard_deadline_boost   ; applied when deadline ≤ hard_deadline_days away
+#+end_example
 
-You can also bind this command to a key combination, for example:
+- *Priority score*: =A= → 10, =B= → 0, =C= → −5, none → 0
+- *State weight*: from =org-auto-scheduler-state-weights=
+- *Category weight*: from =org-auto-scheduler-category-weights=
+- *Effort*: actual effort × historical multiplier (if tracking is on)
+- *buffertime tag*: applies a 15-minute gap around the task instead of the default =org-auto-scheduler-task-gap=
 
-=(global-set-key (kbd "C-c a s") 'org-auto-scheduler-schedule-tasks)=
+** How Sorting Works
 
-** Customization Options
+Tasks are sorted with a *topological sort (Kahn's algorithm)* that respects:
 
-*** General Settings
+1. Explicit =BLOCKER= / =DEPENDS_ON= edges — a task comes after its blockers.
+2. Implicit sibling ordering — tasks with the same parent inside the same project
+   keep their textual order.
+3. Project-level priority (=PROJECT_PRIORITY= property).
+4. Per-project interleaving:
+   - When interleaving is *on* (default), tasks from different projects are
+     merged by individual score.
+   - When interleaving is *off*, projects are scheduled as contiguous blocks,
+     ordered by each project's *maximum task score*.
+5. Individual score as the final tiebreaker.
 
-- =org-auto-scheduler-start-time=: Start time for scheduling tasks (default: "09:00")
-- =org-auto-scheduler-end-time=: End time for scheduling tasks (default: "17:00")
-- =org-auto-scheduler-task-gap=: Gap between scheduled tasks in minutes (default: 5)
-- =org-auto-scheduler-max-days-to-check=: Maximum number of days to look ahead for scheduling (default: 14)
-- =org-auto-scheduler-time-interval=: Interval in minutes for checking time slots (default: 15)
-- =org-auto-scheduler-excluded-days=: List of days to exclude from scheduling (0 is Sunday, 6 is Saturday)
+Circular dependencies are detected; cyclic tasks are appended at the end with
+a depth marker of 99 as a warning signal.
 
-*** Scoring Weights
+** Interactive Commands
 
-- =org-auto-scheduler-effort-weight=: Weight for remaining effort in score calculation (default: 0.0)
-- =org-auto-scheduler-priority-weight=: Weight for priority in score calculation (default: 10.0)
-- =org-auto-scheduler-urgency-weight=: Weight for urgency factor in score calculation (default: 20.0)
-- =org-auto-scheduler-urgent-days=: Number of days before a deadline is considered urgent (default: 7)
+| Command                                         | Description                                                                                        |
+|-------------------------------------------------+----------------------------------------------------------------------------------------------------|
+| =M-x org-auto-scheduler-schedule-tasks=         | Run the full scheduler and apply timestamps immediately.                                           |
+| =M-x org-auto-scheduler-review-and-apply=       | Preview the proposed schedule in the interactive review buffer before applying.                    |
+| =M-x org-auto-scheduler-debug=                  | Run scheduler with debug logging enabled, then open the log buffer.                                |
+| =M-x org-auto-scheduler-toggle-background=      | Toggle idle / background auto-scheduling on or off.                                                |
+| =M-x org-auto-scheduler-setup-background=       | Manually (re-)initialize the idle timer based on current settings.                                 |
+| =M-x org-auto-scheduler-historical-insights=    | Open a buffer showing per-category effort-estimate accuracy multipliers.                           |
+| =M-x org-auto-scheduler-show-repeater-projections= | Display projected repeater/habit occurrences for the configured look-ahead period.              |
+| =M-x org-auto-scheduler-clear-repeater-cache=   | Invalidate the repeater-projections cache so fresh projections are generated on the next run.      |
+| =M-x org-auto-scheduler-bump-agenda=            | From the Org agenda, push the item at point and all subsequent AUTOSCH tasks forward by N minutes. |
+| =M-x org-auto-scheduler-validate-config=        | Verify configuration consistency (called automatically on load).                                   |
 
-*** Task States
+*** Backward-compatible aliases
 
-- =org-auto-scheduler-state-weights=: Alist of weights for different TODO states. The keys of this alist are considered valid states for auto-scheduling.
-  Default: 
-  #+begin_src emacs-lisp
-  '(("TODO" . 0)
-    ("NEXT" . 1)
-    ("IN-PROGRESS" . 2)
-    ("WRITE" . 0)
-    ("LATER" . -10)
-    ("BUY" . 0)
-    ("READ" . 0))
-  #+end_src
+| Old name                                     | Current name                                     |
+|----------------------------------------------+--------------------------------------------------|
+| =org-auto-scheduler-show-habit-projections=  | =org-auto-scheduler-show-repeater-projections=   |
+| =org-auto-scheduler-clear-habit-cache=       | =org-auto-scheduler-clear-repeater-cache=        |
 
-  You can customize this list to match your workflow. For example:
+** Review & Apply Buffer
 
-  #+begin_src emacs-lisp
-  (setq org-auto-scheduler-state-weights
-        '(("TODO" . 0)
-          ("NEXT" . 1)
-          ("IN-PROGRESS" . 2)
-          ("WAITING" . -1)))
-  #+end_src
+=M-x org-auto-scheduler-review-and-apply= runs the scheduler in *preview mode*
+(nothing is written to your Org files) and opens the =*Org Auto Scheduler Review*=
+buffer.
 
-  The auto-scheduler will consider tasks with TODO states that match any key in this alist.
+*** Buffer columns
 
-*** Time Blocks
+| Column         | Description                                               |
+|----------------+-----------------------------------------------------------|
+| =Apply=        | =[X]= means the task will be applied; =[ ]= means skip.  |
+| =Task Name=    | Headline (indented with =├─= to show dependency depth).  |
+| =Proposed Time= | Calculated schedule string.                              |
+| =Duration=     | Task duration in minutes.                                 |
+| =Project ID=   | Nearest ancestor with the =:PROJECT:= tag.               |
+| =Score=        | Composite scheduling score.                               |
+| =Depth=        | Topological depth (0 = no blockers).                      |
+| =Blockers=     | Comma-separated headings of blocking tasks.               |
 
-- =org-auto-scheduler-time-blocks=: Alist of time blocks for scheduling tasks with specific tags
-  Default:
-  #+begin_src emacs-lisp
-  '(("FUN" . (("18:00" . "19:00")))
-    ("BUYING" . (("14:00" . "15:00")))
-    ("CHORES" . (("19:00" . "20:00"))))
-  #+end_src
+*** Keybindings
 
-*** Other Settings
+| Key         | Command                              | Action                                                                         |
+|-------------+--------------------------------------+--------------------------------------------------------------------------------|
+| =SPC=       | =review-toggle=                      | Toggle the =[X]= / =[ ]= apply mark and advance one line.                      |
+| =m=         | =review-toggle=                      | Same as =SPC=.                                                                 |
+| =TAB=       | =review-jump=                        | Open the original Org task in another window.                                  |
+| =U= / =p=   | =review-move-up=                     | Move the current task up in the list (reorders priority).                      |
+| =D= / =n=   | =review-move-down=                   | Move the current task down in the list.                                        |
+| =r=         | =review-recalculate=                 | Recalculate proposed times from the *current visual order*, without resorting. |
+| =C-c C-r=   | =review-recalculate=                 | Same as =r=.                                                                   |
+| =R=         | =review-refresh=                     | Discard and re-run the full scheduler from scratch (picks up Org file changes).|
+| =x=         | =review-execute=                     | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
+| =C-c C-c=   | =review-execute=                     | Same as =x=.                                                                   |
 
-- =org-auto-scheduler-inherited-priority-property=: Property name for setting inherited priority for subtasks (default: "INHERITED_PRIORITY")
-- =org-auto-scheduler-scheduled-property=: Property name to mark AUTOSCH tasks that have been scheduled in the current session (default: "AUTOSCH_SCHEDULED")
-- =org-auto-scheduler-default-task-duration=: Default duration in minutes for tasks without an explicit effort (default: 60)
+*Note:* Pressing =x= always re-recalculates times from the current visual order
+before writing, so you never need to press =r= first.
 
-*** Files to Consider
+** Background Scheduling
 
-- =org-auto-scheduler-files=: Specifies which files to consider for auto-scheduling, with optional weights. Can be one of:
-  - =(agenda . WEIGHT)=: Use all files in =org-agenda-files= with the specified weight (default)
-  - An alist of =(FILE . WEIGHT)= pairs
-  - A function that returns an alist of =(FILE . WEIGHT)= pairs
+When enabled, the scheduler runs silently while Emacs is idle, without popping
+up the report buffer.
 
-  WEIGHT is a float value used to adjust task scores from the corresponding file.
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-background-enabled t)
+(setq org-auto-scheduler-idle-time 300)          ; wait 5 min of idle before first run
+(setq org-auto-scheduler-background-interval 300) ; re-run every 5 min of continuous idle
 
-  Example of custom configuration:
-  #+begin_src emacs-lisp
-  ;; Use agenda files with default weight
-  (setq org-auto-scheduler-files '(agenda . 1.0))
+;; Restrict to specific machines (optional)
+(setq org-auto-scheduler-allowed-hostnames '("work-laptop" "home-pc"))
+#+end_src
 
-  ;; Use specific files with custom weights
-  (setq org-auto-scheduler-files
-        '(("~/org/work.org" . 1.2)
-          ("~/org/personal.org" . 0.8)))
+Toggle at runtime with =M-x org-auto-scheduler-toggle-background=.
 
-  ;; Or use a custom function
-  (setq org-auto-scheduler-files
-        (lambda ()
-          (mapcar (lambda (file)
-                    (cons file (if (string-match "work" file) 1.2 0.8)))
-                  (directory-files "~/org" t "\\.org$"))))
-  #+end_src
+** Historical Effort Tracking
 
-  Tasks from files with higher weights will be given higher priority in scheduling.
+The scheduler learns from your actual clocked time versus your Effort estimates.
+When you mark a task =DONE=, the ratio (clocked ÷ estimate) is recorded per
+*category* as an exponential moving average (α = 0.2):
 
-** How It Works
+#+begin_example
+new_multiplier = 0.8 × old + 0.2 × (clocked / estimate)
+#+end_example
 
-1. The plugin clears existing scheduled times for tasks with the =AUTOSCH= tag.
-2. It collects all schedulable tasks (those with =AUTOSCH= tag and valid TODO states).
-3. Tasks are sorted based on a calculated score considering priority, deadline, effort, state, and project grouping.
-4. Each task is scheduled in the next available time slot, respecting time blocks if applicable.
-5. The plugin avoids conflicts with existing scheduled tasks and maintains gaps between tasks.
-6. It considers clocked time when calculating remaining effort for tasks.
-7. Project-based tasks are grouped and scheduled together.
+The multiplier is then automatically applied to future scheduling for tasks in
+the same category (if =org-auto-scheduler-apply-historical-multipliers= is =t=).
 
-** Debugging
+Data is saved to =org-auto-scheduler-history-file= on Emacs exit and loaded
+on startup.
 
-To debug the auto-scheduler, use the command:
+Inspect the learned multipliers with =M-x org-auto-scheduler-historical-insights=.
 
-=M-x org-auto-scheduler-debug=
+** Repeater / Habit Integration
 
-This will run the scheduler with detailed logging and open the log buffer for inspection.
+The scheduler detects tasks with Org repeater intervals and projects their
+future occurrences into the conflict map so AUTOSCH tasks are never placed on
+top of habits or repeating meetings.
 
-** Notes
+Supported formats:
 
-- Ensure that tasks have appropriate effort estimates for accurate scheduling.
-- The plugin respects existing scheduled tasks and will not overwrite them.
-- Time blocks allow you to restrict certain types of tasks to specific time ranges.
-- The scheduler now considers project grouping and task hierarchy when scheduling.
-- Clocked time is taken into account when calculating remaining effort for tasks.
-- The plugin validates configuration settings to ensure consistency.
+#+begin_src org
+SCHEDULED: <2024-01-15 Mon 07:00 +1d>         ; simple daily
+SCHEDULED: <2024-01-15 Mon 14:00 ++1w>        ; catch-up weekly
+SCHEDULED: <2024-01-15 Mon 09:00 .+1m>        ; restart monthly
+SCHEDULED: <2025-08-16 Sat 15:54-17:24 ++1d>  ; explicit end time + repeater
+#+end_src
 
-** Recent Changes
+Supported repeater types: =+= =++= =.+= with units =d= =w= =m= =y=.
 
-- Added support for "NOT_BEFORE" property to set the earliest scheduling time for tasks
-- Added project-based task grouping and ordering
-- Implemented consideration of clocked time for remaining effort calculation
-- Improved handling of tasks without explicit effort estimates
-- Enhanced debug logging for better troubleshooting
-- Added configuration validation to catch potential issues early
+Projections are cached for 10 minutes. Clear early with
+=M-x org-auto-scheduler-clear-repeater-cache=.
 
 ** Recurring Tasks
 
-Org Auto Scheduler supports the automatic scheduling of recurring tasks. To define a recurring task, add the `RECURRING` property to your task with a specified frequency. Supported frequencies include `daily`, `weekly`, `bi-weekly`, and `monthly`.
+Add the =RECURRING= property to create dated sub-task instances automatically:
 
-**Example:**
-
-#+BEGIN_SRC org
+#+begin_src org
 * TODO Weekly Team Meeting :AUTOSCH:
   :PROPERTIES:
   :RECURRING: weekly
+  :Effort:   0:30
   :END:
+#+end_src
 
-This task will be automatically scheduled every week.
-#+END_SRC
+Supported frequencies: =daily= / =weekly= / =bi-weekly= / =monthly=.
 
-**Customization Options:**
+Combine with =NOT_BEFORE= to set the earliest first occurrence:
 
-- **Frequency Options:**
-  - `daily`: The task repeats every day.
-  - `weekly`: The task repeats every week.
-  - `bi-weekly`: The task repeats every two weeks.
-  - `monthly`: The task repeats every month.
-
-- **NOT_BEFORE Property:**
-  You can combine the `RECURRING` property with the `NOT_BEFORE` property to specify the earliest date and time the recurring task should be scheduled.
-
-**Example with NOT_BEFORE:**
-
-#+BEGIN_SRC org
-* TODO Monthly Report Submission :AUTOSCH:
+#+begin_src org
+* TODO Monthly Report :AUTOSCH:
   :PROPERTIES:
   :RECURRING: monthly
-  :NOT_BEFORE: <2024-01-01 Wed 09:00>
+  :NOT_BEFORE: <2026-04-01 Wed 09:00>
+  :Effort:   2:00
   :END:
+#+end_src
 
-This task will be automatically scheduled on the first day of each month, not before January 1, 2024, at 9:00 AM.
-#+END_SRC
+** Agenda Bump
 
-**Notes:**
+While in the Org Agenda buffer, use =M-x org-auto-scheduler-bump-agenda= (prompted
+for minutes) to push the task at point *and every subsequent AUTOSCH task
+scheduled today* forward by that many minutes. Useful when a task runs over time.
 
-- Ensure that recurring tasks have appropriate effort estimates for accurate scheduling.
-- Recurring tasks will be created based on the specified frequency and will adhere to the `NOT_BEFORE` constraints if set.
-- You can manage the recurrence by adjusting the `RECURRING` property or by removing it to stop the task from recurring.
+** Customization Reference
 
-**Troubleshooting:**
+Access all options via =M-x customize-group RET org-auto-scheduler=.
 
-If recurring tasks are not being scheduled as expected:
+*** Scheduling Window
 
-1. Verify that the `RECURRING` property is set with a valid frequency (`daily`, `weekly`, `bi-weekly`, or `monthly`).
-2. Ensure that the `AUTOSCH` tag is present on the task.
-3. Check the `NOT_BEFORE` property to confirm it does not conflict with your desired scheduling.
-4. Use the debugging command `M-x org-auto-scheduler-debug` to inspect detailed logs for any issues related to recurring task scheduling.
+| Variable                             | Default    | Description                                                                 |
+|--------------------------------------+------------+-----------------------------------------------------------------------------|
+| =org-auto-scheduler-start-time=      | ="09:00"=  | Daily scheduling window start (24 h =HH:MM=).                              |
+| =org-auto-scheduler-end-time=        | ="17:00"=  | Daily scheduling window end.                                                |
+| =org-auto-scheduler-excluded-days=   | ='()=      | Day-of-week integers to skip (0 = Sun … 6 = Sat).                          |
+| =org-auto-scheduler-time-interval=   | =15=       | Slot granularity in minutes (for collision scanning).                       |
+| =org-auto-scheduler-task-gap=        | =5=        | Minimum gap in minutes between consecutive tasks.                           |
+| =org-auto-scheduler-max-days-to-check= | =14=     | How many days ahead to search for a free slot.                              |
+| =org-auto-scheduler-default-task-duration= | =60= | Fallback duration (minutes) when a task has no =Effort= property.           |
 
-** Repeater Tasks Integration
+*** Scoring Weights
 
-Org Auto Scheduler now supports integration with any repeater tasks (including org-habits) to prevent scheduling conflicts. When enabled, the scheduler will automatically detect tasks with repeater intervals and project their future occurrences to ensure AUTOSCH tasks are not scheduled at the same time.
+| Variable                               | Default | Description                                                        |
+|----------------------------------------+---------+--------------------------------------------------------------------|
+| =org-auto-scheduler-effort-weight=     | =0.0=   | Weight applied to the effort component.                            |
+| =org-auto-scheduler-priority-weight=   | =10.0=  | Multiplier for (priority_score + inherited_priority).              |
+| =org-auto-scheduler-urgency-weight=    | =20.0=  | Multiplier for the urgency factor (1 / (1 + days_to_deadline)).    |
+| =org-auto-scheduler-urgent-days=       | =7=     | Days before deadline when urgency starts ramping up.               |
+| =org-auto-scheduler-hard-deadline-days= | =1=    | Days-to-deadline threshold that triggers the hard-deadline boost.  |
+| =org-auto-scheduler-hard-deadline-boost= | =10000= | Score bonus applied when a deadline is within hard_deadline_days. |
+| =org-auto-scheduler-large-task-minutes= | =12=   | Minutes above which a task is "large" (informational only now).    |
 
-**Example Repeater Tasks:**
+*** State Weights
 
-#+BEGIN_SRC org
-* TODO GYM (Habit style)
-  SCHEDULED: <2024-01-15 Mon 07:00 +1d>
-  :PROPERTIES:
-  :STYLE: habit
-  :Effort: 1:00
-  :END:
+Tasks missing from this alist are *not* scheduled at all.
 
-* TODO Weekly Meeting (Regular repeater)
-  SCHEDULED: <2024-01-15 Mon 14:00 ++1w>
-  :PROPERTIES:
-  :Effort: 0:30
-  :END:
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-state-weights
+      '(("TODO"        .  0)
+        ("NEXT"        .  1)
+        ("IN-PROGRESS" .  2)
+        ("WRITE"       .  0)
+        ("LATER"       . -10)
+        ("BUY"         .  0)
+        ("READ"        .  0)))
+#+end_src
 
-* TODO Daily Standup (With explicit end time)
-  SCHEDULED: <2025-08-16 Sat 15:54-17:24 ++1d>
+*** Tag Weights
 
-* TODO Monthly Review (Restart type)
-  SCHEDULED: <2024-01-15 Mon 09:00 .+1m>
-  :PROPERTIES:
-  :Effort: 2:00
-  :END:
-#+END_SRC
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-tag-weights
+      '(("URGENT"    . 10)
+        ("IMPORTANT" .  5)
+        ("QUICK"     .  2)))
+#+end_src
 
-**Customization Options:**
+*** Category Weights
 
-- =org-auto-scheduler-repeater-integration=: Enable/disable repeater integration (default: t)
-- =org-auto-scheduler-repeater-look-days-ahead=: Days to project repeater occurrences (default: uses max of other settings)
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-category-weights
+      '(("Work"     . 10)
+        ("Personal" .  5)
+        ("Errands"  .  2)))
+#+end_src
 
-**Supported Repeater Types and Intervals:**
+*** Time Blocks (Hard Constraints)
 
-***Repeater Types:***
-- =+=: Simple repeater (reschedules from original date)
-- =++=: Catch-up repeater (reschedules to today if overdue) 
-- =.+=: Restart repeater (reschedules from completion date)
+Tasks tagged with a matching tag are restricted to the listed windows. If no
+window fits, the task falls back to the general scheduling window.
 
-***Interval Units:***
-- =d=: Days (e.g., +1d, ++2d, .+3d)
-- =w=: Weeks (e.g., +1w, ++2w, .+1w)
-- =m=: Months (e.g., +1m, ++1m, .+2m)
-- =y=: Years (e.g., +1y, ++1y, .+1y)
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-time-blocks
+      '(("FUN"    . (("18:00" . "19:00")))
+        ("BUYING" . (("14:00" . "15:00")))
+        ("CHORES" . (("19:00" . "20:00")))))
+#+end_src
 
-**Supported Scheduled Formats:**
+*** Energy Blocks (Soft Preferences)
 
-- =<2024-01-15 Mon 09:00 +1d>=: Basic repeater with effort-based duration
-- =<2025-08-16 Sat 15:54-17:24 ++1d>=: Repeater with explicit end time
-- =<2024-01-01 Mon 09:00>--<2024-01-01 Mon 10:00> +1w=: Range format with repeater
+Same format as time blocks, but these are preferences, not hard constraints.
 
-**Interactive Commands:**
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-energy-blocks
+      '(("@HighEnergy" . (("09:00" . "12:00")))
+        ("@LowEnergy"  . (("14:00" . "17:00")))))
+#+end_src
 
-- =M-x org-auto-scheduler-show-repeater-projections=: Display projected repeater occurrences for debugging
-- =M-x org-auto-scheduler-clear-repeater-cache=: Clear repeater projections cache to force regeneration
+*** Project Settings
 
-*For backward compatibility, the old habit-specific commands are still available as aliases.*
+| Variable                                  | Default                | Description                                                             |
+|-------------------------------------------+------------------------+-------------------------------------------------------------------------|
+| =org-auto-scheduler-interleave-projects=   | =t=                    | When =t=, tasks from different projects interleave by score.            |
+| =org-auto-scheduler-project-interleave-property= | ="PROJECT_INTERLEAVE"= | Property name on =:PROJECT:= headings to override the global default.  |
+| =org-auto-scheduler-project-priority-property=   | ="PROJECT_PRIORITY"=  | Property name for an explicit numeric project priority.                 |
 
-**How It Works:**
+*** Dependency Properties
 
-1. The system scans all agenda files for tasks with repeater intervals (+, ++, .+)
-2. Projects future occurrences based on the scheduled time and repeater interval
-3. Includes these projections in conflict detection when scheduling AUTOSCH tasks
-4. Uses caching to improve performance when checking multiple time slots
-5. Supports both effort-based duration and explicit end times
+| Variable                                      | Default                  | Description                                             |
+|-----------------------------------------------+--------------------------+---------------------------------------------------------|
+| =org-auto-scheduler-inherited-priority-property= | ="INHERITED_PRIORITY"= | Property name used to add a flat priority bonus.        |
+| =org-auto-scheduler-scheduled-property=          | ="AUTOSCH_SCHEDULED"=  | Property set on tasks after they are scheduled.         |
 
-**Notes:**
+*** Files & Weights
+<<file-weights>>
 
-- Repeater tasks are excluded from being treated as regular scheduled tasks to avoid double-counting
-- The system projects repeaters up to the maximum of `org-auto-scheduler-max-days-to-check` or `org-auto-scheduler-recurring-look-days-ahead`
-- Repeater projections are cached for 10 minutes to improve performance during scheduling sessions
-- All three repeater types (+, ++, .+) are projected the same way for conflict detection - their differences only matter when marking tasks as done
+| Variable                    | Default         | Description                                        |
+|-----------------------------+-----------------+----------------------------------------------------|
+| =org-auto-scheduler-files=  | ='(agenda . 1)= | Which files to schedule from and with what weight. |
+
+The value can be:
+- ='(agenda . WEIGHT)= — use =org-agenda-files= with a uniform weight.
+- An alist ='((FILE . WEIGHT) ...)= — specific files with individual weights.
+- A function returning such an alist.
+
+#+begin_src emacs-lisp
+;; Specific files with custom weights
+(setq org-auto-scheduler-files
+      '(("~/org/work.org"     . 1.2)
+        ("~/org/personal.org" . 0.8)))
+
+;; Dynamic function
+(setq org-auto-scheduler-files
+      (lambda ()
+        (mapcar (lambda (f)
+                  (cons f (if (string-match "work" f) 1.2 0.8)))
+                (directory-files "~/org" t "\\.org$"))))
+#+end_src
+
+*** Repeater Integration
+
+| Variable                                    | Default | Description                                                              |
+|---------------------------------------------+---------+--------------------------------------------------------------------------|
+| =org-auto-scheduler-repeater-integration=   | =t=     | Project repeater/habit occurrences into the conflict map.                |
+| =org-auto-scheduler-repeater-look-days-ahead= | =nil= | Days ahead to project repeaters. =nil= = max of other day settings.     |
+| =org-auto-scheduler-recurring-look-days-ahead= | =30= | Days ahead to generate recurring task sub-task instances.               |
+
+Backward-compatible aliases:
+- =org-auto-scheduler-habit-integration= → =org-auto-scheduler-repeater-integration=
+- =org-auto-scheduler-habit-look-days-ahead= → =org-auto-scheduler-repeater-look-days-ahead=
+
+*** Historical Tracking
+
+| Variable                                        | Default                                      | Description                                                    |
+|-------------------------------------------------+----------------------------------------------+----------------------------------------------------------------|
+| =org-auto-scheduler-enable-historical-tracking= | =t=                                          | Record clocked-vs-estimate ratios when tasks are marked DONE.  |
+| =org-auto-scheduler-apply-historical-multipliers= | =t=                                        | Apply learned multipliers to effort estimates during scheduling.|
+| =org-auto-scheduler-history-file=              | =~/.emacs.d/org-auto-scheduler-history.el=  | File for persisting historical multipliers.                    |
+
+*** Background Scheduling
+
+| Variable                                   | Default | Description                                                                    |
+|--------------------------------------------+---------+--------------------------------------------------------------------------------|
+| =org-auto-scheduler-background-enabled=    | =nil=   | Enable idle-time background scheduling.                                        |
+| =org-auto-scheduler-idle-time=             | =300=   | Seconds of Emacs idle before the first background run.                         |
+| =org-auto-scheduler-background-interval=   | =300=   | Seconds between subsequent background runs (while still idle).                 |
+| =org-auto-scheduler-allowed-hostnames=     | =nil=   | List of hostnames allowed to run background scheduling. =nil= = any machine.   |
+| =org-auto-scheduler-silent-mode=           | =nil=   | When =t=, suppress report buffer creation and display.                         |
+
+*** CalDAV Sync
+
+| Variable                            | Default | Description                                                     |
+|-------------------------------------+---------+-----------------------------------------------------------------|
+| =org-auto-scheduler-sync-caldav=    | =t=     | Sync via =org-caldav= before and after applying a full schedule.|
+
+** Debugging
+
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-debug
+#+end_src
+
+This enables debug logging, runs the scheduler, and opens the =log4e= log
+buffer so you can inspect slot-conflict checks, score calculations, repeater
+projections, and dependency resolution.
+
+You can also enable debug output permanently:
+
+#+begin_src emacs-lisp
+(setq org-auto-scheduler-debug t)
+#+end_src
