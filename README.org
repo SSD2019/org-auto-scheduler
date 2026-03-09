@@ -124,6 +124,9 @@ a depth marker of 99 as a warning signal.
 | =M-x org-auto-scheduler-clear-repeater-cache=   | Invalidate the repeater-projections cache so fresh projections are generated on the next run.      |
 | =M-x org-auto-scheduler-bump-agenda=            | From the Org agenda, push the item at point and all subsequent AUTOSCH tasks forward by N minutes. |
 | =M-x org-auto-scheduler-validate-config=        | Verify configuration consistency (called automatically on load).                                   |
+| =M-x org-auto-scheduler-snapshot-schedule=      | Record a snapshot of today's scheduled tasks for adherence tracking.                               |
+| =M-x org-auto-scheduler-score-schedule=         | Score today's schedule adherence against the morning's snapshot.                                   |
+| =M-x org-auto-scheduler-adherence-report=       | Display the adherence report buffer for today (or a specific date).                                |
 
 *** Backward-compatible aliases
 
@@ -253,6 +256,36 @@ Combine with =NOT_BEFORE= to set the earliest first occurrence:
 While in the Org Agenda buffer, use =M-x org-auto-scheduler-bump-agenda= (prompted
 for minutes) to push the task at point *and every subsequent AUTOSCH task
 scheduled today* forward by that many minutes. Useful when a task runs over time.
+
+** Schedule Adherence Tracking
+
+Track how well you stick to your daily schedule and earn a daily adherence score. 
+
+1. *The Morning Snapshot*: Run =M-x org-auto-scheduler-snapshot-schedule= when you have your daily schedule ready. This takes a snapshot of all scheduled tasks planned for the day (loads automatically on startup).
+2. *The Evening Score*: At the end of the day, run =M-x org-auto-scheduler-score-schedule=. This compares the morning snapshot to your actual completed work.
+
+The scoring algorithm features:
+- *Time-Gated Midday Scoring:* You can safely score yourself in the middle of the day. The algorithm will only consider tasks whose =SCHEDULED= start-time has already passed, allowing you to see your live pace without being penalized for afternoon tasks.
+- *Retroactive Scoring:* Forgot to score yesterday? No problem! Call =M-x org-auto-scheduler-score-schedule= with a prefix argument (e.g. =C-u M-x...=) or interactively answer the prompt to score and record any day from the past 30 days.
+- *Category Breakdown:* See adherence percentages split by category.
+- *Partial Credit:* Giving you credit for effort spent even if the task isn't marked =DONE= (requires =org-clock=).
+- *Time-of-Day Analysis:* Flags missed or rescheduled tasks alongside their scheduled time to help identify when your schedule breaks down.
+- *The "Squirrel" Penalty:* Tracks tasks you completed but didn't plan for.
+- *Rollover Warnings:* Detects tasks pushed from yesterday's snapshot to today's.
+- *Hall of Fame:* Tracks and displays your best adherence days over the last 7 days, 30 days, and 1 year.
+
+Adherence data and streaks are saved to =org-auto-scheduler-adherence-file=.
+
+*** Modeline Integration
+
+You can display a live, running adherence score directly in your Emacs mode line. It updates automatically every 5 minutes.
+
+#+begin_src emacs-lisp
+(org-auto-scheduler-adherence-mode-line-enable)
+#+end_src
+
+To disable it, run =M-x org-auto-scheduler-adherence-mode-line-disable=.
+
 
 ** Customization Reference
 
