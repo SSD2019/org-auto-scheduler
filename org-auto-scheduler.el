@@ -2354,7 +2354,7 @@ start time is in the past."
          (tasks-results nil)
          (cat-stats (make-hash-table :test 'equal))
          (postponed-tasks 0)
-         (unplanned-tasks 0)
+         (unplanned-tasks nil)
          (missed-tasks nil))
 
     (unless snapshot
@@ -2429,7 +2429,7 @@ start time is in the past."
   
           (push (list heading earned effort is-done) tasks-results))))
 
-    ;; 2. Unplanned Tasks Check
+    ;; 2. Unplanned Tasks Check - collect detailed info
     (org-map-entries
      (lambda ()
        (when (member (org-get-todo-state) org-done-keywords)
@@ -2438,7 +2438,11 @@ start time is in the past."
            (unless in-snapshot
              (let ((closed-ts (org-entry-get (point) "CLOSED")))
                (when (and closed-ts (string= (substring closed-ts 1 11) score-date))
-                 (cl-incf unplanned-tasks)))))))
+                 (let* ((heading (org-get-heading t t t t))
+                        (effort (or (org-auto-scheduler-get-effort (point-marker)) 0))
+                        (clocked (org-auto-scheduler-get-clocked-time (point-marker)))
+                        (category (or (org-get-category) "Uncategorized")))
+                   (push (list heading id effort clocked category) unplanned-tasks))))))))
      nil 'agenda)
 
     (let* ((score (if (> total-effort 0) (* (/ earned-effort total-effort) 100.0) 100.0))
@@ -2446,7 +2450,8 @@ start time is in the past."
                              :total-effort total-effort
                              :earned-effort earned-effort
                              :postponed postponed-tasks
-                             :unplanned unplanned-tasks
+                             :unplanned (length unplanned-tasks)
+                             :unplanned-tasks unplanned-tasks
                              :categories cat-stats
                              :missed missed-tasks))
            (history-entry (assoc score-date org-auto-scheduler--adherence-history)))
@@ -2477,19 +2482,203 @@ start time is in the past."
         (setq date (time-subtract date (days-to-time 1)))))
     streak))
 
+;;; Adherence Report Mode (TAB / RET jump-to-task)
+
+(defvar org-auto-scheduler-report-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "TAB") #'org-auto-scheduler-report-jump-to-task)
+    (define-key map (kbd "RET") #'org-auto-scheduler-report-jump-to-task)
+    map)
+  "Keymap for `org-auto-scheduler-report-mode`.")
+
+(define-derived-mode org-auto-scheduler-report-mode special-mode "AutoSch-Report"
+  "Major mode for viewing the adherence report with TAB/RET jump-to-task.")
+
+(defun org-auto-scheduler-report-jump-to-task ()
+  "Jump to the Org task under point using the `org-id` text property."
+  (interactive)
+  (let ((task-id (get-text-property (point) 'org-id)))
+    (if task-id
+        (let ((marker (org-id-find task-id t)))
+          (if marker
+              (progn
+                (switch-to-buffer-other-window (marker-buffer marker))
+                (goto-char marker)
+                (org-show-context))
+            (user-error "Cannot find task with ID %s" task-id)))
+      (user-error "No task link at point"))))
+
+(defun org-auto-scheduler--insert-linked-heading (heading task-id)
+  "Insert HEADING with an `org-id` text property set to TASK-ID.
+This enables TAB/RET navigation from the report buffer."
+  (let ((start (point)))
+    (insert (propertize heading
+                        'org-id task-id
+                        'face 'link
+                        'mouse-face 'highlight))))
+
+;;; Clock interval extraction for timeline
+
+(defun org-auto-scheduler-get-clock-intervals (date-str)
+  "Return a list of (HEADING ID START-TIME END-TIME) for all CLOCK entries on DATE-STR.
+Scans all org-agenda-files for CLOCK lines matching the target date."
+  (let ((intervals nil))
+    (dolist (file (org-agenda-files))
+      (with-current-buffer (find-file-noselect file)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (re-search-forward
+                 "^[ \t]*CLOCK: \\[\\([^]]+\\)\\]--\\[\\([^]]+\\)\\]" nil t)
+           (let* ((start-str (match-string 1))
+                  (end-str (match-string 2))
+                  (start-time (org-auto-scheduler-parse-time-string start-str))
+                  (end-time (org-auto-scheduler-parse-time-string end-str))
+                  (start-date (format-time-string "%Y-%m-%d" start-time)))
+             (when (string= start-date date-str)
+               (save-excursion
+                 (org-back-to-heading t)
+                 (let ((heading (org-get-heading t t t t))
+                       (id (org-id-get)))
+                   (push (list heading id start-time end-time) intervals)))))))))
+    (sort intervals (lambda (a b) (time-less-p (nth 2 a) (nth 2 b))))))
+
+;;; Compact Gantt Timeline Rendering
+
+(defun org-auto-scheduler--time-to-day-minutes (time-val)
+  "Convert TIME-VAL to minutes since midnight of that day."
+  (let* ((decoded (decode-time time-val))
+         (hour (nth 2 decoded))
+         (minute (nth 1 decoded)))
+    (+ (* hour 60) minute)))
+
+(defun org-auto-scheduler--render-gantt-row (label intervals chunk-start-min chunk-end-min chars-per-min date-str)
+  "Render a single Gantt row for LABEL (e.g. \"Planned\", \"Actual\").
+INTERVALS is a list of (HEADING ID START-TIME END-TIME).
+CHUNK-START-MIN and CHUNK-END-MIN are minute offsets from midnight.
+CHARS-PER-MIN is the character resolution (e.g. 0.2 = 1 char per 5 min).
+DATE-STR is the target date for clamping."
+  (let* ((chunk-width (round (* (- chunk-end-min chunk-start-min) chars-per-min)))
+         (row (make-string chunk-width ?\s)))
+    ;; Fill in each interval
+    (dolist (interval intervals)
+      (let* ((start-min (org-auto-scheduler--time-to-day-minutes (nth 2 interval)))
+             (end-min (org-auto-scheduler--time-to-day-minutes (nth 3 interval)))
+             ;; Clamp to chunk boundaries
+             (clamped-start (max start-min chunk-start-min))
+             (clamped-end (min end-min chunk-end-min))
+             (heading (nth 0 interval)))
+        (when (> clamped-end clamped-start)
+          (let* ((col-start (round (* (- clamped-start chunk-start-min) chars-per-min)))
+                 (col-end (round (* (- clamped-end chunk-start-min) chars-per-min)))
+                 (safe-start (max 0 (min col-start (1- chunk-width))))
+                 (safe-end (max (1+ safe-start) (min col-end chunk-width)))
+                 (block-len (- safe-end safe-start))
+                 ;; Truncate heading to fit
+                 (display-name (if (> (length heading) (- block-len 2))
+                                   (if (> block-len 4)
+                                       (concat (substring heading 0 (- block-len 3)) "..")
+                                     (make-string block-len ?=))
+                                 heading))
+                 ;; Pad name within block
+                 (padded (concat "[" display-name (make-string (max 0 (- block-len (length display-name) 2)) ?=) "]")))
+            ;; Continuation markers for tasks spanning chunk boundaries
+            (when (< start-min chunk-start-min)
+              (aset row safe-start ?<))
+            (when (> end-min chunk-end-min)
+              (when (< (1- safe-end) chunk-width)
+                (aset row (1- safe-end) ?>)))
+            ;; Write the block into the row
+            (let ((write-str (substring padded 0 (min (length padded) block-len))))
+              (dotimes (i (min (length write-str) (- chunk-width safe-start)))
+                (aset row (+ safe-start i) (aref write-str i))))))))
+    (insert (format "%-8s %s\n" label row))))
+
+(defun org-auto-scheduler--render-timeline-header (chunk-start-min chunk-end-min chars-per-min)
+  "Insert a timeline header with hour markers.
+CHUNK-START-MIN and CHUNK-END-MIN are minute offsets from midnight."
+  (let* ((chunk-width (round (* (- chunk-end-min chunk-start-min) chars-per-min)))
+         (header (make-string chunk-width ?\s))
+         (ruler (make-string chunk-width ?\s)))
+    ;; Place hour labels and tick marks
+    (let ((hour-start (/ chunk-start-min 60)))
+      (cl-loop for hour from hour-start to (/ chunk-end-min 60)
+               for col = (round (* (- (* hour 60) chunk-start-min) chars-per-min))
+               when (and (>= col 0) (< col chunk-width))
+               do (let ((label (format "%02d:00" hour)))
+                    ;; Write hour label into header
+                    (dotimes (i (min (length label) (- chunk-width col)))
+                      (aset header (+ col i) (aref label i)))
+                    ;; Write tick mark into ruler
+                    (aset ruler col ?|))))
+    (insert (format "%-8s %s\n" "" header))
+    (insert (format "%-8s %s\n" "" ruler))))
+
+(defun org-auto-scheduler--render-compact-gantt (date-str snapshot)
+  "Render the compact chunked Gantt timeline for DATE-STR.
+SNAPSHOT is the planned schedule snapshot for the day.
+Clocked intervals are extracted from the org files."
+  (let* ((chunk-hours 4)        ;; 4-hour chunks
+         (chars-per-min (/ 1.0 5))  ;; 1 char per 5 minutes => 12 chars/hour
+         ;; Parse start/end times from the customization
+         (start-minutes (org-duration-to-minutes org-auto-scheduler-start-time))
+         (end-minutes (org-duration-to-minutes org-auto-scheduler-end-time))
+         ;; Build planned intervals from snapshot
+         (planned-intervals nil)
+         ;; Get actual clocked intervals
+         (clocked-intervals (org-auto-scheduler-get-clock-intervals date-str))
+         (date-time (org-auto-scheduler-parse-time-string (concat date-str " 00:00"))))
+    ;; Build planned intervals from snapshot
+    (dolist (task snapshot)
+      (let* ((heading (plist-get task :heading))
+             (id (plist-get task :id))
+             (effort (or (plist-get task :effort) 30))
+             (scheduled-str (plist-get task :scheduled))
+             (scheduled-time (when scheduled-str (org-time-string-to-time scheduled-str)))
+             (scheduled-date (when scheduled-time (format-time-string "%Y-%m-%d" scheduled-time))))
+        (when (and scheduled-time (string= scheduled-date date-str))
+          (let ((end-time (time-add scheduled-time (seconds-to-time (* effort 60)))))
+            (push (list heading id scheduled-time end-time) planned-intervals)))))
+    (setq planned-intervals (sort planned-intervals (lambda (a b) (time-less-p (nth 2 a) (nth 2 b)))))
+
+    (insert (propertize " 📊 Daily Timeline \n" 'face 'org-level-1))
+    (insert (make-string 30 ?-) "\n")
+    (when (and (null planned-intervals) (null clocked-intervals))
+      (insert "No timeline data available.\n\n")
+      (cl-return-from org-auto-scheduler--render-compact-gantt nil))
+
+    ;; Render chunk by chunk
+    (let ((chunk-start start-minutes))
+      (while (< chunk-start end-minutes)
+        (let ((chunk-end (min (+ chunk-start (* chunk-hours 60)) end-minutes)))
+          ;; Header with hour markers
+          (org-auto-scheduler--render-timeline-header chunk-start chunk-end chars-per-min)
+          ;; Planned row
+          (org-auto-scheduler--render-gantt-row "Planned" planned-intervals chunk-start chunk-end chars-per-min date-str)
+          ;; Actual row
+          (org-auto-scheduler--render-gantt-row "Actual" clocked-intervals chunk-start chunk-end chars-per-min date-str)
+          (insert "\n")
+          (setq chunk-start chunk-end))))
+    (insert "\n")))
+
+;;; Adherence Report
+
 (defun org-auto-scheduler-adherence-report (&optional date-str)
   "Display the adherence report for DATE-STR.
 If DATE-STR is nil, defaults to today."
   (interactive)
   (let* ((date-str (or date-str (format-time-string "%Y-%m-%d")))
          (data (cdr (assoc date-str org-auto-scheduler--adherence-history)))
+         (snapshot (cdr (assoc date-str org-auto-scheduler--adherence-snapshots)))
          (buf (get-buffer-create "*Org Auto Scheduler Adherence*")))
     (unless data
       (user-error "No data to display for %s" date-str))
     
     (with-current-buffer buf
-      (read-only-mode -1)
-      (erase-buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (org-auto-scheduler-report-mode)
+      (let ((inhibit-read-only t))
       (insert (propertize (format " Daily Schedule Adherence - %s \n" date-str) 'face 'org-document-title))
       (insert (make-string 50 ?=) "\n\n")
       
@@ -2528,33 +2717,57 @@ If DATE-STR is nil, defaults to today."
           (insert (make-string 30 ?-) "\n")
           (dolist (m missed)
             (if (= (length m) 3)
-                ;; It's a rescheduled task
-                (let ((heading (nth 0 m))
-                      (old (nth 1 m))
-                      (new (nth 2 m)))
-                  (insert (format "[Rescheduled] %s\n  From: %s\n  To:   %s\n" heading old new)))
+                ;; It's a rescheduled task - find ID from snapshot
+                (let* ((heading (nth 0 m))
+                       (old (nth 1 m))
+                       (new (nth 2 m))
+                       (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
+                       (task-id (and snap-task (plist-get snap-task :id))))
+                  (insert "[Rescheduled] ")
+                  (if task-id
+                      (org-auto-scheduler--insert-linked-heading heading task-id)
+                    (insert heading))
+                  (insert (format "\n  From: %s\n  To:   %s\n" old new)))
               ;; It's a standard missed task
-              (let ((heading (nth 0 m))
-                    (time (nth 1 m))
-                    (clocked (nth 2 m))
-                    (effort (nth 3 m))
-                    (cat (nth 4 m)))
+              (let* ((heading (nth 0 m))
+                     (time (nth 1 m))
+                     (clocked (nth 2 m))
+                     (effort (nth 3 m))
+                     (cat (nth 4 m))
+                     (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
+                     (task-id (and snap-task (plist-get snap-task :id))))
                 (let ((time-str (if (and time (string-match "\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" time))
                                     (match-string 1 time)
                                   "Unscheduled")))
-                  (insert (format "[%-5s] %s | Effort: %dm, Clocked: %dm\n" time-str heading effort clocked))))))
+                  (insert (format "[%-5s] " time-str))
+                  (if task-id
+                      (org-auto-scheduler--insert-linked-heading heading task-id)
+                    (insert heading))
+                  (insert (format " | Effort: %dm, Clocked: %dm\n" effort clocked))))))
           (insert "\n")))
       
       ;; 4. Postponed & Unplanned Warnings
       (let ((postponed (or (plist-get data :postponed) 0))
-            (unplanned (or (plist-get data :unplanned) 0)))
+            (unplanned (or (plist-get data :unplanned) 0))
+            (unplanned-tasks (plist-get data :unplanned-tasks)))
         (when (or (> postponed 0) (> unplanned 0))
           (insert (propertize " Warnings \n" 'face 'org-level-1))
           (insert (make-string 30 ?-) "\n")
           (when (> postponed 0)
             (insert (format "⚠️ You have %d tasks that rolled over from yesterday.\n" postponed)))
           (when (> unplanned 0)
-            (insert (format "⚠️ The \"Squirrel!\" Penalty: You completed %d unplanned tasks today.\n" unplanned)))
+            (insert (format "⚠️ The \"Squirrel!\" Penalty: You completed %d unplanned tasks today:\n" unplanned))
+            (dolist (ut unplanned-tasks)
+              (let ((heading (nth 0 ut))
+                    (task-id (nth 1 ut))
+                    (effort (nth 2 ut))
+                    (clocked (nth 3 ut))
+                    (category (nth 4 ut)))
+                (insert "  • ")
+                (if task-id
+                    (org-auto-scheduler--insert-linked-heading heading task-id)
+                  (insert heading))
+                (insert (format " [%s] Clocked: %dm\n" category clocked)))))
           (insert "\n")))
           
       ;; 5. Hall of Fame (Best Days)
@@ -2598,8 +2811,12 @@ If DATE-STR is nil, defaults to today."
             (insert (format "%-15s : %5.2fx (meaning tasks take %s time than estimated)\n"
                             (car m) (cdr m)
                             (if (> (cdr m) 1.2) "more" (if (< (cdr m) 0.8) "less" "about the same")))))))
+
+      ;; 7. Compact Gantt Timeline
+      (when snapshot
+        (org-auto-scheduler--render-compact-gantt date-str snapshot))
                             
-      (read-only-mode 1)
+      (goto-char (point-min)))
       (display-buffer buf))))
 
 (defvar org-auto-scheduler--adherence-timer nil
