@@ -7,6 +7,7 @@
 (require 'org-duration)
 (require 'time-date)
 (require 'org-clock)
+(require 'calendar)
 
 
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
@@ -90,7 +91,7 @@
 
 (defcustom org-auto-scheduler-max-days-to-check 14
   "The maximum number of days to look ahead for an available slot."
-  :type 'intege
+  :type 'integer
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-debug nil
@@ -441,11 +442,12 @@ Hash table with date strings as keys and lists of items as values.")
            (dolist (prop '("SCHEDULED" "TIMESTAMP"))
              (let ((time-str (org-entry-get nil prop)))
                (when time-str
-                 (let ((time-val (org-time-string-to-time time-str)))
+                 (let* ((time-val (org-time-string-to-time time-str))
+                        (has-time-flag (string-match "[0-9][0-9]:[0-9][0-9]" time-str)))
                    (unless task-id (setq task-id (org-id-get)))
                    (unless task-end-time (setq task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
                    (let* ((date-string (format-time-string "%Y-%m-%d" time-val))
-                          (item (list task-id time-val task-end-time tags t task-name))
+                          (item (list task-id time-val task-end-time tags t task-name has-time-flag))
                           (existing (gethash date-string org-auto-scheduler--agenda-cache)))
                      (puthash date-string (cons item existing) org-auto-scheduler--agenda-cache))))))))))
    nil 'agenda)
@@ -461,6 +463,7 @@ Hash table with date strings as keys and lists of items as values.")
             (let* ((task-name (org-get-heading t t t t))
                    (scheduled-time-str (org-entry-get nil "SCHEDULED"))
                    (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
+                   (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
                    (task-id (org-id-get))
                    (tags (org-get-tags))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
@@ -472,7 +475,7 @@ Hash table with date strings as keys and lists of items as values.")
                 (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                        (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
                   (when (string= scheduled-date date-string)
-                    (list task-id scheduled-time task-end-time tags t task-name))))))
+                    (list task-id scheduled-time task-end-time tags t task-name has-time-flag))))))
           nil
           'agenda)
          ;; Tasks with active timestamps (excluding habit tasks)
@@ -481,6 +484,7 @@ Hash table with date strings as keys and lists of items as values.")
             (let* ((task-name (org-get-heading t t t t))
                    (scheduled-time-str (org-entry-get nil "TIMESTAMP"))
                    (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
+                   (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
                    (task-id (org-id-get))
                    (tags (org-get-tags))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
@@ -492,7 +496,7 @@ Hash table with date strings as keys and lists of items as values.")
                 (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
                        (task-end-time (org-auto-scheduler-calculate-task-end-time (point))))
                   (when (string= scheduled-date date-string)
-                    (list task-id scheduled-time task-end-time tags t task-name))))))
+                    (list task-id scheduled-time task-end-time tags t task-name has-time-flag))))))
           nil
           'agenda))))
 
@@ -522,6 +526,8 @@ Hash table with date strings as keys and lists of items as values.")
             (dolist (repeater-item repeater-projections)
               (let ((repeater-date (format-time-string "%Y-%m-%d" (nth 1 repeater-item))))
                 (when (string= repeater-date date-string)
+                  ;; Has time flag is true for repeaters as they are scheduled tasks with a time duration 
+                  (setq repeater-item (append repeater-item (list t)))
                   (push repeater-item agenda-items)
                   (org-auto-scheduler--log-debug "Added projected repeater occurrence: %s at %s"
                                                  (nth 5 repeater-item)
@@ -1013,8 +1019,8 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                (tags (nth 3 item))
                (consider-for-conflicts (nth 4 item))
                (task-name (nth 5 item))
+               (has-time (nth 6 item))
                (is-autosch (member "AUTOSCH" tags))
-               (has-time (string-match "[0-9][0-9]:[0-9][0-9]" (format-time-string "%H:%M" task-start)))
                (needs-buffer (or (member "buffertime" tags) (member "buffertime" proposed-tags)))
                (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
                (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 active-gap))))
@@ -1070,7 +1076,11 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
 
 (defun org-auto-scheduler-next-day (time)
   "Get the start of the next day after TIME."
-  (time-add time (seconds-to-time (* 24 60 60))))
+  (let* ((decoded (decode-time time))
+         (next-day-decoded (append (subseq decoded 0 3)
+                                   (list (1+ (nth 3 decoded)))
+                                   (nthcdr 4 decoded))))
+    (apply #'encode-time next-day-decoded)))
 
 (defun org-time-with-hour (time hour)
   "Set the hour of TIME to HOUR."
@@ -1152,7 +1162,7 @@ If POM is nil, use the current point."
 
 (defun org-auto-scheduler-next-day-start (time)
   "Get the start time of the next day after TIME."
-  (let* ((next-day (time-add time (seconds-to-time 86400))) ; Add 24 hours
+  (let* ((next-day (org-auto-scheduler-next-day time))
          (next-day-str (format-time-string "%Y-%m-%d" next-day))
          (start-time-str (concat next-day-str " " org-auto-scheduler-start-time)))
     (org-time-string-to-time start-time-str)))
@@ -1256,7 +1266,8 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
            (if recurring
                (progn
                  (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
-                 (org-auto-scheduler-create-recurring-instances headline recurring scheduled not-before tasks))
+                 (let ((new-instances (org-auto-scheduler-create-recurring-instances headline recurring scheduled not-before)))
+                   (setq tasks (append new-instances tasks))))
              (org-auto-scheduler--log-debug "Adding non-recurring task: %s from file %s" headline file)
              (push (point-marker) tasks)))
          (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
@@ -1266,26 +1277,28 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (org-auto-scheduler--log-info "Found %d schedulable tasks across the agenda" (length tasks))
     (nreverse tasks)))
 
-(defun org-auto-scheduler-create-recurring-instances (headline recurring scheduled not-before tasks)
-  "Create recurring instances for a task and add them to TASKS list."
+(defun org-auto-scheduler-create-recurring-instances (headline recurring scheduled not-before)
+  "Create recurring instances for a task and return a list of markers for the scheduled tasks."
   (let* ((start-date (if scheduled
                          (org-time-string-to-time scheduled)
                        (current-time)))
          (end-date (time-add (current-time) (days-to-time org-auto-scheduler-recurring-look-days-ahead)))
          (current-date start-date)
-         (last-instance-date nil))
+         (last-instance-date nil)
+         (new-tasks '()))
     (while (time-less-p current-date end-date)
       (let* ((date-string (format-time-string "%Y-%m-%d" current-date))
              (instance-headline (format "%s - %s" headline date-string))
              (existing-instance (org-auto-scheduler-find-existing-instance instance-headline)))
         (unless existing-instance
           (let ((new-task (org-auto-scheduler-create-subtask instance-headline current-date)))
-            (push new-task tasks)))
+            (push new-task new-tasks)))
         (setq current-date (org-auto-scheduler-next-recurring-date current-date recurring))
         (setq last-instance-date current-date)))
     ;; Update the SCHEDULED property of the main task
     (when last-instance-date
-      (org-set-property "SCHEDULED" (format-time-string "<%Y-%m-%d %a>" last-instance-date)))))
+      (org-set-property "SCHEDULED" (format-time-string "<%Y-%m-%d %a>" last-instance-date)))
+    new-tasks))
 
 (defun org-auto-scheduler-create-subtask (headline date)
   "Create a new subtask with HEADLINE and DATE as NOT_BEFORE property."
@@ -1315,7 +1328,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     ("weekly" (time-add date (days-to-time 7)))
     ("bi-weekly" (time-add date (days-to-time 14)))
     ("monthly" (org-auto-scheduler-add-months date 1))
-    (_ date))) ; Default case, return the same date
+    (_ (error "Unknown recur frequency: %s" recurring))))
 
 (defun org-auto-scheduler-add-months (time months)
   "Add MONTHS to TIME, handling end of month and leap year cases."
