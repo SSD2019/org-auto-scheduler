@@ -52,6 +52,11 @@
   :type 'integer
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-default-task-duration 60
+  "Default duration in minutes for tasks without an explicit effort."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-state-weights
   '(("TODO" . 0)
     ("NEXT" . 1)
@@ -563,7 +568,7 @@ Hash table with date strings as keys and lists of items as values.")
   "Get the effort estimate for the task at point or marker POM.
 This function retrieves the effort property of a task and converts
 it to minutes."
-  (let ((effort (org-entry-get pom "Effort" t)))
+  (let ((effort (org-entry-get pom "Effort")))
     (when effort
       (org-duration-to-minutes effort))))
 
@@ -1077,19 +1082,11 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
 (defun org-auto-scheduler-next-day (time)
   "Get the start of the next day after TIME."
   (let* ((decoded (decode-time time))
-         (next-day-decoded (append (subseq decoded 0 3)
+         (next-day-decoded (append (cl-subseq decoded 0 3)
                                    (list (1+ (nth 3 decoded)))
                                    (nthcdr 4 decoded))))
     (apply #'encode-time next-day-decoded)))
 
-(defun org-time-with-hour (time hour)
-  "Set the hour of TIME to HOUR."
-  (let ((decoded (decode-time time)))
-    (apply #'encode-time (append (list 0 0 hour) (nthcdr 3 decoded)))))
-
-(defun time-to-minutes (time)
-  "Convert TIME duration to minutes."
-  (/ (time-to-seconds time) 60))
 
 (defun org-auto-scheduler-next-available-time-in-block (current-time blocks remaining-effort)
   "Find the next available time in the specified BLOCKS after CURRENT-TIME.
@@ -1097,12 +1094,13 @@ Returns the next available time if found within the blocks and max-days-to-check
 and if the task with REMAINING-EFFORT fits within the block.
 If no slot is found within blocks after max-days-to-check, returns nil."
   (let* ((days-checked 0)
-         (found-time nil))
+         (found-time nil)
+         (original-time current-time))
     
     ;; Try to find a slot within blocks
     (while (and (not found-time) 
                 (< days-checked org-auto-scheduler-max-days-to-check))
-      (let ((day-start (time-add current-time (days-to-time days-checked))))
+      (let ((day-start (time-add original-time (days-to-time days-checked))))
         (dolist (block blocks)
           (let* ((block-start (org-auto-scheduler-time-with-time-string day-start (car block)))
                  (block-end (org-auto-scheduler-time-with-time-string day-start (cdr block))))
@@ -1112,18 +1110,8 @@ If no slot is found within blocks after max-days-to-check, returns nil."
                                   block-start
                                 current-time))))))
       
-      ;; If no slot found in the current day, check the immediate next day
-      (when (and (not found-time) (= days-checked 0))
-        (let ((next-day-start (org-auto-scheduler-next-day-start current-time)))
-          (dolist (block blocks)
-            (let* ((block-start (org-auto-scheduler-time-with-time-string next-day-start (car block)))
-                   (block-end (org-auto-scheduler-time-with-time-string next-day-start (cdr block))))
-              (when (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort)
-                (setq found-time block-start))))))
-
       ;; Move to the next day
-      (setq days-checked (1+ days-checked))
-      (setq current-time (org-auto-scheduler-next-day-start current-time)))
+      (setq days-checked (1+ days-checked)))
     
     (when found-time
       (org-auto-scheduler--log-debug 
@@ -1204,6 +1192,7 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (org-caldav-sync))
   (condition-case err
       (progn
+        (org-auto-scheduler-validate-config)              ; Validate config at runtime
         (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
         (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
         (unless org-auto-scheduler--preview-mode
@@ -1296,8 +1285,11 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
         (setq current-date (org-auto-scheduler-next-recurring-date current-date recurring))
         (setq last-instance-date current-date)))
     ;; Update the SCHEDULED property of the main task
-    (when last-instance-date
-      (org-set-property "SCHEDULED" (format-time-string "<%Y-%m-%d %a>" last-instance-date)))
+    ;; Save-excursion to get back to the parent heading since create-subtask moves point
+    (save-excursion
+      (org-back-to-heading t)
+      (when last-instance-date
+        (org-set-property "SCHEDULED" (format-time-string "<%Y-%m-%d %a>" last-instance-date))))
     new-tasks))
 
 (defun org-auto-scheduler-create-subtask (headline date)
@@ -1331,18 +1323,17 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
     (_ (error "Unknown recur frequency: %s" recurring))))
 
 (defun org-auto-scheduler-add-months (time months)
-  "Add MONTHS to TIME, handling end of month and leap year cases."
+  "Add MONTHS to TIME, handling end of month, multi-year jumps, and leap year cases."
   (let* ((decoded (decode-time time))
          (month (nth 4 decoded))
          (year (nth 5 decoded))
          (day (nth 3 decoded))
-         (last-day-of-month
-          (calendar-last-day-of-month month year)))
-    (setf (nth 4 decoded) (+ month months))
-    (when (> (nth 4 decoded) 12)
-      (setf (nth 5 decoded) (1+ year))
-      (setf (nth 4 decoded) (- (nth 4 decoded) 12)))
-    (setf (nth 3 decoded) (min day (calendar-last-day-of-month (nth 4 decoded) (nth 5 decoded))))
+         (total-months (+ month months -1))
+         (new-year (+ year (floor total-months 12)))
+         (new-month (1+ (mod total-months 12))))
+    (setf (nth 5 decoded) new-year)
+    (setf (nth 4 decoded) new-month)
+    (setf (nth 3 decoded) (min day (calendar-last-day-of-month new-month new-year)))
     (apply #'encode-time decoded)))
 
 (defun org-auto-scheduler-create-report-buffer ()
@@ -1487,7 +1478,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                         (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string marker topo-depth) org-auto-scheduler-completed-tasks)
                       (org-set-property "SCHEDULED" schedule-string)
                       (org-set-property org-auto-scheduler-scheduled-property "t")
-                      (push (list task-id available-time end-time '("AUTOSCH") t headline nil nil topo-depth) org-auto-scheduler-completed-tasks))
+                      (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string nil topo-depth) org-auto-scheduler-completed-tasks))
                     (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled task '%s' from %s to %s (Remaining effort: %d minutes, Gap: %dm)"
                                                   headline
                                                   (format-time-string "%Y-%m-%d %H:%M" available-time)
@@ -1531,15 +1522,9 @@ is the maximum end time of any blocker scheduled today (or nil if none)."
             (setq all-met nil)))))
       (cons all-met latest-end))))
 
-(defmacro org-with-point-at (pom &rest body)
-  "Execute BODY with point at POM. POM can be a marker or a buffer position."
-  (declare (indent 1) (debug t))
-  `(let ((pom ,pom))
-     (save-excursion
-       (when (markerp pom)
-         (set-buffer (marker-buffer pom)))
-         (goto-char (or (marker-position pom) pom))
-         ,@body)))
+;; NOTE: Using Org's built-in `org-with-point-at` macro.
+;; The custom redefinition that was here has been removed to avoid
+;; shadowing Org's version, which had subtle scoping bugs.
 
 (defun org-auto-scheduler-setup ()
   "Set up the Org Auto Scheduler."
@@ -1601,10 +1586,6 @@ if no effort is specified, adjusted by historical effort multiplier."
          (multiplier (org-auto-scheduler-get-effort-multiplier marker)))
     (round (* base-effort multiplier))))
 
-(defcustom org-auto-scheduler-default-task-duration 60
-  "Default duration in minutes for tasks without an explicit effort."
-  :type 'integer
-  :group 'org-auto-scheduler)
 
 (defun org-auto-scheduler-validate-config ()
   "Validate the configuration variables for org-auto-scheduler.
@@ -1836,7 +1817,8 @@ to ensure fresh projections are generated."
 
 
 ;; Call this function when the package is loaded
-(org-auto-scheduler-validate-config)
+;; NOTE: validate-config is called inside schedule-tasks, not at load time,
+;; to avoid errors when the user hasn't configured their settings yet.
 
 
 (defun org-auto-scheduler-display-report ()
@@ -1914,7 +1896,7 @@ if the current system's hostname is in the list."
     (setq org-auto-scheduler--idle-timer
           (run-with-idle-timer 
            org-auto-scheduler-idle-time
-           org-auto-scheduler-background-interval
+           t  ; REPEAT: t means fire every time Emacs goes idle for idle-time seconds
            #'org-auto-scheduler-background-run))
     (add-hook 'kill-emacs-hook #'org-auto-scheduler-cleanup-background)))
 
@@ -2008,7 +1990,7 @@ if the current system's hostname is in the list."
          (current-state (aref entry 0)))
     (when entry
       (aset entry 0 (if (string= current-state "[X]") "[ ]" "[X]"))
-      (tabulated-list-put-tag current-state t) ; force redraw line
+      (tabulated-list-print t)
       (forward-line 1))))
 
 (defun org-auto-scheduler-review-jump ()
@@ -2102,12 +2084,17 @@ if the current system's hostname is in the list."
             
           (setq current-time (org-auto-scheduler-schedule-single-task marker current-time depth)))))
           
-    ;; Rebuild the tabulated list entries natively in the same buffer window
+    ;; Rebuild the tabulated list entries using task-id matching (not index)
+    ;; to avoid misalignment if some tasks failed to schedule
     (setq tabulated-list-entries nil)
-    (let ((index 0))
+    (let ((check-state-map (make-hash-table :test 'equal)))
+      ;; Build a map from task-id -> checked state from ordered-tasks
+      (dolist (item ordered-tasks)
+        (let ((task-id (nth 0 (cdr item))))
+          (puthash task-id (car item) check-state-map)))
       (dolist (task (reverse org-auto-scheduler-completed-tasks))
-        (let* ((item (nth index ordered-tasks))
-               (check-state (car item))
+        (let* ((task-id (nth 0 task))
+               (check-state (or (gethash task-id check-state-map) "[X]"))
                (marker (nth 7 task))
                (headline (nth 5 task))
                (schedule-str-actual (nth 6 task))
@@ -2125,7 +2112,7 @@ if the current system's hostname is in the list."
                                "None"))
                (prefix (if (> depth 0) (concat (make-string (* 2 (1- depth)) ? ) "├─ ") ""))
                (tree-headline (concat prefix headline)))
-          (push (list (nth 0 task) (vector check-state
+          (push (list task-id (vector check-state
                                            tree-headline 
                                            schedule-str-actual
                                            (format "%d mins" duration)
@@ -2133,8 +2120,7 @@ if the current system's hostname is in the list."
                                            (format "%.2f" score)
                                            (format "%d" depth)
                                            blockers-str))
-                tabulated-list-entries)
-          (setq index (1+ index)))))
+                tabulated-list-entries))))
     (setq tabulated-list-entries (nreverse tabulated-list-entries))
     (setq tabulated-list-sort-key nil) ; disable sort stringency
     (tabulated-list-print t)
@@ -2436,8 +2422,10 @@ start time is in the past."
               (cl-incf postponed-tasks)))
   
           ;; Track Missed Tasks for Time of Day Analysis
-          (when (and (not is-done) (< (/ earned effort) 0.8) has-passed)
-            (push (list heading scheduled-time clocked effort category) missed-tasks))
+          ;; Only add if not already recorded as a rescheduled task (3-element list)
+          (let ((already-rescheduled (cl-find-if (lambda (m) (and (= (length m) 3) (string= (nth 0 m) heading))) missed-tasks)))
+            (when (and (not is-done) (not already-rescheduled) (< (/ earned effort) 0.8) has-passed)
+              (push (list heading scheduled-time clocked effort category) missed-tasks)))
   
           (push (list heading earned effort is-done) tasks-results))))
 
