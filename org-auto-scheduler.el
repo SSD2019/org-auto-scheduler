@@ -2331,11 +2331,12 @@ Only records tasks that have a SCHEDULED property matching today's date."
     (org-auto-scheduler-save-adherence)
     (message "Snapshot saved: %d tasks planned for today." count)))
 
-(defun org-auto-scheduler-score-schedule (&optional target-date)
+(defun org-auto-scheduler-score-schedule (&optional target-date no-display)
   "Score performance against a morning's snapshot.
 If TARGET-DATE is provided or prompted for, scores that specific day.
 When scoring the current day, only considers tasks whose expected
-start time is in the past."
+start time is in the past.
+If NO-DISPLAY is non-nil, suppresses the graphical output."
   (interactive
    (list (when current-prefix-arg
            (let ((prompt-date (org-read-date nil nil nil "Score schedule for date: ")))
@@ -2349,8 +2350,13 @@ start time is in the past."
          (snapshot (cdr (assoc score-date org-auto-scheduler--adherence-snapshots)))
          (yesterday-snapshot (cdr (assoc yesterday-date org-auto-scheduler--adherence-snapshots)))
          (current-time (current-time))
+         (clock-intervals (org-auto-scheduler-get-clock-intervals score-date))
          (total-effort 0.0)
          (earned-effort 0.0)
+         (total-overlap-mins 0.0)
+         (punctuality-earned 0.0)
+         (weighted-earned 0.0)
+         (weighted-total 0.0)
          (tasks-results nil)
          (cat-stats (make-hash-table :test 'equal))
          (postponed-tasks 0)
@@ -2397,24 +2403,61 @@ start time is in the past."
           (let ((cat-data (gethash category cat-stats)))
             (setcar cat-data (+ (car cat-data) effort)))
   
-          (if marker
-              (progn
-                ;; Check if it was rescheduled
-                (let* ((current-scheduled (org-with-point-at marker (org-entry-get marker "SCHEDULED"))))
-                  (when (and current-scheduled scheduled-time
-                             (not (string= current-scheduled scheduled-time))
-                             (not is-done))
-                    (push (list heading scheduled-time current-scheduled) missed-tasks)))
-                (if is-done
-                    (setq earned (float effort))
-                  ;; Partial credit: up to the estimated effort
-                  (setq earned (min (float effort) (float clocked)))))
-            ;; Marker not found - count as 0 earned
-            (setq earned 0.0))
-          
-          (setq earned-effort (+ earned-effort earned))
-          (let ((cat-data (gethash category cat-stats)))
-            (setcar (cdr cat-data) (+ (cadr cat-data) earned)))
+          (let ((task-val 1.0)
+                (overlap-mins 0.0)
+                (punctual-mult 1.0))
+            (if marker
+                (progn
+                  ;; Get task score for priority weighting
+                  (let ((score-info (org-auto-scheduler-calculate-score marker)))
+                    (setq task-val (max 1.0 (car score-info))))
+                  
+                  ;; Calculate overlap and punctuality from clock intervals
+                  (when scheduled-time
+                    (let* ((plan-start (org-time-string-to-time scheduled-time))
+                           (plan-end (time-add plan-start (seconds-to-time (* effort 60))))
+                           (first-start nil))
+                      (dolist (interval clock-intervals)
+                        (when (equal (nth 1 interval) id)
+                          (let* ((actual-start (nth 2 interval))
+                                 (actual-end (nth 3 interval)))
+                            ;; Track earliest start
+                            (unless first-start (setq first-start actual-start))
+                            ;; Add overlap
+                            (let ((o-start (time-since (max (float-time plan-start) (float-time actual-start))))
+                                  (o-end (time-since (min (float-time plan-end) (float-time actual-end)))))
+                              (when (> (float-time o-end) (float-time o-start))
+                                (cl-incf overlap-mins (/ (- (float-time o-end) (float-time o-start)) 60.0)))))))
+                      ;; Calculate punctuality multiplier
+                      (when first-start
+                        (let ((variance-mins (/ (abs (float-time (time-subtract first-start plan-start))) 60.0)))
+                          (if (<= variance-mins 15.0)
+                              (setq punctual-mult 1.0)
+                            ;; Lose 0.1 for every 30 mins late/early past 15 min buffer
+                            (setq punctual-mult (max 0.5 (- 1.0 (* (ffloor (/ (- variance-mins 15.0) 30.0)) 0.1)))))))))
+                              
+                  ;; Check if it was rescheduled
+                  (let* ((current-scheduled (org-with-point-at marker (org-entry-get marker "SCHEDULED"))))
+                    (when (and current-scheduled scheduled-time
+                               (not (string= current-scheduled scheduled-time))
+                               (not is-done))
+                      (push (list heading scheduled-time current-scheduled) missed-tasks)))
+                  (if is-done
+                      (setq earned (float effort))
+                    ;; Partial credit: up to the estimated effort
+                    (setq earned (min (float effort) (float clocked)))))
+              ;; Marker not found - count as 0 earned
+              (setq earned 0.0))
+            
+            ;; Update multi-score totals
+            (setq earned-effort (+ earned-effort earned))
+            (setq total-overlap-mins (+ total-overlap-mins (min (float effort) overlap-mins)))
+            (setq punctuality-earned (+ punctuality-earned (* earned punctual-mult)))
+            (setq weighted-earned (+ weighted-earned (* earned task-val)))
+            (setq weighted-total (+ weighted-total (* effort task-val)))
+            
+            (let ((cat-data (gethash category cat-stats)))
+              (setcar (cdr cat-data) (+ (cadr cat-data) earned))))
   
           ;; Postponement Check (was it in yesterday's snapshot?)
           (let ((was-yesterday (cl-find-if (lambda (yt) (equal (plist-get yt :id) id)) yesterday-snapshot)))
@@ -2446,7 +2489,13 @@ start time is in the past."
      nil 'agenda)
 
     (let* ((score (if (> total-effort 0) (* (/ earned-effort total-effort) 100.0) 100.0))
+           (true-adherence (if (> total-effort 0) (* (/ total-overlap-mins total-effort) 100.0) 100.0))
+           (punctuality-score (if (> total-effort 0) (* (/ punctuality-earned total-effort) 100.0) 100.0))
+           (weighted-score (if (> weighted-total 0) (* (/ weighted-earned weighted-total) 100.0) 100.0))
            (score-data (list :score score
+                             :true-adherence true-adherence
+                             :punctuality-score punctuality-score
+                             :weighted-score weighted-score
                              :total-effort total-effort
                              :earned-effort earned-effort
                              :postponed postponed-tasks
@@ -2462,7 +2511,166 @@ start time is in the past."
         (push (cons score-date score-data) org-auto-scheduler--adherence-history))
       
       (org-auto-scheduler-save-adherence)
-      (org-auto-scheduler-adherence-report score-date)
+      (unless no-display
+        (with-current-buffer (get-buffer-create "*Org Auto Scheduler Scores*")
+          (let ((inhibit-read-only t))
+            (erase-buffer))
+          (org-auto-scheduler-report-mode)
+          (let ((inhibit-read-only t))
+            (insert (propertize (format " Daily Schedule Adherence - %s \n" score-date) 'face 'org-document-title))
+            (insert (make-string 50 ?=) "\n\n")
+            
+            ;; 1. Global Score Overview
+            (let* ((streak (org-auto-scheduler-get-adherence-streak))
+                   (get-color (lambda (s) (cond ((>= s 90) "green")
+                                                ((>= s 70) "orange")
+                                                (t "red")))))
+              (insert (format "Pure Effort:       %s\n" 
+                              (propertize (format "%5.1f%%" score) 'face `(:foreground ,(funcall get-color score) :weight bold))))
+              (insert (format "True Adherence:    %s\n" 
+                              (propertize (format "%5.1f%%" true-adherence) 'face `(:foreground ,(funcall get-color true-adherence) :weight bold))))
+              (insert (format "Punctuality Score: %s\n" 
+                              (propertize (format "%5.1f%%" punctuality-score) 'face `(:foreground ,(funcall get-color punctuality-score) :weight bold))))
+              (insert (format "Weighted Effort:   %s\n\n" 
+                              (propertize (format "%5.1f%%" weighted-score) 'face `(:foreground ,(funcall get-color weighted-score) :weight bold))))
+                              
+              (insert (format "Current Streak: %d days 🔥\n" streak))
+              (insert (format "Effort: %.1fh planned, %.1fh earned\n\n" 
+                              (/ total-effort 60.0) 
+                              (/ earned-effort 60.0))))
+            
+            ;; 2. Category Breakdown
+            (insert (propertize " Category Breakdown \n" 'face 'org-level-1))
+            (insert (make-string 30 ?-) "\n")
+            (if (and cat-stats (> (hash-table-count cat-stats) 0))
+                (maphash (lambda (cat stats)
+                           (let* ((total (car stats))
+                                  (earned (cadr stats))
+                                  (cat-score (if (> total 0) (* (/ earned total) 100.0) 100.0)))
+                             (insert (format "%-15s : %6.1f%% (Planned: %.1fh, Earned: %.1fh)\n"
+                                             cat cat-score (/ total 60.0) (/ earned 60.0)))))
+                         cat-stats)
+              (insert "No categories tracked.\n"))
+            (insert "\n")
+            
+            ;; 4. Time of Day Analysis / Missed Tasks
+            (when missed-tasks
+              (insert (propertize " Missed or Rescheduled Tasks \n" 'face 'org-level-1))
+              (insert (make-string 30 ?-) "\n")
+              (dolist (m missed-tasks)
+                (if (= (length m) 3)
+                    ;; It's a rescheduled task - find ID from snapshot
+                    (let* ((heading (nth 0 m))
+                           (old (nth 1 m))
+                           (new (nth 2 m))
+                           (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
+                           (task-id (and snap-task (plist-get snap-task :id))))
+                      (insert "[Rescheduled] ")
+                      (if task-id
+                          (org-auto-scheduler--insert-linked-heading heading task-id)
+                        (insert heading))
+                      (insert (format "\n  From: %s\n  To:   %s\n" old new)))
+                  ;; It's a standard missed task
+                  (let* ((heading (nth 0 m))
+                         (time (nth 1 m))
+                         (clocked (nth 2 m))
+                         (effort (nth 3 m))
+                         (cat (nth 4 m))
+                         (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
+                         (task-id (and snap-task (plist-get snap-task :id))))
+                    (let ((time-str (if (and time (string-match "\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" time))
+                                        (match-string 1 time)
+                                      "Unscheduled")))
+                      (insert (format "[%-5s] " time-str))
+                      (if task-id
+                          (org-auto-scheduler--insert-linked-heading heading task-id)
+                        (insert heading))
+                      (insert (format " | Effort: %dm, Clocked: %dm\n" effort clocked))))))
+              (insert "\n"))
+            
+            ;; 5. Postponed & Unplanned Warnings
+            (when (or (> postponed-tasks 0) (> (length unplanned-tasks) 0))
+              (insert (propertize " Warnings \n" 'face 'org-level-1))
+              (insert (make-string 30 ?-) "\n")
+              (when (> postponed-tasks 0)
+                (insert (format "⚠️ You have %d tasks that rolled over from yesterday.\n" postponed-tasks)))
+              (when (> (length unplanned-tasks) 0)
+                (insert (format "⚠️ The \"Squirrel!\" Penalty: You completed %d unplanned tasks today:\n" (length unplanned-tasks)))
+                (dolist (ut unplanned-tasks)
+                  (let ((heading (nth 0 ut))
+                        (task-id (nth 1 ut))
+                        (effort (nth 2 ut))
+                        (clocked (nth 3 ut))
+                        (category (nth 4 ut)))
+                    (insert "  • ")
+                    (if task-id
+                        (org-auto-scheduler--insert-linked-heading heading task-id)
+                      (insert heading))
+                    (insert (format " [%s] Clocked: %dm\n" category clocked)))))
+              (insert "\n"))
+              
+            ;; 6. Hall of Fame (Past Bests)
+            (let ((best-week 0.0) (best-week-date "")
+                  (best-month 0.0) (best-month-date "")
+                  (best-year 0.0) (best-year-date ""))
+              (dolist (entry org-auto-scheduler--adherence-history)
+                (let* ((d-str (car entry))
+                       (entry-data (cdr entry))
+                       (entry-score (plist-get entry-data :score))
+                       (entry-time (org-auto-scheduler-parse-time-string (concat d-str " 12:00")))
+                       (days-ago (and entry-time (time-to-days (time-subtract current-time entry-time)))))
+                  (when days-ago
+                    ;; Week
+                    (when (and (<= days-ago 7) (> entry-score best-week))
+                      (setq best-week entry-score)
+                      (setq best-week-date d-str))
+                    ;; Month
+                    (when (and (<= days-ago 30) (> entry-score best-month))
+                      (setq best-month entry-score)
+                      (setq best-month-date d-str))
+                    ;; Year
+                    (when (and (<= days-ago 365) (> entry-score best-year))
+                      (setq best-year entry-score)
+                      (setq best-year-date d-str)))))
+              (when (> best-week 0)
+                (insert (propertize " 🏆 Hall of Fame (Past Bests) \n" 'face 'org-level-1))
+                (insert (make-string 30 ?-) "\n")
+                (insert (format "Best Last 7 Days:  %6.1f%% (%s)\n" best-week best-week-date))
+                (insert (format "Best Last 30 Days: %6.1f%% (%s)\n" best-month best-month-date))
+                (insert (format "Best Last 1 Year:  %6.1f%% (%s)\n" best-year best-year-date))
+                (insert "\n")))
+                
+            ;; 7. Historical Multipliers
+            (when org-auto-scheduler-historical-multipliers
+              (insert (propertize " Estimation vs Reality (Historical Multipliers) \n" 'face 'org-level-1))
+              (insert (make-string 30 ?-) "\n")
+              (dolist (m org-auto-scheduler-historical-multipliers)
+                (insert (format "%-15s : %5.2fx (meaning tasks take %s time than estimated)\n"
+                                (car m) (cdr m)
+                                (if (> (cdr m) 1.2) "more" (if (< (cdr m) 0.8) "less" "about the same"))))))
+                                
+            ;; 7. Compact Gantt Timeline
+            (when snapshot
+              (org-auto-scheduler--render-compact-gantt score-date snapshot))
+              
+            ;; 8. 30-Day Trend (2x2 Grid at bottom)
+            (insert (propertize " 📈 30-Day Trend \n" 'face 'org-level-1))
+            (insert (make-string 30 ?-) "\n")
+            
+            (let ((graph1 (org-auto-scheduler--get-bar-graph-lines "Pure Effort" :score score-date))
+                  (graph2 (org-auto-scheduler--get-bar-graph-lines "True Adherence" :true-adherence score-date))
+                  (graph3 (org-auto-scheduler--get-bar-graph-lines "Punctuality" :punctuality-score score-date))
+                  (graph4 (org-auto-scheduler--get-bar-graph-lines "Weighted Score" :weighted-score score-date)))
+              ;; Top row (Effort, Adherence)
+              (dotimes (i 14)
+                (insert (nth i graph1) "  " (nth i graph2) "\n"))
+              (insert "\n")
+              ;; Bottom row (Punctuality, Weighted)
+              (dotimes (i 14)
+                (insert (nth i graph3) "  " (nth i graph4) "\n")))
+            
+            (goto-char (point-min)))
+          (display-buffer (current-buffer))))
       (message "Schedule scored: %.1f%% adherence calculated for %s." score score-date))))
 
 (defun org-auto-scheduler-get-adherence-streak ()
@@ -2552,12 +2760,13 @@ Scans all org-agenda-files for CLOCK lines matching the target date."
          (minute (nth 1 decoded)))
     (+ (* hour 60) minute)))
 
-(defun org-auto-scheduler--render-gantt-row (label intervals chunk-start-min chunk-end-min chars-per-min date-str)
+(defun org-auto-scheduler--render-gantt-row (label intervals chunk-start-min chunk-end-min chars-per-min date-str legend-hash)
   "Render a single Gantt row for LABEL (e.g. \"Planned\", \"Actual\").
 INTERVALS is a list of (HEADING ID START-TIME END-TIME).
 CHUNK-START-MIN and CHUNK-END-MIN are minute offsets from midnight.
 CHARS-PER-MIN is the character resolution (e.g. 0.2 = 1 char per 5 min).
-DATE-STR is the target date for clamping."
+DATE-STR is the target date for clamping.
+LEGEND-HASH maps task IDs to short numbers strings for display."
   (let* ((chunk-width (round (* (- chunk-end-min chunk-start-min) chars-per-min)))
          (row (make-string chunk-width ?\s)))
     ;; Fill in each interval
@@ -2567,21 +2776,29 @@ DATE-STR is the target date for clamping."
              ;; Clamp to chunk boundaries
              (clamped-start (max start-min chunk-start-min))
              (clamped-end (min end-min chunk-end-min))
-             (heading (nth 0 interval)))
+             (heading (nth 0 interval))
+             (id (nth 1 interval)))
         (when (> clamped-end clamped-start)
           (let* ((col-start (round (* (- clamped-start chunk-start-min) chars-per-min)))
                  (col-end (round (* (- clamped-end chunk-start-min) chars-per-min)))
                  (safe-start (max 0 (min col-start (1- chunk-width))))
                  (safe-end (max (1+ safe-start) (min col-end chunk-width)))
                  (block-len (- safe-end safe-start))
+                 (legend-val (if id (gethash id legend-hash (list heading nil)) (list heading nil)))
+                 (legend-id (if (stringp legend-val) legend-val (car legend-val)))
+                 (block-color (if (stringp legend-val) nil (cadr legend-val)))
                  ;; Truncate heading to fit
-                 (display-name (if (> (length heading) (- block-len 2))
+                 (display-name (if (> (length legend-id) (- block-len 2))
                                    (if (> block-len 4)
-                                       (concat (substring heading 0 (- block-len 3)) "..")
+                                       (concat (substring legend-id 0 (- block-len 3)) "..")
                                      (make-string block-len ?=))
-                                 heading))
+                                 legend-id))
                  ;; Pad name within block
-                 (padded (concat "[" display-name (make-string (max 0 (- block-len (length display-name) 2)) ?=) "]")))
+                 (pad-len (max 0 (- block-len (length display-name) 2)))
+                 (pad-left (/ pad-len 2))
+                 (pad-right (- pad-len pad-left))
+                 (raw-padded (concat "[" (make-string pad-left ?=) display-name (make-string pad-right ?=) "]"))
+                 (padded (if block-color (propertize raw-padded 'face `(:foreground ,block-color)) raw-padded)))
             ;; Continuation markers for tasks spanning chunk boundaries
             (when (< start-min chunk-start-min)
               (aset row safe-start ?<))
@@ -2589,9 +2806,14 @@ DATE-STR is the target date for clamping."
               (when (< (1- safe-end) chunk-width)
                 (aset row (1- safe-end) ?>)))
             ;; Write the block into the row
-            (let ((write-str (substring padded 0 (min (length padded) block-len))))
+            (let ((write-str (substring raw-padded 0 (min (length raw-padded) block-len))))
               (dotimes (i (min (length write-str) (- chunk-width safe-start)))
-                (aset row (+ safe-start i) (aref write-str i))))))))
+                (let ((char (aref write-str i)))
+                  ;; If it's a visible char, inject it with properties directly if colored
+                  (if block-color
+                      (put-text-property (+ safe-start i) (+ safe-start i 1) 
+                                         'face block-color row))
+                  (aset row (+ safe-start i) char))))))))
     (insert (format "%-8s %s\n" label row))))
 
 (defun org-auto-scheduler--render-timeline-header (chunk-start-min chunk-end-min chars-per-min)
@@ -2627,7 +2849,19 @@ Clocked intervals are extracted from the org files."
          (planned-intervals nil)
          ;; Get actual clocked intervals
          (clocked-intervals (org-auto-scheduler-get-clock-intervals date-str))
-         (date-time (org-auto-scheduler-parse-time-string (concat date-str " 00:00"))))
+         (date-time (org-auto-scheduler-parse-time-string (concat date-str " 00:00")))
+         (legend-hash (make-hash-table :test 'equal))
+         (legend-list nil)
+         (legend-counter 1)
+         (colors '(font-lock-keyword-face
+                   font-lock-type-face
+                   font-lock-string-face
+                   font-lock-variable-name-face
+                   font-lock-function-name-face
+                   font-lock-constant-face
+                   font-lock-builtin-face
+                   font-lock-warning-face))
+         (color-idx 0))
     ;; Build planned intervals from snapshot
     (dolist (task snapshot)
       (let* ((heading (plist-get task :heading))
@@ -2641,183 +2875,129 @@ Clocked intervals are extracted from the org files."
             (push (list heading id scheduled-time end-time) planned-intervals)))))
     (setq planned-intervals (sort planned-intervals (lambda (a b) (time-less-p (nth 2 a) (nth 2 b)))))
 
+    ;; Build legend hash before rendering with colors
+    (dolist (interval (append planned-intervals clocked-intervals))
+      (let ((heading (nth 0 interval))
+            (id (nth 1 interval)))
+        (when (and id (not (gethash id legend-hash)))
+          (let* ((legend-id (number-to-string legend-counter))
+                 (assigned-color (nth (% color-idx (length colors)) colors)))
+            (puthash id (list legend-id assigned-color) legend-hash)
+            (push (list legend-id heading id assigned-color) legend-list)
+            (cl-incf legend-counter)
+            (cl-incf color-idx)))))
+    (setq legend-list (nreverse legend-list))
+
     (insert (propertize " 📊 Daily Timeline \n" 'face 'org-level-1))
     (insert (make-string 30 ?-) "\n")
     (when (and (null planned-intervals) (null clocked-intervals))
       (insert "No timeline data available.\n\n")
       (cl-return-from org-auto-scheduler--render-compact-gantt nil))
 
-    ;; Render chunk by chunk
-    (let ((chunk-start start-minutes))
-      (while (< chunk-start end-minutes)
-        (let ((chunk-end (min (+ chunk-start (* chunk-hours 60)) end-minutes)))
+    ;; Render chunk by chunk (Explicitly 06:00 - 12:00, 12:00 - 18:00, 18:00 - 24:00)
+    (let ((chunks '((360 720) (720 1080) (1080 1440))))
+      (dolist (chunk chunks)
+        (let ((chunk-start (car chunk))
+              (chunk-end (cadr chunk)))
           ;; Header with hour markers
           (org-auto-scheduler--render-timeline-header chunk-start chunk-end chars-per-min)
           ;; Planned row
-          (org-auto-scheduler--render-gantt-row "Planned" planned-intervals chunk-start chunk-end chars-per-min date-str)
+          (org-auto-scheduler--render-gantt-row "Planned" planned-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
           ;; Actual row
-          (org-auto-scheduler--render-gantt-row "Actual" clocked-intervals chunk-start chunk-end chars-per-min date-str)
-          (insert "\n")
-          (setq chunk-start chunk-end))))
-    (insert "\n")))
+          (org-auto-scheduler--render-gantt-row "Actual" clocked-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
+          (insert "\n"))))
+    (insert "\n")
+    ;; Render Legend
+    (when legend-list
+      (insert (propertize " Timeline Legend \n" 'face 'org-level-2))
+      (insert (make-string 30 ?-) "\n")
+      (dolist (item legend-list)
+        (let* ((legend-id (nth 0 item))
+               (heading (nth 1 item))
+               (id (nth 2 item))
+               (color (nth 3 item))
+               ;; Since color is a face symbol (e.g., 'font-lock-keyword-face), we use it directly
+               (fmt-legend-id (if color (propertize (format " [%2s] " legend-id) 'face color)
+                                (format " [%2s] " legend-id))))
+          (insert fmt-legend-id)
+          (if id
+              (let ((start (point)))
+                (insert (propertize heading
+                                    'org-id id
+                                    'face (if color `(:inherit ,color :underline t) 'link)
+                                    'mouse-face 'highlight)))
+            (insert (if color (propertize heading 'face color) heading)))
+          (insert "\n")))
+      (insert "\n"))))
 
 ;;; Adherence Report
 
-(defun org-auto-scheduler-adherence-report (&optional date-str)
-  "Display the adherence report for DATE-STR.
-If DATE-STR is nil, defaults to today."
-  (interactive)
-  (let* ((date-str (or date-str (format-time-string "%Y-%m-%d")))
-         (data (cdr (assoc date-str org-auto-scheduler--adherence-history)))
-         (snapshot (cdr (assoc date-str org-auto-scheduler--adherence-snapshots)))
-         (buf (get-buffer-create "*Org Auto Scheduler Adherence*")))
-    (unless data
-      (user-error "No data to display for %s" date-str))
+(defun org-auto-scheduler--get-bar-graph-lines (label property target-date-str)
+  "Return a list of strings representing a 10-row high bar graph for LABEL.
+Extracts PROPERTY from history ending at TARGET-DATE-STR.
+Normalizes the Y-axis based on the maximum score in the 30-day window."
+  (let* ((days 30)
+         (target-time (org-auto-scheduler-parse-time-string (concat target-date-str " 12:00")))
+         (values nil)
+         ;; Unicode blocks:   ▂ ▃ ▄ ▅ ▆ ▇ █ (8 levels, plus space for 0)
+         (bars [" " " " "▂" "▃" "▄" "▅" "▆" "▇" "█"])
+         (latest-val 0.0)
+         (lines nil))
+    ;; Collect last 30 days of data
+    (dotimes (i days)
+      (let* ((date-time (time-subtract target-time (days-to-time (- (1- days) i))))
+             (date-str (format-time-string "%Y-%m-%d" date-time))
+             (entry (assoc date-str org-auto-scheduler--adherence-history))
+             (val (if entry (or (plist-get (cdr entry) property) (plist-get (cdr entry) :score) 0.0) 0.0)))
+        (push val values)
+        (when (= i (1- days))
+          (setq latest-val val))))
+    (setq values (nreverse values))
     
-    (with-current-buffer buf
-      (let ((inhibit-read-only t))
-        (erase-buffer))
-      (org-auto-scheduler-report-mode)
-      (let ((inhibit-read-only t))
-      (insert (propertize (format " Daily Schedule Adherence - %s \n" date-str) 'face 'org-document-title))
-      (insert (make-string 50 ?=) "\n\n")
+    ;; Build output array
+    (let* ((color (cond ((>= latest-val 90) "green")
+                        ((>= latest-val 70) "orange")
+                        (t "red")))
+           (actual-max (apply #'max values))
+           (max-val (max 10.0 (* 10.0 (ceiling (/ actual-max 10.0)))))
+           (rows 10))
+           
+      ;; Header lines
+      (push (format "%-25s (Last 30 Days)" label) lines)
+      (push (make-string 38 ?-) lines)
       
-      ;; 1. Global Score
-      (let* ((score (plist-get data :score))
-             (streak (org-auto-scheduler-get-adherence-streak))
-             (color (cond ((>= score 90) "green")
-                          ((>= score 70) "orange")
-                          (t "red"))))
-        (insert (format "Overall Score: %s\n" 
-                        (propertize (format "%.1f%%" score) 'face `(:foreground ,color :weight bold))))
-        (insert (format "Current Streak: %d days 🔥\n" streak))
-        (insert (format "Effort: %.1fh planned, %.1fh earned\n\n" 
-                        (/ (plist-get data :total-effort) 60.0) 
-                        (/ (plist-get data :earned-effort) 60.0))))
-      
-      ;; 2. Category Breakdown
-      (insert (propertize " Category Breakdown \n" 'face 'org-level-1))
-      (insert (make-string 30 ?-) "\n")
-      (let ((cat-stats (plist-get data :categories)))
-        (if (and cat-stats (> (hash-table-count cat-stats) 0))
-            (maphash (lambda (cat stats)
-                       (let* ((total (car stats))
-                              (earned (cadr stats))
-                              (cat-score (if (> total 0) (* (/ earned total) 100.0) 100.0)))
-                         (insert (format "%-15s : %6.1f%% (Planned: %.1fh, Earned: %.1fh)\n"
-                                         cat cat-score (/ total 60.0) (/ earned 60.0)))))
-                     cat-stats)
-          (insert "No categories tracked.\n")))
-      (insert "\n")
-      
-      ;; 3. Time of Day Analysis / Missed Tasks
-      (let ((missed (plist-get data :missed)))
-        (when missed
-          (insert (propertize " Missed or Rescheduled Tasks \n" 'face 'org-level-1))
-          (insert (make-string 30 ?-) "\n")
-          (dolist (m missed)
-            (if (= (length m) 3)
-                ;; It's a rescheduled task - find ID from snapshot
-                (let* ((heading (nth 0 m))
-                       (old (nth 1 m))
-                       (new (nth 2 m))
-                       (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
-                       (task-id (and snap-task (plist-get snap-task :id))))
-                  (insert "[Rescheduled] ")
-                  (if task-id
-                      (org-auto-scheduler--insert-linked-heading heading task-id)
-                    (insert heading))
-                  (insert (format "\n  From: %s\n  To:   %s\n" old new)))
-              ;; It's a standard missed task
-              (let* ((heading (nth 0 m))
-                     (time (nth 1 m))
-                     (clocked (nth 2 m))
-                     (effort (nth 3 m))
-                     (cat (nth 4 m))
-                     (snap-task (cl-find-if (lambda (s) (string= (plist-get s :heading) heading)) snapshot))
-                     (task-id (and snap-task (plist-get snap-task :id))))
-                (let ((time-str (if (and time (string-match "\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" time))
-                                    (match-string 1 time)
-                                  "Unscheduled")))
-                  (insert (format "[%-5s] " time-str))
-                  (if task-id
-                      (org-auto-scheduler--insert-linked-heading heading task-id)
-                    (insert heading))
-                  (insert (format " | Effort: %dm, Clocked: %dm\n" effort clocked))))))
-          (insert "\n")))
-      
-      ;; 4. Postponed & Unplanned Warnings
-      (let ((postponed (or (plist-get data :postponed) 0))
-            (unplanned (or (plist-get data :unplanned) 0))
-            (unplanned-tasks (plist-get data :unplanned-tasks)))
-        (when (or (> postponed 0) (> unplanned 0))
-          (insert (propertize " Warnings \n" 'face 'org-level-1))
-          (insert (make-string 30 ?-) "\n")
-          (when (> postponed 0)
-            (insert (format "⚠️ You have %d tasks that rolled over from yesterday.\n" postponed)))
-          (when (> unplanned 0)
-            (insert (format "⚠️ The \"Squirrel!\" Penalty: You completed %d unplanned tasks today:\n" unplanned))
-            (dolist (ut unplanned-tasks)
-              (let ((heading (nth 0 ut))
-                    (task-id (nth 1 ut))
-                    (effort (nth 2 ut))
-                    (clocked (nth 3 ut))
-                    (category (nth 4 ut)))
-                (insert "  • ")
-                (if task-id
-                    (org-auto-scheduler--insert-linked-heading heading task-id)
-                  (insert heading))
-                (insert (format " [%s] Clocked: %dm\n" category clocked)))))
-          (insert "\n")))
+      ;; Graph lines
+      (dotimes (r rows)
+        (let* ((level (- rows r))
+               (threshold (* (/ max-val rows) level))
+               (prev-threshold (* (/ max-val rows) (1- level)))
+               (y-label (format "%4s | " (format "%d%%" (round threshold))))
+               (row-str y-label))
+          ;; Build the row string horizontally
+          (dolist (val values)
+            (let ((char (cond ((>= val threshold) "█")
+                              ((and (< val threshold) (> val prev-threshold))
+                               (let* ((fraction (/ (float (- val prev-threshold)) (float (- threshold prev-threshold))))
+                                      (idx (max 0 (min 8 (round (* fraction 8))))))
+                                 (aref bars idx)))
+                              (t " "))))
+              (setq row-str (concat row-str (propertize char 'face `(:foreground ,color))))))
+          (push row-str lines)))
           
-      ;; 5. Hall of Fame (Best Days)
-      (let ((best-week 0.0) (best-week-date "")
-            (best-month 0.0) (best-month-date "")
-            (best-year 0.0) (best-year-date "")
-            (today-time (current-time)))
-        (dolist (entry org-auto-scheduler--adherence-history)
-          (let* ((date-str (car entry))
-                 (entry-data (cdr entry))
-                 (entry-score (plist-get entry-data :score))
-                 (entry-time (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
-                 (days-ago (and entry-time (time-to-days (time-subtract today-time entry-time)))))
-            (when days-ago
-              ;; Week
-              (when (and (<= days-ago 7) (> entry-score best-week))
-                (setq best-week entry-score)
-                (setq best-week-date date-str))
-              ;; Month
-              (when (and (<= days-ago 30) (> entry-score best-month))
-                (setq best-month entry-score)
-                (setq best-month-date date-str))
-              ;; Year
-              (when (and (<= days-ago 365) (> entry-score best-year))
-                (setq best-year entry-score)
-                (setq best-year-date date-str)))))
-        (when (> best-week 0)
-          (insert (propertize " 🏆 Hall of Fame (Past Bests) \n" 'face 'org-level-1))
-          (insert (make-string 30 ?-) "\n")
-          (insert (format "Best Last 7 Days:  %6.1f%% (%s)\n" best-week best-week-date))
-          (insert (format "Best Last 30 Days: %6.1f%% (%s)\n" best-month best-month-date))
-          (insert (format "Best Last 1 Year:  %6.1f%% (%s)\n" best-year best-year-date))
-          (insert "\n")))
-          
-      ;; 6. Historical Multipliers
-      (let ((multipliers org-auto-scheduler-historical-multipliers))
-        (when multipliers
-          (insert (propertize " Estimation vs Reality (Historical Multipliers) \n" 'face 'org-level-1))
-          (insert (make-string 30 ?-) "\n")
-          (dolist (m multipliers)
-            (insert (format "%-15s : %5.2fx (meaning tasks take %s time than estimated)\n"
-                            (car m) (cdr m)
-                            (if (> (cdr m) 1.2) "more" (if (< (cdr m) 0.8) "less" "about the same")))))))
+      ;; X-axis
+      (push (concat "       +" (make-string days ?-)) lines)
+      (push " " lines))
+      
+    (nreverse lines)))
 
-      ;; 7. Compact Gantt Timeline
-      (when snapshot
-        (org-auto-scheduler--render-compact-gantt date-str snapshot))
-                            
-      (goto-char (point-min)))
-      (display-buffer buf))))
+(defun org-auto-scheduler-adherence-generate ()
+  "Recalculate adherence scores silently for all available snapshot dates."
+  (interactive)
+  (let ((count 0))
+    (dolist (snap org-auto-scheduler--adherence-snapshots)
+      (org-auto-scheduler-score-schedule (car snap) t)
+      (cl-incf count))
+    (message "Successfully regenerated adherence scores for %d days." count)))
 
 (defvar org-auto-scheduler--adherence-timer nil
   "Timer for updating the adherence score in the mode line.")
