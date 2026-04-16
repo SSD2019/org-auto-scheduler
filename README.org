@@ -1,43 +1,164 @@
 * Org Auto Scheduler
 
-Org Auto Scheduler is an Emacs plugin that automatically schedules tasks in your Org mode files. It scores tasks by priority, deadline, effort, state, and category; sorts them using a dependency-aware topological algorithm; and packs them into your available time windows—respecting time blocks, repeater conflicts, and task blockers.
+*Automatically schedule your Org mode tasks — so you can focus on doing, not planning.*
+
+Org Auto Scheduler scores tasks by priority, deadline, effort, state, and category; topologically sorts them via dependency-aware Kahn's algorithm; and packs them into your available time windows — respecting time blocks, repeater conflicts, and task blockers.
+
+#+begin_quote
+Tag it =AUTOSCH=, press a key, and your day is planned.
+#+end_quote
 
 ** Table of Contents
 
+- [[#features-at-a-glance][Features at a Glance]]
+- [[#installation][Installation]]
 - [[#quick-start][Quick Start]]
+- [[#key-commands][⚡ Key Commands]]
 - [[#how-tasks-are-selected][How Tasks Are Selected]]
 - [[#task-properties][Task Properties]]
 - [[#how-scoring-works][How Scoring Works]]
 - [[#how-sorting-works][How Sorting Works]]
-- [[#interactive-commands][Interactive Commands]]
 - [[#review-and-apply-buffer][Review & Apply Buffer]]
+- [[#schedule-adherence-tracking][Schedule Adherence Tracking]]
 - [[#background-scheduling][Background Scheduling]]
 - [[#historical-effort-tracking][Historical Effort Tracking]]
 - [[#repeater--habit-integration][Repeater / Habit Integration]]
 - [[#recurring-tasks][Recurring Tasks]]
 - [[#agenda-bump][Agenda Bump]]
 - [[#customization-reference][Customization Reference]]
-- [[#file-weights][File Weights]]
 - [[#debugging][Debugging]]
+- [[#contributing][Contributing]]
+- [[#license][License]]
+
+** Features at a Glance
+
+- *Smart Scoring:* Multi-factor scoring (priority, deadline urgency, effort, category, state).
+- *Dependency-Aware Sorting:* Topological sort via Kahn's algorithm respects =BLOCKER= / =DEPENDS_ON= chains.
+- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules before applying.
+- *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
+- *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
+- *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
+- *Historical Effort Learning:* Learns from your actual vs. estimated times per category.
+- *Time & Energy Blocks:* Hard and soft constraints for context-based scheduling.
+- *Repeater / Habit Awareness:* Projects repeater occurrences into the conflict map.
+- *Recurring Task Generation:* Automatic sub-task creation for daily/weekly/monthly patterns.
+- *Agenda Bump:* Cascade-push today's schedule when a task runs overtime.
+
+** Installation
+
+*** Manual Installation
+
+Clone the repository:
+
+#+begin_src shell
+git clone https://github.com/YOUR-USERNAME/org-auto-scheduler.git
+#+end_src
+
+Add to your Emacs configuration:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/org-auto-scheduler")
+(require 'org-auto-scheduler)
+#+end_src
+
+*** Dependencies
+
+- Emacs 27.1+
+- =org-mode= (built-in)
+- =log4e= (available on MELPA: =M-x package-install RET log4e=)
 
 ** Quick Start
 
 1. Add the =AUTOSCH= tag to any task you want auto-scheduled.
-2. Run =M-x org-auto-scheduler-review-and-apply= to preview the schedule, then
-   press =x= in the review buffer to apply it.
+2. Set an =Effort= property (e.g. =0:30= for 30 minutes).
+3. Run one of the key commands below.
 
-Or apply directly without review:
+*Recommended key bindings:*
+
+#+begin_src emacs-lisp
+(global-set-key (kbd "C-c a s") #'org-auto-scheduler-schedule-tasks)
+(global-set-key (kbd "C-c a r") #'org-auto-scheduler-review-and-apply)
+#+end_src
+
+** ⚡ Key Commands
+<<key-commands>>
+
+These are the most important interactive commands you will use day-to-day.
+
+*** 🗓️ =M-x org-auto-scheduler-schedule-tasks=
+
+Run the full scheduler and *immediately apply* timestamps to your Org files. This is the "just do it" command — it scores, sorts, and schedules everything in one shot.
 
 #+begin_src emacs-lisp
 M-x org-auto-scheduler-schedule-tasks
 #+end_src
 
-Recommended key binding:
+*** 🔍 =M-x org-auto-scheduler-review-and-apply=
+
+Preview the proposed schedule in the *interactive review buffer* before applying. You can toggle tasks on/off, reorder them, and recalculate times — then press =x= to apply.
 
 #+begin_src emacs-lisp
-(global-set-key (kbd "C-c a s") 'org-auto-scheduler-schedule-tasks)
-(global-set-key (kbd "C-c a r") 'org-auto-scheduler-review-and-apply)
+M-x org-auto-scheduler-review-and-apply
 #+end_src
+
+See [[#review-and-apply-buffer][Review & Apply Buffer]] for full keybindings.
+
+*** 📸 =M-x org-auto-scheduler-snapshot-schedule=
+
+Take a *morning snapshot* of today's planned schedule. This records what you planned so the adherence scorer can later compare it to what actually happened.
+
+#+begin_src emacs-lisp
+;; Run this each morning after your schedule is set
+M-x org-auto-scheduler-snapshot-schedule
+#+end_src
+
+*** 📊 =M-x org-auto-scheduler-score-schedule=
+
+Score today's schedule adherence against the morning snapshot. Shows completion rates, missed tasks, unplanned work ("Squirrel" penalty), category breakdowns, and your current streak.
+
+#+begin_src emacs-lisp
+;; Run this in the evening (or midday for a live check)
+M-x org-auto-scheduler-score-schedule
+
+;; Score a past day (prompted for date)
+C-u M-x org-auto-scheduler-score-schedule
+#+end_src
+
+*** 📈 =M-x org-auto-scheduler-adherence-report=
+
+Display the full adherence report buffer for today (or a specific date). Includes time-of-day analysis, rollover warnings, and Hall of Fame stats.
+
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-adherence-report
+#+end_src
+
+*** All Interactive Commands
+
+| Command                                             | Description                                                                                |
+|-----------------------------------------------------+--------------------------------------------------------------------------------------------|
+| =org-auto-scheduler-schedule-tasks= ⭐              | Run full scheduler, apply timestamps immediately.                                          |
+| =org-auto-scheduler-review-and-apply= ⭐            | Preview schedule in interactive review buffer.                                             |
+| =org-auto-scheduler-snapshot-schedule= ⭐            | Snapshot today's planned tasks for adherence tracking.                                     |
+| =org-auto-scheduler-score-schedule= ⭐              | Score adherence against the morning snapshot.                                               |
+| =org-auto-scheduler-adherence-report= ⭐            | Display full adherence report buffer.                                                       |
+| =org-auto-scheduler-debug=                          | Run scheduler with debug logging, then open the log buffer.                                |
+| =org-auto-scheduler-toggle-background=              | Toggle idle/background auto-scheduling on or off.                                          |
+| =org-auto-scheduler-setup-background=               | Manually (re-)initialize the idle timer.                                                   |
+| =org-auto-scheduler-historical-insights=            | Show per-category effort-estimate accuracy multipliers.                                    |
+| =org-auto-scheduler-show-repeater-projections=      | Display projected repeater/habit occurrences.                                              |
+| =org-auto-scheduler-clear-repeater-cache=           | Invalidate the repeater-projections cache.                                                 |
+| =org-auto-scheduler-bump-agenda=                    | Push the agenda item at point and all subsequent AUTOSCH tasks forward by N minutes.       |
+| =org-auto-scheduler-validate-config=                | Verify configuration consistency.                                                          |
+| =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
+| =org-auto-scheduler-adherence-mode-line-disable=    | Remove adherence score from the mode line.                                                 |
+| =org-auto-scheduler-adherence-generate=             | Regenerate adherence scores for all available snapshot dates.                               |
+
+**** Backward-compatible aliases
+
+| Old name                                     | Current name                                     |
+|----------------------------------------------+--------------------------------------------------|
+| =org-auto-scheduler-show-habit-projections=  | =org-auto-scheduler-show-repeater-projections=   |
+| =org-auto-scheduler-clear-habit-cache=       | =org-auto-scheduler-clear-repeater-cache=        |
 
 ** How Tasks Are Selected
 
@@ -90,7 +211,7 @@ score = (effort × effort_weight)
 - *State weight*: from =org-auto-scheduler-state-weights=
 - *Category weight*: from =org-auto-scheduler-category-weights=
 - *Effort*: actual effort × historical multiplier (if tracking is on)
-- *buffertime tag*: applies a 15-minute gap around the task instead of the default =org-auto-scheduler-task-gap=
+- *=buffertime= tag*: applies a 15-minute gap around the task instead of the default =org-auto-scheduler-task-gap=
 
 ** How Sorting Works
 
@@ -109,31 +230,6 @@ Tasks are sorted with a *topological sort (Kahn's algorithm)* that respects:
 
 Circular dependencies are detected; cyclic tasks are appended at the end with
 a depth marker of 99 as a warning signal.
-
-** Interactive Commands
-
-| Command                                         | Description                                                                                        |
-|-------------------------------------------------+----------------------------------------------------------------------------------------------------|
-| =M-x org-auto-scheduler-schedule-tasks=         | Run the full scheduler and apply timestamps immediately.                                           |
-| =M-x org-auto-scheduler-review-and-apply=       | Preview the proposed schedule in the interactive review buffer before applying.                    |
-| =M-x org-auto-scheduler-debug=                  | Run scheduler with debug logging enabled, then open the log buffer.                                |
-| =M-x org-auto-scheduler-toggle-background=      | Toggle idle / background auto-scheduling on or off.                                                |
-| =M-x org-auto-scheduler-setup-background=       | Manually (re-)initialize the idle timer based on current settings.                                 |
-| =M-x org-auto-scheduler-historical-insights=    | Open a buffer showing per-category effort-estimate accuracy multipliers.                           |
-| =M-x org-auto-scheduler-show-repeater-projections= | Display projected repeater/habit occurrences for the configured look-ahead period.              |
-| =M-x org-auto-scheduler-clear-repeater-cache=   | Invalidate the repeater-projections cache so fresh projections are generated on the next run.      |
-| =M-x org-auto-scheduler-bump-agenda=            | From the Org agenda, push the item at point and all subsequent AUTOSCH tasks forward by N minutes. |
-| =M-x org-auto-scheduler-validate-config=        | Verify configuration consistency (called automatically on load).                                   |
-| =M-x org-auto-scheduler-snapshot-schedule=      | Record a snapshot of today's scheduled tasks for adherence tracking.                               |
-| =M-x org-auto-scheduler-score-schedule=         | Score today's schedule adherence against the morning's snapshot.                                   |
-| =M-x org-auto-scheduler-adherence-report=       | Display the adherence report buffer for today (or a specific date).                                |
-
-*** Backward-compatible aliases
-
-| Old name                                     | Current name                                     |
-|----------------------------------------------+--------------------------------------------------|
-| =org-auto-scheduler-show-habit-projections=  | =org-auto-scheduler-show-repeater-projections=   |
-| =org-auto-scheduler-clear-habit-cache=       | =org-auto-scheduler-clear-repeater-cache=        |
 
 ** Review & Apply Buffer
 
@@ -169,8 +265,45 @@ buffer.
 | =x=         | =review-execute=                     | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
 | =C-c C-c=   | =review-execute=                     | Same as =x=.                                                                   |
 
-*Note:* Pressing =x= always re-recalculates times from the current visual order
+*Note:* Pressing =x= always re-calculates times from the current visual order
 before writing, so you never need to press =r= first.
+
+** Schedule Adherence Tracking
+
+Track how well you stick to your daily schedule and earn a daily adherence score.
+
+*** Daily Workflow
+
+*1. Morning — Take a Snapshot:*
+
+Run =M-x org-auto-scheduler-snapshot-schedule= when your daily schedule is ready. This records all scheduled tasks planned for the day. The snapshot loads automatically on startup.
+
+*2. Evening — Score Yourself:*
+
+Run =M-x org-auto-scheduler-score-schedule=. This compares the morning snapshot to your actual completed work.
+
+*** Scoring Features
+
+- *Time-Gated Midday Scoring:* Score yourself in the middle of the day — the algorithm only considers tasks whose scheduled start-time has already passed, so you won't be penalized for afternoon tasks.
+- *Retroactive Scoring:* Forgot to score yesterday? Call =M-x org-auto-scheduler-score-schedule= with a prefix argument (=C-u M-x ...=) or answer the interactive prompt to score any day from the past 30 days.
+- *Category Breakdown:* See adherence percentages split by category.
+- *Partial Credit:* Credit for effort spent even if the task isn't marked =DONE= (requires =org-clock=).
+- *Time-of-Day Analysis:* Flags missed or rescheduled tasks alongside their scheduled time to help identify when your schedule breaks down.
+- *The "Squirrel" Penalty:* Tracks tasks you completed but didn't plan for.
+- *Rollover Warnings:* Detects tasks pushed from yesterday's snapshot to today's.
+- *Hall of Fame:* Tracks and displays your best adherence days over the last 7 days, 30 days, and 1 year.
+
+Adherence data and streaks are saved to =org-auto-scheduler-adherence-file=.
+
+*** Modeline Integration
+
+Display a live, running adherence score directly in your Emacs mode line. It updates every 5 minutes.
+
+#+begin_src emacs-lisp
+(org-auto-scheduler-adherence-mode-line-enable)
+#+end_src
+
+To disable: =M-x org-auto-scheduler-adherence-mode-line-disable=.
 
 ** Background Scheduling
 
@@ -257,36 +390,6 @@ While in the Org Agenda buffer, use =M-x org-auto-scheduler-bump-agenda= (prompt
 for minutes) to push the task at point *and every subsequent AUTOSCH task
 scheduled today* forward by that many minutes. Useful when a task runs over time.
 
-** Schedule Adherence Tracking
-
-Track how well you stick to your daily schedule and earn a daily adherence score. 
-
-1. *The Morning Snapshot*: Run =M-x org-auto-scheduler-snapshot-schedule= when you have your daily schedule ready. This takes a snapshot of all scheduled tasks planned for the day (loads automatically on startup).
-2. *The Evening Score*: At the end of the day, run =M-x org-auto-scheduler-score-schedule=. This compares the morning snapshot to your actual completed work.
-
-The scoring algorithm features:
-- *Time-Gated Midday Scoring:* You can safely score yourself in the middle of the day. The algorithm will only consider tasks whose =SCHEDULED= start-time has already passed, allowing you to see your live pace without being penalized for afternoon tasks.
-- *Retroactive Scoring:* Forgot to score yesterday? No problem! Call =M-x org-auto-scheduler-score-schedule= with a prefix argument (e.g. =C-u M-x...=) or interactively answer the prompt to score and record any day from the past 30 days.
-- *Category Breakdown:* See adherence percentages split by category.
-- *Partial Credit:* Giving you credit for effort spent even if the task isn't marked =DONE= (requires =org-clock=).
-- *Time-of-Day Analysis:* Flags missed or rescheduled tasks alongside their scheduled time to help identify when your schedule breaks down.
-- *The "Squirrel" Penalty:* Tracks tasks you completed but didn't plan for.
-- *Rollover Warnings:* Detects tasks pushed from yesterday's snapshot to today's.
-- *Hall of Fame:* Tracks and displays your best adherence days over the last 7 days, 30 days, and 1 year.
-
-Adherence data and streaks are saved to =org-auto-scheduler-adherence-file=.
-
-*** Modeline Integration
-
-You can display a live, running adherence score directly in your Emacs mode line. It updates automatically every 5 minutes.
-
-#+begin_src emacs-lisp
-(org-auto-scheduler-adherence-mode-line-enable)
-#+end_src
-
-To disable it, run =M-x org-auto-scheduler-adherence-mode-line-disable=.
-
-
 ** Customization Reference
 
 Access all options via =M-x customize-group RET org-auto-scheduler=.
@@ -324,10 +427,7 @@ Tasks missing from this alist are *not* scheduled at all.
       '(("TODO"        .  0)
         ("NEXT"        .  1)
         ("IN-PROGRESS" .  2)
-        ("WRITE"       .  0)
-        ("LATER"       . -10)
-        ("BUY"         .  0)
-        ("READ"        .  0)))
+        ("LATER"       . -10)))
 #+end_src
 
 *** Tag Weights
@@ -355,9 +455,9 @@ window fits, the task falls back to the general scheduling window.
 
 #+begin_src emacs-lisp
 (setq org-auto-scheduler-time-blocks
-      '(("FUN"    . (("18:00" . "19:00")))
-        ("BUYING" . (("14:00" . "15:00")))
-        ("CHORES" . (("19:00" . "20:00")))))
+      '(("DeepWork" . (("09:00" . "12:00")))
+        ("Meetings" . (("14:00" . "16:00")))
+        ("Admin"    . (("16:00" . "17:00")))))
 #+end_src
 
 *** Energy Blocks (Soft Preferences)
@@ -462,3 +562,14 @@ You can also enable debug output permanently:
 #+begin_src emacs-lisp
 (setq org-auto-scheduler-debug t)
 #+end_src
+
+** Contributing
+
+Contributions, bug reports, and feature requests are welcome! Please open an issue or pull request on GitHub.
+
+** License
+
+This project is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
