@@ -1,0 +1,14 @@
+# Editor / IDE
+.vscode/
+*.code-workspace
+
+# Development artifacts
+implementation_plan.md
+
+# Byte-compiled files
+*.elc
+
+# Emacs backup / lock files
+*~
+\#*\#
+.\#*

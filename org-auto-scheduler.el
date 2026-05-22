@@ -1015,29 +1015,40 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
      ;; Check day boundaries
      (and (time-less-p start-time day-start) day-start)
      (and (time-less-p day-end end-time) day-end)
-     ;; Check conflicts with existing tasks
-     (cl-some 
-      (lambda (item)
-        (let* ((task-id (nth 0 item))
-               (task-start (nth 1 item))
-               (task-end (nth 2 item))
-               (tags (nth 3 item))
-               (consider-for-conflicts (nth 4 item))
-               (task-name (nth 5 item))
-               (has-time (nth 6 item))
-               (is-autosch (member "AUTOSCH" tags))
-               (needs-buffer (or (member "buffertime" tags) (member "buffertime" proposed-tags)))
-               (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
-               (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 active-gap))))
-               (task-end-with-gap (time-add task-end (seconds-to-time (* 60 active-gap)))))
-          (when (and (not (equal task-id ignore-id))
-                    (or (not is-autosch) (and is-autosch consider-for-conflicts))
-                    has-time
-                    (time-less-p start-time task-end-with-gap)
-                    (time-less-p task-start-with-gap end-time))
-            (org-auto-scheduler--log-debug "    Conflict detected with task: %s" task-name)
-            task-end-with-gap)))
-      agenda-items))))
+     ;; Check conflicts with existing tasks.
+     ;; We scan ALL conflicting items and return the MAXIMUM end-with-gap so that
+     ;; next-available-time jumps past every overlapping item in one step.
+     ;; Using cl-some would return the first match's end time (in non-deterministic
+     ;; list order), requiring multiple loop iterations and causing inconsistent results.
+     (let ((max-conflict-end nil))
+       (dolist (item agenda-items)
+         (let* ((task-id (nth 0 item))
+                (task-start (nth 1 item))
+                (task-end (nth 2 item))
+                (tags (nth 3 item))
+                (consider-for-conflicts (nth 4 item))
+                (task-name (nth 5 item))
+                (has-time (nth 6 item))
+                (is-autosch (member "AUTOSCH" tags))
+                (needs-buffer (or (member "buffertime" tags) (member "buffertime" proposed-tags)))
+                (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
+                (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 active-gap))))
+                (task-end-with-gap (time-add task-end (seconds-to-time (* 60 active-gap)))))
+           (when (and task-start  ; guard against nil timestamps from bad cache entries
+                      task-end
+                      (not (equal task-id ignore-id))
+                      (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                      has-time
+                      (time-less-p start-time task-end-with-gap)
+                      (time-less-p task-start-with-gap end-time))
+             (org-auto-scheduler--log-debug "    Conflict detected with task: %s (ends %s)"
+                                            task-name
+                                            (format-time-string "%H:%M" task-end-with-gap))
+             (when (or (null max-conflict-end)
+                       (time-less-p max-conflict-end task-end-with-gap))
+               (setq max-conflict-end task-end-with-gap)))))
+       max-conflict-end))))
+
 
 (defun org-auto-scheduler-next-available-time (start-time duration &optional proposed-tags)
   "Find the next available time slot starting from START-TIME for DURATION minutes."
@@ -1215,9 +1226,15 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                 (org-auto-scheduler--log-debug "Project changed or is null. Resetting current time to %s"
                                              (format-time-string "%Y-%m-%d %H:%M" current-time)))
 
-              (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
-              (unless org-auto-scheduler--preview-mode
-                (org-auto-scheduler-add-to-report task-info current-time))
+              (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
+                (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
+                (unless org-auto-scheduler--preview-mode
+                  ;; Use the actual scheduled start time (nth 1 of the newly pushed entry),
+                  ;; not current-time which is already end+gap for the *next* task.
+                  (let ((scheduled-start
+                         (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
+                           (nth 1 (car org-auto-scheduler-completed-tasks)))))
+                    (org-auto-scheduler-add-to-report task-info scheduled-start))))
               (setq tasks-scheduled (1+ tasks-scheduled)) 
               (when (zerop (mod tasks-scheduled 10))
                 (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
@@ -2180,7 +2197,8 @@ Automatically recalculates dependent times based on visual layout before executi
                   (org-with-point-at marker
                     (org-set-property "SCHEDULED" schedule-string)
                     (org-set-property org-auto-scheduler-scheduled-property "t"))
-                  (org-auto-scheduler-add-to-report task-info end-time)
+                   ;; Pass the scheduled start time (nth 1), not end-time (nth 2).
+                   (org-auto-scheduler-add-to-report task-info (nth 1 data))
                   (setq applied-count (1+ applied-count)))))))
         (forward-line 1)))
     (org-auto-scheduler-display-report)
