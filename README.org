@@ -51,8 +51,9 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 Clone the repository:
 
 #+begin_src shell
-git clone https://github.com/YOUR-USERNAME/org-auto-scheduler.git
+git clone https://github.com/SSD2019/org-auto-scheduler.git
 #+end_src
+
 
 Add to your Emacs configuration:
 
@@ -60,6 +61,13 @@ Add to your Emacs configuration:
 (add-to-list 'load-path "/path/to/org-auto-scheduler")
 (require 'org-auto-scheduler)
 #+end_src
+
+#+begin_src emacs-lisp
+(use-package org-auto-scheduler
+  :ensure t
+  :vc (:url "https://github.com/SSD2019/org-auto-scheduler"
+			:rev :newest))
+#+end_src 
 
 *** Dependencies
 
