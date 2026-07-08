@@ -247,31 +247,47 @@ buffer.
 
 *** Buffer columns
 
-| Column         | Description                                               |
-|----------------+-----------------------------------------------------------|
-| =Apply=        | =[X]= means the task will be applied; =[ ]= means skip.  |
-| =Task Name=    | Headline (indented with =├─= to show dependency depth).  |
-| =Proposed Time= | Calculated schedule string.                              |
-| =Duration=     | Task duration in minutes.                                 |
-| =Project ID=   | Nearest ancestor with the =:PROJECT:= tag.               |
-| =Score=        | Composite scheduling score.                               |
-| =Depth=        | Topological depth (0 = no blockers).                      |
-| =Blockers=     | Comma-separated headings of blocking tasks.               |
+| Column      | Description                                                    |
+|-------------+----------------------------------------------------------------|
+| =Apply=     | =[X]= means the task will be applied; =[ ]= means skip.        |
+| =●=         | Color-coded dot representing the project.                      |
+| =Task Name= | Headline (flat visual list; project colors define identity).   |
+| =Time=      | Calculated schedule string (e.g., =Mon 09:15 – 10:45=).         |
+| =Duration=  | Task duration in minutes (annotated with =[?]= if estimated).  |
+| =Project=   | Human-readable project name.                                   |
+| =Score=     | Composite scheduling score.                                    |
+| =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed).  |
 
 *** Keybindings
 
 | Key         | Command                              | Action                                                                         |
 |-------------+--------------------------------------+--------------------------------------------------------------------------------|
-| =SPC=       | =review-toggle=                      | Toggle the =[X]= / =[ ]= apply mark and advance one line.                      |
-| =m=         | =review-toggle=                      | Same as =SPC=.                                                                 |
-| =TAB=       | =review-jump=                        | Open the original Org task in another window.                                  |
-| =U= / =p=   | =review-move-up=                     | Move the current task up in the list (reorders priority).                      |
-| =D= / =n=   | =review-move-down=                   | Move the current task down in the list.                                        |
-| =r=         | =review-recalculate=                 | Recalculate proposed times from the *current visual order*, without resorting. |
-| =C-c C-r=   | =review-recalculate=                 | Same as =r=.                                                                   |
+| =SPC= / =m= | =review-toggle=                      | Toggle the =[X]= / =[ ]= apply mark and advance one line.                      |
+| =TAB= / =RET=| =review-jump=                       | Open the original Org task in another window.                                  |
+| =U= / =p=   | =review-move-up=                     | Move the current task up in the list (manually reorder).                       |
+| =D= / =n=   | =review-move-down=                   | Move the current task down in the list (manually reorder).                     |
+| =r= / =C-c C-r=| =review-recalculate=               | Recalculate proposed times from the *current visual order*, without resorting. |
 | =R=         | =review-refresh=                     | Discard and re-run the full scheduler from scratch (picks up Org file changes).|
-| =x=         | =review-execute=                     | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
-| =C-c C-c=   | =review-execute=                     | Same as =x=.                                                                   |
+| =u=         | =review-undo=                        | Undo the last modification (toggle, reorder, effort edit, mark, or filter).   |
+| =e=         | =review-edit-effort=                 | Edit estimated effort of task at point in-memory (What-If planning).           |
+| =v=         | =review-toggle-calendar=             | Toggle between the Column Table and the multi-day Chronological Calendar View. |
+| =x= / =C-c C-c=| =review-execute=                   | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
+| =?=         | =review-help=                        | Show help buffer detailing all review commands.                                |
+
+*** Filtering Commands (Prefix: =f= or =/=)
+
+- =f t= : Show only tasks scheduled for today.
+- =f p= : Filter tasks by project (prompts with autocompletion).
+- =f a= : Clear active filters and show all tasks.
+- =/=   : Filter tasks using an interactive regular expression matching headlines.
+
+*** Bulk Marking Commands (Prefix: =*=)
+
+- =* a= : Mark all visible tasks.
+- =* n= : Unmark/clear all visible tasks.
+- =* t= : Mark all tasks scheduled for today.
+- =* p= : Mark all tasks belonging to a specific project.
+- =* %= : Mark all tasks matching a regular expression.
 
 *Note:* Pressing =x= always re-calculates times from the current visual order
 before writing, so you never need to press =r= first.

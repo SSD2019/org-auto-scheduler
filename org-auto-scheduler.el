@@ -557,7 +557,7 @@ Hash table with date strings as keys and lists of items as values.")
   "Parse a time string in the format YYYY-MM-DD Day HH:MM."
   (when time-string
     (let ((parsed (parse-time-string time-string)))
-      (encode-time (or (nth 0 parsed) 0)  ; secon
+      (encode-time (or (nth 0 parsed) 0)  ; second
                    (or (nth 1 parsed) 0)  ; minute
                    (or (nth 2 parsed) 0)  ; hour
                    (or (nth 3 parsed) 1)  ; day
@@ -566,11 +566,17 @@ Hash table with date strings as keys and lists of items as values.")
 
 (defun org-auto-scheduler-get-effort (pom)
   "Get the effort estimate for the task at point or marker POM.
-This function retrieves the effort property of a task and converts
-it to minutes."
-  (let ((effort (org-entry-get pom "Effort")))
-    (when effort
-      (org-duration-to-minutes effort))))
+Checks for what-if overrides in the review buffer if active."
+  (let* ((task-id (org-with-point-at pom (org-id-get)))
+         (override (and task-id
+                        (bound-and-true-p org-auto-scheduler--review-overrides)
+                        (gethash task-id org-auto-scheduler--review-overrides)))
+         (overridden-effort (plist-get override :effort)))
+    (if overridden-effort
+        overridden-effort
+      (let ((effort (org-entry-get pom "Effort")))
+        (when effort
+          (org-duration-to-minutes effort))))))
 
 (defun org-auto-scheduler-get-priority (task)
   "Get the priority of TASK."
@@ -1198,9 +1204,11 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
   (interactive)
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
   (when (and org-auto-scheduler-sync-caldav
-             (not org-auto-scheduler--preview-mode))
-    (require 'org-caldav)
-    (org-caldav-sync))
+             (not org-auto-scheduler--preview-mode)
+             (require 'org-caldav nil t))
+    (condition-case err
+        (org-caldav-sync)
+      (error (message "CalDAV sync failed (pre-schedule): %s" (error-message-string err)))))
   (condition-case err
       (progn
         (org-auto-scheduler-validate-config)              ; Validate config at runtime
@@ -1215,40 +1223,43 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                (total-tasks (length sorted-tasks-info))
                (previous-project nil))
           
-          (dolist (task-info sorted-tasks-info)
-            (let* ((marker (car task-info))
-                   (task-project (nth 2 task-info)))
+          (let ((reporter (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
+            (dolist (task-info sorted-tasks-info)
+              (let* ((marker (car task-info))
+                     (task-project (nth 2 task-info)))
               
-              (when (or (not (equal task-project previous-project))
-                        (null task-project))
-                (setq current-time (org-auto-scheduler-get-start-time))
-                (setq previous-project task-project)
-                (org-auto-scheduler--log-debug "Project changed or is null. Resetting current time to %s"
-                                             (format-time-string "%Y-%m-%d %H:%M" current-time)))
+                (when (or (not (equal task-project previous-project))
+                          (null task-project))
+                  (setq current-time (org-auto-scheduler-get-start-time))
+                  (setq previous-project task-project)
+                  (org-auto-scheduler--log-debug "Project changed or is null. Resetting current time to %s"
+                                               (format-time-string "%Y-%m-%d %H:%M" current-time)))
 
-              (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
-                (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
-                (unless org-auto-scheduler--preview-mode
-                  ;; Use the actual scheduled start time (nth 1 of the newly pushed entry),
-                  ;; not current-time which is already end+gap for the *next* task.
-                  (let ((scheduled-start
-                         (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
-                           (nth 1 (car org-auto-scheduler-completed-tasks)))))
-                    (org-auto-scheduler-add-to-report task-info scheduled-start))))
-              (setq tasks-scheduled (1+ tasks-scheduled)) 
-              (when (zerop (mod tasks-scheduled 10))
-                (org-auto-scheduler--log-info "Scheduled %d/%d tasks..." tasks-scheduled total-tasks))))
+                (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
+                  (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
+                  (unless org-auto-scheduler--preview-mode
+                    (let ((scheduled-start
+                           (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
+                             (nth 1 (car org-auto-scheduler-completed-tasks)))))
+                      (org-auto-scheduler-add-to-report task-info scheduled-start))))
+                (setq tasks-scheduled (1+ tasks-scheduled))
+                (progress-reporter-update reporter tasks-scheduled)))
+            (progress-reporter-done reporter))
           
+          ;; Normalize completed-tasks to chronological order (built via push)
+          (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
           (unless org-auto-scheduler--preview-mode
             (org-auto-scheduler-display-report))
           (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)
-          (when org-auto-scheduler-sync-caldav
-            ;; Save all org agenda buffers before syncing with CalDAV
+          (when (and org-auto-scheduler-sync-caldav
+                     (require 'org-caldav nil t))
             (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV sync")
             (save-some-buffers t (lambda () 
                                    (and (buffer-file-name)
                                         (member (buffer-file-name) (org-agenda-files t)))))
-            (org-caldav-sync))))
+            (condition-case err
+                (org-caldav-sync)
+              (error (message "CalDAV sync failed (post-schedule): %s" (error-message-string err)))))))
     (error  
      (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
 
@@ -1460,6 +1471,11 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
         (if (not all-blockers-met)
             (progn
               (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is blocked by unmet dependencies. Skipping." headline)
+              ;; Record blocked tasks so they appear in the review buffer
+              (when org-auto-scheduler--preview-mode
+                (push (list task-id current-time current-time '("AUTOSCH") nil headline
+                           "BLOCKED" marker (or topo-depth 0) :blocked '("Blocked by unmet dependencies"))
+                      org-auto-scheduler-completed-tasks))
               current-time) ; Return current-time unmodified since task wasn't scheduled
 
           ;; Task is not blocked, proceed to find an available time
@@ -1507,6 +1523,11 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
               (org-auto-scheduler--log-warn "[org-auto-scheduler-schedule-single-task] Could not find available time slot within 7 days for task: %s" headline)
               (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Scheduling failed after %d attempts" attempts)
               (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Last attempted time: %s" (format-time-string "%Y-%m-%d %H:%M" available-time))
+              ;; Record failed tasks so they appear in the review buffer with error status
+              (when org-auto-scheduler--preview-mode
+                (push (list task-id current-time current-time '("AUTOSCH") nil headline
+                           "FAILED" marker (or topo-depth 0) :failed '("No available slot within 7 days"))
+                      org-auto-scheduler-completed-tasks))
               current-time)))))))
 
 (defvar org-auto-scheduler--ignore-blockers-p nil
@@ -1963,61 +1984,278 @@ if the current system's hostname is in the list."
       (org-table-align))
     (pop-to-buffer buffer)))
 
+;;; ────────────────────────────────────────────────────────────────
+;;; Review Buffer Helpers — project colors, filters, undo, smart effort
+;;; ────────────────────────────────────────────────────────────────
+
+(defvar org-auto-scheduler--project-color-palette
+  '("dodger blue" "orange" "medium sea green" "orchid"
+    "sandy brown" "deep sky blue" "salmon" "lime green"
+    "hot pink" "turquoise" "gold" "slate blue")
+  "Colors cycled through for project indicators in the review buffer.")
+
+(defvar org-auto-scheduler--project-colors nil
+  "Hash-table mapping project-name → color string.  Rebuilt each review session.")
+
+(defvar org-auto-scheduler--project-name-cache nil
+  "Hash-table mapping marker-buffer+pos → project heading name.  Session cache.")
+
+(defvar-local org-auto-scheduler--review-all-entries nil
+  "Full unfiltered copy of `tabulated-list-entries' for filter/restore.")
+
+(defvar-local org-auto-scheduler--review-undo-stack nil
+  "Undo stack of previous `tabulated-list-entries' snapshots.")
+
+(defvar-local org-auto-scheduler--review-undo-max 30
+  "Maximum undo stack depth.")
+
+(defvar-local org-auto-scheduler--review-active-filter nil
+  "Currently active filter description string, or nil.")
+
+(defvar-local org-auto-scheduler--review-overrides nil
+  "Hash-table of task-id → plist of what-if overrides (:effort N :priority P).")
+
+(defvar-local org-auto-scheduler--review-view 'table
+  "Current view mode: `table' or `calendar'.")
+
+(defun org-auto-scheduler--get-project-name (marker)
+  "Get the human-readable heading of the nearest :PROJECT: ancestor for MARKER.
+Returns a truncated string (max 20 chars) or nil."
+  (when (and marker (markerp marker) (marker-buffer marker))
+    (or (and org-auto-scheduler--project-name-cache
+             (gethash (cons (marker-buffer marker) (marker-position marker))
+                      org-auto-scheduler--project-name-cache))
+        (let ((name (save-excursion
+                      (with-current-buffer (marker-buffer marker)
+                        (goto-char (marker-position marker))
+                        (let ((found nil))
+                          (catch 'found
+                            (when (member "PROJECT" (org-get-tags nil t))
+                              (throw 'found (org-get-heading t t t t)))
+                            (while (org-up-heading-safe)
+                              (when (member "PROJECT" (org-get-tags nil t))
+                                (throw 'found (org-get-heading t t t t)))))
+                          found)))))
+          (when name
+            (unless org-auto-scheduler--project-name-cache
+              (setq org-auto-scheduler--project-name-cache (make-hash-table :test 'equal)))
+            (puthash (cons (marker-buffer marker) (marker-position marker))
+                     name org-auto-scheduler--project-name-cache))
+          name))))
+
+(defun org-auto-scheduler--truncate (str max)
+  "Truncate STR to MAX chars, appending '..' if needed."
+  (if (and str (> (length str) max))
+      (concat (substring str 0 (- max 2)) "..")
+    (or str "")))
+
+(defun org-auto-scheduler--assign-project-colors (entries)
+  "Build `org-auto-scheduler--project-colors' from ENTRIES (tabulated-list-entries).
+Each entry's vector has project-name at index 5."
+  (setq org-auto-scheduler--project-colors (make-hash-table :test 'equal))
+  (let ((idx 0))
+    (dolist (entry entries)
+      (let ((proj (aref (cadr entry) 5)))
+        (when (and proj (not (string= proj "—"))
+                   (not (gethash proj org-auto-scheduler--project-colors)))
+          (puthash proj
+                   (nth (% idx (length org-auto-scheduler--project-color-palette))
+                        org-auto-scheduler--project-color-palette)
+                   org-auto-scheduler--project-colors)
+          (cl-incf idx))))))
+
+(defun org-auto-scheduler--project-dot (project-name)
+  "Return a propertized '●' for PROJECT-NAME, or a dim '·' for no-project."
+  (if (and project-name (not (string= project-name "—"))
+           org-auto-scheduler--project-colors)
+      (let ((color (gethash project-name org-auto-scheduler--project-colors)))
+        (if color
+            (propertize "●" 'face `(:foreground ,color))
+          "·"))
+    "·"))
+
+(defun org-auto-scheduler--status-indicator (task)
+  "Return a status string for a completed-task entry.
+TASK is a list: (id start end tags consider headline sched-str marker depth status warnings)."
+  (let ((status (nth 9 task))
+        (warnings (nth 10 task)))
+    (cond
+     ((eq status :failed)  (propertize "✗" 'face 'error))
+     ((eq status :blocked) (propertize "⊘" 'face 'warning))
+     (warnings             (propertize "⚠" 'face 'warning))
+     (t                    (propertize "✓" 'face 'success)))))
+
+(defun org-auto-scheduler--check-task-warnings (task marker)
+  "Check for scheduling warnings on TASK and return a list of warning strings."
+  (let ((warnings nil)
+        (time-block (org-auto-scheduler-get-task-tag-block marker))
+        (not-before (org-auto-scheduler-get-not-before marker))
+        (start (nth 1 task))
+        (effort-prop (org-auto-scheduler-get-effort marker)))
+    ;; Outside time block?
+    (when (and time-block start (not (eq (nth 9 task) :failed)))
+      (let ((in-block nil))
+        (dolist (block time-block)
+          (let ((bs (org-auto-scheduler-time-with-time-string start (car block)))
+                (be (org-auto-scheduler-time-with-time-string start (cdr block))))
+            (when (and (not (time-less-p start bs))
+                       (time-less-p start be))
+              (setq in-block t))))
+        (unless in-block
+          (push "Scheduled outside preferred time block" warnings))))
+    ;; NOT_BEFORE constraint was active?
+    (when not-before
+      (push "📌 NOT_BEFORE constraint" warnings))
+    ;; Default effort used?
+    (unless effort-prop
+      (push "Using default effort estimate" warnings))
+    warnings))
+
+(defun org-auto-scheduler--smart-effort-label (marker)
+  "Return effort string, appending '[?]' if using default/historical estimate."
+  (let ((explicit (org-auto-scheduler-get-effort marker)))
+    (if explicit
+        (format "%dm" (round explicit))
+      (let* ((cat (org-with-point-at marker (org-get-category)))
+             (mult (cdr (assoc cat org-auto-scheduler-historical-multipliers)))
+             (est (round (* org-auto-scheduler-default-task-duration (or mult 1.0)))))
+        (format "%dm[?]" est)))))
+
+(defun org-auto-scheduler--format-time-short (time)
+  "Format TIME as 'Mon 09:15' for the review buffer."
+  (if time
+      (format-time-string "%a %H:%M" time)
+    "—"))
+
+(defun org-auto-scheduler--review-push-undo ()
+  "Save current entries to undo stack."
+  (when tabulated-list-entries
+    (push (mapcar (lambda (e) (list (car e) (copy-sequence (cadr e))))
+                  tabulated-list-entries)
+          org-auto-scheduler--review-undo-stack)
+    (when (> (length org-auto-scheduler--review-undo-stack)
+             org-auto-scheduler--review-undo-max)
+      (setq org-auto-scheduler--review-undo-stack
+            (cl-subseq org-auto-scheduler--review-undo-stack 0
+                       org-auto-scheduler--review-undo-max)))))
+
+(defun org-auto-scheduler--review-header-line (entries)
+  "Build the `header-line-format' string from ENTRIES."
+  (let ((total 0) (hours 0.0) (projects (make-hash-table :test 'equal))
+        (min-date nil) (max-date nil) (today-count 0)
+        (today-str (format-time-string "%Y-%m-%d")))
+    (dolist (e entries)
+      (let* ((vec (cadr e))
+             (id (car e)))
+        (unless (string-prefix-p "__sep_" (or id ""))
+          (cl-incf total)
+          (let* ((dur-str (aref vec 4))
+                 (dur (string-to-number dur-str))
+                 (proj (aref vec 5))
+                 (time-str (aref vec 3)))
+            (setq hours (+ hours (/ dur 60.0)))
+            (when (and proj (not (string= proj "—")))
+              (puthash proj (1+ (gethash proj projects 0)) projects))
+            ;; Check if task is today
+            (let ((task-data (assoc id org-auto-scheduler-completed-tasks)))
+              (when (and task-data (nth 1 task-data))
+                (let ((d (format-time-string "%Y-%m-%d" (nth 1 task-data))))
+                  (when (string= d today-str) (cl-incf today-count))
+                  (when (or (null min-date) (string< d min-date)) (setq min-date d))
+                  (when (or (null max-date) (string< max-date d)) (setq max-date d)))))))))
+    (let ((proj-legend ""))
+      (maphash (lambda (name count)
+                 (let ((color (and org-auto-scheduler--project-colors
+                                   (gethash name org-auto-scheduler--project-colors))))
+                   (setq proj-legend
+                         (concat proj-legend
+                                 (if color (propertize (format " ● %s(%d)" name count)
+                                                       'face `(:foreground ,color))
+                                   (format " %s(%d)" name count))))))
+               projects)
+      (format " %d tasks │ %.1fh │ %d today │%s   [SPC]=toggle [U/D]=reorder [r]=recalc [x]=apply [v]=calendar [?]=help"
+              total hours today-count proj-legend))))
+
 ;;; Interactive Review Mode
+
 
 (defvar org-auto-scheduler-review-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
+    ;; Core operations
+    (define-key map (kbd "SPC") #'org-auto-scheduler-review-toggle)
+    (define-key map (kbd "m")   #'org-auto-scheduler-review-toggle)
+    (define-key map (kbd "TAB") #'org-auto-scheduler-review-jump)
+    (define-key map (kbd "x")   #'org-auto-scheduler-review-execute)
+    (define-key map (kbd "C-c C-c") #'org-auto-scheduler-review-execute)
+    ;; Reorder
+    (define-key map (kbd "U")   #'org-auto-scheduler-review-move-up)
+    (define-key map (kbd "p")   #'org-auto-scheduler-review-move-up)
+    (define-key map (kbd "D")   #'org-auto-scheduler-review-move-down)
+    (define-key map (kbd "n")   #'org-auto-scheduler-review-move-down)
+    ;; Recalculate / Refresh
+    (define-key map (kbd "r")   #'org-auto-scheduler-review-recalculate)
+    (define-key map (kbd "C-c C-r") #'org-auto-scheduler-review-recalculate)
+    (define-key map (kbd "R")   #'org-auto-scheduler-review-refresh)
+    ;; Undo
+    (define-key map (kbd "u")   #'org-auto-scheduler-review-undo)
+    ;; Filters
+    (define-key map (kbd "f t") #'org-auto-scheduler-review-filter-today)
+    (define-key map (kbd "f p") #'org-auto-scheduler-review-filter-project)
+    (define-key map (kbd "f a") #'org-auto-scheduler-review-filter-clear)
+    (define-key map (kbd "/")   #'org-auto-scheduler-review-filter-regexp)
+    ;; Bulk operations
+    (define-key map (kbd "* a") #'org-auto-scheduler-review-mark-all)
+    (define-key map (kbd "* n") #'org-auto-scheduler-review-unmark-all)
+    (define-key map (kbd "* t") #'org-auto-scheduler-review-mark-today)
+    (define-key map (kbd "* p") #'org-auto-scheduler-review-mark-project)
+    (define-key map (kbd "* %") #'org-auto-scheduler-review-mark-regexp)
+    ;; What-if
+    (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
+    ;; Views
+    (define-key map (kbd "v")   #'org-auto-scheduler-review-toggle-calendar)
+    ;; Help
+    (define-key map (kbd "?")   #'org-auto-scheduler-review-help)
     map)
-  "Keymap for `org-auto-scheduler-review-mode`.")
-
-(define-key org-auto-scheduler-review-mode-map (kbd "SPC") 'org-auto-scheduler-review-toggle)
-(define-key org-auto-scheduler-review-mode-map (kbd "m") 'org-auto-scheduler-review-toggle)
-(define-key org-auto-scheduler-review-mode-map (kbd "TAB") 'org-auto-scheduler-review-jump)
-(define-key org-auto-scheduler-review-mode-map (kbd "C-c C-c") 'org-auto-scheduler-review-execute)
-(define-key org-auto-scheduler-review-mode-map (kbd "x") 'org-auto-scheduler-review-execute)
-(define-key org-auto-scheduler-review-mode-map (kbd "U") 'org-auto-scheduler-review-move-up)
-(define-key org-auto-scheduler-review-mode-map (kbd "p") 'org-auto-scheduler-review-move-up)
-(define-key org-auto-scheduler-review-mode-map (kbd "D") 'org-auto-scheduler-review-move-down)
-(define-key org-auto-scheduler-review-mode-map (kbd "n") 'org-auto-scheduler-review-move-down)
-(define-key org-auto-scheduler-review-mode-map (kbd "r") 'org-auto-scheduler-review-recalculate)
-(define-key org-auto-scheduler-review-mode-map (kbd "C-c C-r") 'org-auto-scheduler-review-recalculate)
-(define-key org-auto-scheduler-review-mode-map (kbd "R") 'org-auto-scheduler-review-refresh)
+  "Keymap for `org-auto-scheduler-review-mode'.")
 
 (define-derived-mode org-auto-scheduler-review-mode tabulated-list-mode "AutoSch-Review"
   "Major mode for reviewing proposed auto-scheduled tasks before applying them."
-  (setq tabulated-list-format [("Apply" 7 t)
-                               ("Task Name" 40 t)
-                               ("Proposed Time" 35 t)
-                               ("Duration" 10 t)
-                               ("Project ID" 20 t)
-                               ("Score" 8 t)
-                               ("Depth" 8 t)
-                               ("Blockers" 25 t)])
+  (setq tabulated-list-format [("Apply" 5 t)
+                               ("●" 2 nil)
+                               ("Task" 38 t)
+                               ("Time" 20 t)
+                               ("Dur" 8 t)
+                               ("Project" 18 t)
+                               ("Score" 7 t)
+                               ("St" 3 nil)])
   (setq tabulated-list-padding 2)
-  (setq tabulated-list-sort-key (cons "Proposed Time" nil))
+  (setq tabulated-list-sort-key (cons "Time" nil))
   (setq-local revert-buffer-function #'org-auto-scheduler-review-refresh-revert)
+  (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
   (tabulated-list-init-header))
 
 (defun org-auto-scheduler-review-toggle ()
   "Toggle the apply checkmark for the task at point."
   (interactive)
   (let* ((id (tabulated-list-get-id))
-         (entry (tabulated-list-get-entry))
-         (current-state (aref entry 0)))
-    (when entry
-      (aset entry 0 (if (string= current-state "[X]") "[ ]" "[X]"))
+         (entry (tabulated-list-get-entry)))
+    (when (and entry id (not (string-prefix-p "__sep_" id)))
+      (org-auto-scheduler--review-push-undo)
+      (aset entry 0 (if (string= (aref entry 0) "[X]") "[ ]" "[X]"))
       (tabulated-list-print t)
       (forward-line 1))))
 
 (defun org-auto-scheduler-review-jump ()
-  "Jump to the original Org task from the review buffer cleanly."
+  "Jump to the original Org task from the review buffer."
   (interactive)
   (let ((task-id (tabulated-list-get-id)))
+    (when (and task-id (string-prefix-p "__sep_" task-id))
+      (user-error "This is a day separator, not a task"))
     (if task-id
         (let ((marker (org-id-find task-id t)))
           (if marker
-              (org-with-point-at marker
+              (progn
                 (switch-to-buffer-other-window (marker-buffer marker))
                 (goto-char marker)
                 (org-show-context))
@@ -2027,45 +2265,98 @@ if the current system's hostname is in the list."
 (defun org-auto-scheduler-review-move-up ()
   "Move the current task up in the review list."
   (interactive)
-  (when (> (line-number-at-pos) 1) ; Don't move up if already at the top
-    (let* ((entry1 (tabulated-list-get-entry))
-           (id1 (tabulated-list-get-id))
-           (entry2 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
-           (id2 (save-excursion (forward-line -1) (tabulated-list-get-id))))
-      (let ((node1 (assoc id1 tabulated-list-entries))
-            (node2 (assoc id2 tabulated-list-entries)))
-        (setcdr node1 (list entry2))
-        (setcdr node2 (list entry1))
-        (setcar node1 id2)
-        (setcar node2 id1))
-      ;; Disable automatic sorting so tabulated-list-print respects our manual structural map 
-      (setq tabulated-list-sort-key nil)
-      (tabulated-list-print t))))
+  (let* ((id1 (tabulated-list-get-id))
+         (id2 (save-excursion (forward-line -1) (tabulated-list-get-id))))
+    (when (and id1 id2
+               (not (string-prefix-p "__sep_" id1))
+               (not (string-prefix-p "__sep_" id2)))
+      (org-auto-scheduler--review-push-undo)
+      (let* ((entry1 (tabulated-list-get-entry))
+             (entry2 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
+             (node1 (assoc id1 tabulated-list-entries))
+             (node2 (assoc id2 tabulated-list-entries)))
+        (when (and node1 node2)
+          (setcdr node1 (list entry2))
+          (setcdr node2 (list entry1))
+          (setcar node1 id2)
+          (setcar node2 id1)
+          (setq tabulated-list-sort-key nil)
+          (tabulated-list-print t))))))
 
 (defun org-auto-scheduler-review-move-down ()
   "Move the current task down in the review list."
   (interactive)
   (let ((current-id (tabulated-list-get-id)))
-    (save-excursion
-      (forward-line 1)
-      (when (not (eobp)) ; Don't move down if at the bottom
-        (let* ((entry1 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
-               (id1 current-id)
-               (entry2 (tabulated-list-get-entry))
-               (id2 (tabulated-list-get-id)))
-          (let ((node1 (assoc id1 tabulated-list-entries))
-                (node2 (assoc id2 tabulated-list-entries)))
-            (setcdr node1 (list entry2))
-            (setcdr node2 (list entry1))
-            (setcar node1 id2)
-            (setcar node2 id1)))))
-    (when (assoc current-id tabulated-list-entries)
-      ;; Disable automatic sorting so tabulated-list-print respects our manual structural map 
+    (when (and current-id (not (string-prefix-p "__sep_" current-id)))
+      (save-excursion
+        (forward-line 1)
+        (when (not (eobp))
+          (let ((id2 (tabulated-list-get-id)))
+            (when (and id2 (not (string-prefix-p "__sep_" id2)))
+              (org-auto-scheduler--review-push-undo)
+              (let* ((entry1 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
+                     (entry2 (tabulated-list-get-entry))
+                     (node1 (assoc current-id tabulated-list-entries))
+                     (node2 (assoc id2 tabulated-list-entries)))
+                (when (and node1 node2)
+                  (setcdr node1 (list entry2))
+                  (setcdr node2 (list entry1))
+                  (setcar node1 id2)
+                  (setcar node2 current-id)))))))
       (setq tabulated-list-sort-key nil)
       (tabulated-list-print t))))
 
+(defun org-auto-scheduler--build-review-entries (tasks)
+  "Build tabulated-list-entries from TASKS with day separators and new columns."
+  (setq org-auto-scheduler--project-name-cache nil)
+  (let ((raw-entries nil) (prev-date nil))
+    (dolist (task tasks)
+      (let* ((task-id (nth 0 task))
+             (marker (nth 7 task))
+             (headline (nth 5 task))
+             (start (nth 1 task))
+             (end (nth 2 task))
+             (status (nth 9 task))
+             (duration (if (and start end (not (memq status '(:failed :blocked))))
+                          (round (/ (float-time (time-subtract end start)) 60)) 0))
+             (project-name (or (org-auto-scheduler--get-project-name marker) "—"))
+             (proj-trunc (org-auto-scheduler--truncate project-name 18))
+             (score (car (org-auto-scheduler-calculate-score marker)))
+             (auto-warnings (org-auto-scheduler--check-task-warnings task marker))
+             (all-warnings (append (or (nth 10 task) '()) auto-warnings))
+             (stat-str (cond ((eq status :failed)  (propertize "✗" 'face 'error))
+                             ((eq status :blocked) (propertize "⊘" 'face 'warning))
+                             (all-warnings         (propertize "⚠" 'face 'warning))
+                             (t                    (propertize "✓" 'face 'success))))
+             (time-str (cond ((eq status :failed)  (propertize "FAILED" 'face 'error))
+                             ((eq status :blocked) (propertize "BLOCKED" 'face 'warning))
+                             (start (concat (org-auto-scheduler--format-time-short start) "–"
+                                            (format-time-string "%H:%M" end)))
+                             (t "—")))
+             (dur-str (if (memq status '(:failed :blocked)) "—"
+                        (org-auto-scheduler--smart-effort-label marker)))
+             (display-headline (if (memq status '(:failed :blocked))
+                                   (propertize headline 'face 'shadow) headline))
+             (date-str (if start (format-time-string "%Y-%m-%d" start) "Unknown")))
+        ;; Day separator
+        (unless (equal date-str prev-date)
+          (let* ((day-label (if start (format-time-string "── %A, %b %d " start)
+                              "── Unknown Date "))
+                 (sep-line (concat day-label (make-string (max 0 (- 50 (length day-label))) ?─))))
+            (push (list (concat "__sep_" date-str)
+                        (vector "" "" (propertize sep-line 'face 'bold) "" "" "" "" ""))
+                  raw-entries))
+          (setq prev-date date-str))
+        (push (list task-id
+                    (vector (if (memq status '(:failed :blocked)) "[ ]" "[X]")
+                            (org-auto-scheduler--project-dot proj-trunc)
+                            display-headline time-str dur-str
+                            proj-trunc (format "%.1f" score) stat-str))
+              raw-entries)))
+    (nreverse raw-entries)))
+
 (defun org-auto-scheduler-review-recalculate ()
-  "Recalculate scheduled times sequentially based purely on the current visual order without resorting."
+  "Recalculate scheduled times based on visual order without resorting."
   (interactive)
   (message "Recalculating proposed schedule based on visual order...")
   (let ((ordered-tasks '()))
@@ -2075,89 +2366,59 @@ if the current system's hostname is in the list."
         (let* ((task-id (tabulated-list-get-id))
                (entry (tabulated-list-get-entry))
                (checked-state (if entry (aref entry 0) "[X]"))
-               (data (and task-id (assoc task-id org-auto-scheduler-completed-tasks))))
-          (when data
-            (push (cons checked-state data) ordered-tasks)))
+               (data (and task-id (not (string-prefix-p "__sep_" task-id))
+                          (assoc task-id org-auto-scheduler-completed-tasks))))
+          (when data (push (cons checked-state data) ordered-tasks)))
         (forward-line 1)))
     (setq ordered-tasks (nreverse ordered-tasks))
-    
     (let ((org-auto-scheduler--preview-mode t)
           (org-auto-scheduler--ignore-blockers-p t)
           (current-time (org-auto-scheduler-get-start-time))
           (previous-project nil))
       (org-auto-scheduler--build-agenda-cache)
-      (setq org-auto-scheduler-completed-tasks '()) ; clear previous preview state
-      
+      (setq org-auto-scheduler-completed-tasks '())
       (dolist (item ordered-tasks)
         (let* ((task (cdr item))
                (marker (nth 7 task))
                (depth (nth 8 task))
-               (task-project (org-with-point-at marker (org-auto-scheduler-get-project-id marker))))
-          
-          (when (or (not (equal task-project previous-project))
-                    (null task-project))
+               (task-project (org-with-point-at marker
+                               (org-auto-scheduler-get-project-id marker))))
+          (when (or (not (equal task-project previous-project)) (null task-project))
             (setq current-time (org-auto-scheduler-get-start-time))
             (setq previous-project task-project))
-            
-          (setq current-time (org-auto-scheduler-schedule-single-task marker current-time depth)))))
-          
-    ;; Rebuild the tabulated list entries using task-id matching (not index)
-    ;; to avoid misalignment if some tasks failed to schedule
-    (setq tabulated-list-entries nil)
-    (let ((check-state-map (make-hash-table :test 'equal)))
-      ;; Build a map from task-id -> checked state from ordered-tasks
+          (setq current-time
+                (org-auto-scheduler-schedule-single-task marker current-time depth)))))
+    (let ((check-map (make-hash-table :test 'equal)))
       (dolist (item ordered-tasks)
-        (let ((task-id (nth 0 (cdr item))))
-          (puthash task-id (car item) check-state-map)))
-      (dolist (task (reverse org-auto-scheduler-completed-tasks))
-        (let* ((task-id (nth 0 task))
-               (check-state (or (gethash task-id check-state-map) "[X]"))
-               (marker (nth 7 task))
-               (headline (nth 5 task))
-               (schedule-str-actual (nth 6 task))
-               (start (nth 1 task))
-               (end (nth 2 task))
-               (duration (round (/ (float-time (time-subtract end start)) 60)))
-               (project-id (org-with-point-at marker (org-auto-scheduler-get-project-id marker)))
-               (score (car (org-auto-scheduler-calculate-score marker)))
-               (depth (or (nth 8 task) 0))
-               (blockers-list (org-auto-scheduler-get-blockers marker))
-               (blockers-str (if blockers-list
-                                 (mapconcat (lambda (b) 
-                                              (org-with-point-at b (org-get-heading t t t t)))
-                                            blockers-list ", ")
-                               "None"))
-               (prefix (if (> depth 0) (concat (make-string (* 2 (1- depth)) ? ) "├─ ") ""))
-               (tree-headline (concat prefix headline)))
-          (push (list task-id (vector check-state
-                                           tree-headline 
-                                           schedule-str-actual
-                                           (format "%d mins" duration)
-                                           (or project-id "None")
-                                           (format "%.2f" score)
-                                           (format "%d" depth)
-                                           blockers-str))
-                tabulated-list-entries))))
-    (setq tabulated-list-entries (nreverse tabulated-list-entries))
-    (setq tabulated-list-sort-key nil) ; disable sort stringency
+        (puthash (nth 0 (cdr item)) (car item) check-map))
+      (let ((new-entries (org-auto-scheduler--build-review-entries
+                          org-auto-scheduler-completed-tasks)))
+        (dolist (entry new-entries)
+          (let ((saved (gethash (car entry) check-map)))
+            (when saved (aset (cadr entry) 0 saved))))
+        (setq tabulated-list-entries new-entries)
+        (org-auto-scheduler--assign-project-colors new-entries)))
+    (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))
+    (setq tabulated-list-sort-key nil)
     (tabulated-list-print t)
+    (setq header-line-format
+          (org-auto-scheduler--review-header-line tabulated-list-entries))
     (message "Recalculation complete!")))
 
 (defun org-auto-scheduler-review-refresh (&rest _args)
-  "Recalculate the auto-schedule from scratch, resetting the view.
-This allows picking up any fresh Org file changes (tags, blockers) dynamically."
+  "Recalculate the auto-schedule from scratch, resetting the view."
   (interactive)
   (org-auto-scheduler-review-and-apply))
 
-(defun org-auto-scheduler-review-refresh-revert (&optional ignore-auto noconfirm)
-  "Revert function for `org-auto-scheduler-review-mode`."
+(defun org-auto-scheduler-review-refresh-revert (&optional _ignore-auto _noconfirm)
+  "Revert function for `org-auto-scheduler-review-mode'."
   (org-auto-scheduler-review-refresh))
 
 (defun org-auto-scheduler-review-execute ()
   "Apply the scheduled times for all checked tasks in the review buffer.
 Automatically recalculates dependent times based on visual layout before execution."
   (interactive)
-  (org-auto-scheduler-review-recalculate) ; Always trust the exact visual layout before apply
+  (org-auto-scheduler-review-recalculate)
   (org-auto-scheduler-create-report-buffer)
   (let ((applied-count 0))
     (save-excursion
@@ -2165,14 +2426,15 @@ Automatically recalculates dependent times based on visual layout before executi
       (while (not (eobp))
         (let* ((task-id (tabulated-list-get-id))
                (entry (tabulated-list-get-entry))
-               (checked (string= (aref entry 0) "[X]")))
-          (when (and checked task-id)
+               (checked (and entry (string= (aref entry 0) "[X]"))))
+          (when (and checked task-id (not (string-prefix-p "__sep_" task-id)))
             (let* ((data (assoc task-id org-auto-scheduler-completed-tasks)))
               (when data
                 (let* ((schedule-string (nth 6 data))
                        (marker (nth 7 data))
                        (headline (nth 5 data))
-                       (end-time (nth 2 data))
+                       (start (nth 1 data))
+                       (end (nth 2 data))
                        (project-id (org-with-point-at marker (org-auto-scheduler-get-project-id marker)))
                        (score-info (org-auto-scheduler-calculate-score marker))
                        (score (car score-info))
@@ -2197,59 +2459,366 @@ Automatically recalculates dependent times based on visual layout before executi
                   (org-with-point-at marker
                     (org-set-property "SCHEDULED" schedule-string)
                     (org-set-property org-auto-scheduler-scheduled-property "t"))
-                   ;; Pass the scheduled start time (nth 1), not end-time (nth 2).
-                   (org-auto-scheduler-add-to-report task-info (nth 1 data))
+                  (org-auto-scheduler-add-to-report task-info start)
                   (setq applied-count (1+ applied-count)))))))
         (forward-line 1)))
     (org-auto-scheduler-display-report)
     (message "Applied %d tasks from the auto-scheduler review!" applied-count)
     (kill-buffer (current-buffer))
-    (when org-auto-scheduler-sync-caldav
-      (require 'org-caldav)
-      (org-caldav-sync))))
+    (when (and org-auto-scheduler-sync-caldav
+               (require 'org-caldav nil t))
+      (condition-case err
+          (org-caldav-sync)
+        (error (message "CalDAV sync failed (review apply): %s" (error-message-string err)))))))
 
 (defun org-auto-scheduler-review-and-apply ()
   "Calculate an auto-schedule in preview mode and display it for interactive review."
   (interactive)
   (message "Calculating proposed schedule...")
   (let ((org-auto-scheduler--preview-mode t))
-    ;; Run the scheduler cleanly without applying to buffers
     (org-auto-scheduler-schedule-tasks))
-  ;; Now build the tabulated list
   (let ((buf (get-buffer-create "*Org Auto Scheduler Review*")))
     (with-current-buffer buf
       (org-auto-scheduler-review-mode)
-      (setq tabulated-list-entries nil)
-      (dolist (task org-auto-scheduler-completed-tasks)
-        ;; preview task : (task-id available-time end-time '("AUTOSCH") t headline schedule-string marker topo-depth)
-        (let* ((marker (nth 7 task))
-               (headline (nth 5 task))
-               (schedule-str-actual (nth 6 task))
-               (start (nth 1 task))
-               (end (nth 2 task))
-               (duration (round (/ (float-time (time-subtract end start)) 60)))
-               (project-id (org-with-point-at marker (org-auto-scheduler-get-project-id marker)))
-               (score (car (org-auto-scheduler-calculate-score marker)))
-               (depth (or (nth 8 task) 0))
-               (blockers-list (org-auto-scheduler-get-blockers marker))
-               (blockers-str (if blockers-list
-                                 (mapconcat (lambda (b) 
-                                              (org-with-point-at b (org-get-heading t t t t)))
-                                            blockers-list ", ")
-                               "None"))
-               (prefix (if (> depth 0) (concat (make-string (* 2 (1- depth)) ? ) "├─ ") ""))
-               (tree-headline (concat prefix headline)))
-          (push (list (nth 0 task) (vector "[X]" 
-                                           tree-headline 
-                                           schedule-str-actual
-                                     (format "%d mins" duration)
-                                     (or project-id "None")
-                                     (format "%.2f" score)
-                                     (format "%d" depth)
-                                     blockers-str))
-                tabulated-list-entries)))
-      (tabulated-list-print t))
+      (setq org-auto-scheduler--review-view 'table)
+      (setq org-auto-scheduler--review-undo-stack nil)
+      (setq tabulated-list-entries (org-auto-scheduler--build-review-entries
+                                    org-auto-scheduler-completed-tasks))
+      (org-auto-scheduler--assign-project-colors tabulated-list-entries)
+      (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))
+      (tabulated-list-print t)
+      (setq header-line-format
+            (org-auto-scheduler--review-header-line tabulated-list-entries)))
     (switch-to-buffer buf)))
+
+(defun org-auto-scheduler-review-undo ()
+  "Undo the last modification in the review buffer."
+  (interactive)
+  (if (null org-auto-scheduler--review-undo-stack)
+      (user-error "No further undo information")
+    (let ((snapshot (pop org-auto-scheduler--review-undo-stack)))
+      (setq tabulated-list-entries snapshot)
+      (tabulated-list-print t)
+      (setq header-line-format
+            (org-auto-scheduler--review-header-line tabulated-list-entries))
+      (message "Undo!"))))
+
+(defun org-auto-scheduler--apply-current-filter ()
+  "Apply the active filter to `tabulated-list-entries`."
+  (if (null org-auto-scheduler--review-active-filter)
+      (setq tabulated-list-entries (copy-sequence org-auto-scheduler--review-all-entries))
+    (let ((filtered nil))
+      (dolist (e org-auto-scheduler--review-all-entries)
+        (let* ((id (car e))
+               (vec (cadr e)))
+          (when (or (string-prefix-p "__sep_" id)
+                    (funcall org-auto-scheduler--review-active-filter id vec))
+            (push e filtered))))
+      (let ((cleaned nil) (prev-is-sep nil))
+        (dolist (e (nreverse filtered))
+          (let ((is-sep (string-prefix-p "__sep_" (car e))))
+            (if is-sep
+                (unless prev-is-sep
+                  (push e cleaned)
+                  (setq prev-is-sep t))
+              (push e cleaned)
+              (setq prev-is-sep nil))))
+        (setq tabulated-list-entries (nreverse cleaned)))))
+  (tabulated-list-print t)
+  (setq header-line-format
+        (org-auto-scheduler--review-header-line tabulated-list-entries)))
+
+(defun org-auto-scheduler-review-filter-today ()
+  "Filter review list to show only today's tasks."
+  (interactive)
+  (let ((today-str (format-time-string "%Y-%m-%d")))
+    (setq org-auto-scheduler--review-active-filter
+          (lambda (id _vec)
+            (let ((task-data (assoc id org-auto-scheduler-completed-tasks)))
+              (and task-data (nth 1 task-data)
+                   (string= (format-time-string "%Y-%m-%d" (nth 1 task-data)) today-str)))))
+    (org-auto-scheduler--apply-current-filter)
+    (message "Filtered: Today only")))
+
+(defun org-auto-scheduler-review-filter-project ()
+  "Filter review list by project."
+  (interactive)
+  (let* ((projects nil))
+    (dolist (e org-auto-scheduler--review-all-entries)
+      (let ((proj (aref (cadr e) 5)))
+        (when (and proj (not (string= proj "—")) (not (string= proj "")))
+          (cl-pushnew proj projects :test #'string=))))
+    (if (null projects)
+        (message "No projects found to filter by")
+      (let ((choice (completing-read "Filter by project: " projects nil t)))
+        (setq org-auto-scheduler--review-active-filter
+              (lambda (_id vec)
+                (string= (aref vec 5) choice)))
+        (org-auto-scheduler--apply-current-filter)
+        (message "Filtered by project: %s" choice)))))
+
+(defun org-auto-scheduler-review-filter-clear ()
+  "Clear any active filter."
+  (interactive)
+  (setq org-auto-scheduler--review-active-filter nil)
+  (org-auto-scheduler--apply-current-filter)
+  (message "Filter cleared"))
+
+(defun org-auto-scheduler-review-filter-regexp (regexp)
+  "Filter review list by REGEXP matching task headline."
+  (interactive "sFilter by regexp: ")
+  (if (string= regexp "")
+      (org-auto-scheduler-review-filter-clear)
+    (setq org-auto-scheduler--review-active-filter
+          (lambda (_id vec)
+            (string-match-p regexp (substring-no-properties (aref vec 2)))))
+    (org-auto-scheduler--apply-current-filter)
+    (message "Filtered by regexp: %s" regexp)))
+
+(defun org-auto-scheduler-review-mark-all ()
+  "Mark all visible tasks as checked."
+  (interactive)
+  (org-auto-scheduler--review-push-undo)
+  (dolist (e tabulated-list-entries)
+    (let ((id (car e)) (vec (cadr e)))
+      (unless (string-prefix-p "__sep_" id)
+        (aset vec 0 "[X]")
+        (aset vec 2 (substring-no-properties (aref vec 2))))))
+  (tabulated-list-print t))
+
+(defun org-auto-scheduler-review-unmark-all ()
+  "Unmark all visible tasks."
+  (interactive)
+  (org-auto-scheduler--review-push-undo)
+  (dolist (e tabulated-list-entries)
+    (let ((id (car e)) (vec (cadr e)))
+      (unless (string-prefix-p "__sep_" id)
+        (aset vec 0 "[ ]")
+        (aset vec 2 (propertize (substring-no-properties (aref vec 2)) 'face 'shadow)))))
+  (tabulated-list-print t))
+
+(defun org-auto-scheduler-review-mark-today ()
+  "Mark all tasks scheduled for today."
+  (interactive)
+  (org-auto-scheduler--review-push-undo)
+  (let ((today-str (format-time-string "%Y-%m-%d")))
+    (dolist (e tabulated-list-entries)
+      (let* ((id (car e)) (vec (cadr e))
+             (task-data (assoc id org-auto-scheduler-completed-tasks)))
+        (when (and task-data (nth 1 task-data)
+                   (string= (format-time-string "%Y-%m-%d" (nth 1 task-data)) today-str))
+          (aset vec 0 "[X]")
+          (aset vec 2 (substring-no-properties (aref vec 2)))))))
+  (tabulated-list-print t))
+
+(defun org-auto-scheduler-review-mark-project ()
+  "Mark all tasks belonging to a chosen project."
+  (interactive)
+  (let* ((projects nil))
+    (dolist (e tabulated-list-entries)
+      (let ((proj (aref (cadr e) 5)))
+        (when (and proj (not (string= proj "—")) (not (string= proj "")))
+          (cl-pushnew proj projects :test #'string=))))
+    (if (null projects)
+        (message "No projects found")
+      (let ((choice (completing-read "Mark project: " projects nil t)))
+        (org-auto-scheduler--review-push-undo)
+        (dolist (e tabulated-list-entries)
+          (let ((id (car e)) (vec (cadr e)))
+            (when (string= (aref vec 5) choice)
+              (aset vec 0 "[X]")
+              (aset vec 2 (substring-no-properties (aref vec 2))))))
+        (tabulated-list-print t)))))
+
+(defun org-auto-scheduler-review-mark-regexp (regexp)
+  "Mark all tasks matching REGEXP."
+  (interactive "sMark matching regexp: ")
+  (when (not (string= regexp ""))
+    (org-auto-scheduler--review-push-undo)
+    (dolist (e tabulated-list-entries)
+      (let ((id (car e)) (vec (cadr e)))
+        (when (and (not (string-prefix-p "__sep_" id))
+                   (string-match-p regexp (substring-no-properties (aref vec 2))))
+          (aset vec 0 "[X]")
+          (aset vec 2 (substring-no-properties (aref vec 2))))))
+    (tabulated-list-print t)))
+
+(defun org-auto-scheduler-review-edit-effort (new-effort)
+  "Edit the estimated effort (in minutes) for the task at point (temporary override)."
+  (interactive "nNew effort in minutes: ")
+  (let* ((id (tabulated-list-get-id))
+         (entry (tabulated-list-get-entry)))
+    (if (or (null id) (string-prefix-p "__sep_" id))
+        (user-error "Not on a task")
+      (org-auto-scheduler--review-push-undo)
+      (puthash id (plist-put (gethash id org-auto-scheduler--review-overrides) :effort new-effort)
+               org-auto-scheduler--review-overrides)
+      (aset entry 4 (propertize (format "%dm*" new-effort) 'face 'warning))
+      (tabulated-list-print t)
+      (message "Effort updated to %d min (press 'r' to recalculate schedule)" new-effort))))
+
+(defun org-auto-scheduler-review-toggle-calendar ()
+  "Toggle between table view and calendar view in the review buffer."
+  (interactive)
+  (if (eq org-auto-scheduler--review-view 'calendar)
+      (progn
+        (setq org-auto-scheduler--review-view 'table)
+        (let ((inhibit-read-only t))
+          (erase-buffer))
+        (tabulated-list-init-header)
+        (tabulated-list-print t)
+        (setq header-line-format
+              (org-auto-scheduler--review-header-line tabulated-list-entries))
+        (message "Switched to Table View"))
+    (setq org-auto-scheduler--review-view 'calendar)
+    (org-auto-scheduler--render-calendar-view)))
+
+(defun org-auto-scheduler--render-calendar-view ()
+  "Render the calendar view of the proposed schedule."
+  (let ((inhibit-read-only t)
+        (tasks (cl-remove-if (lambda (t2) (memq (nth 9 t2) '(:failed :blocked)))
+                             org-auto-scheduler-completed-tasks)))
+    (erase-buffer)
+    (setq header-line-format
+          (concat " " (propertize "Auto Scheduler Calendar View" 'face 'bold)
+                  " │ [v] Table View │ [TAB/RET] Jump to task │ Scroll to navigate"))
+    (insert (propertize " Proposed Schedule Calendar View \n" 'face 'org-document-title))
+    (insert (propertize "========================================================\n\n" 'face 'shadow))
+    (if (null tasks)
+        (insert "  No successfully scheduled tasks to display.\n")
+      (let ((days-hash (make-hash-table :test 'equal))
+            (dates nil))
+        (dolist (task tasks)
+          (let* ((start (nth 1 task))
+                 (date-str (format-time-string "%Y-%m-%d" start)))
+            (cl-pushnew date-str dates :test #'string=)
+            (puthash date-str (cons task (gethash date-str days-hash)) days-hash)))
+        (setq dates (sort dates #'string<))
+        (dolist (date-str dates)
+          (let* ((day-tasks (nreverse (gethash date-str days-hash)))
+                 (min-time (cl-reduce (lambda (a b) (if (time-less-p (nth 1 a) (nth 1 b)) a b)) day-tasks))
+                 (max-time (cl-reduce (lambda (a b) (if (time-less-p (nth 2 a) (nth 2 b)) b a)) day-tasks))
+                 (start-hour (max 0 (- (string-to-number (format-time-string "%H" (nth 1 min-time))) 1)))
+                 (end-hour (min 23 (+ (string-to-number (format-time-string "%H" (nth 2 max-time))) 1)))
+                 (parsed-date (nth 1 min-time)))
+            (insert (propertize (format " 📅 %s \n" (format-time-string "%A, %B %d, %Y" parsed-date))
+                                'face 'bold-italic))
+            (insert (propertize " ──────────────────────────────────────────────────────\n" 'face 'shadow))
+            (let ((hour start-hour)
+                  (minute 0)
+                  (last-printed-task-id nil))
+              (while (<= hour end-hour)
+                (let* ((slot-time (org-auto-scheduler-parse-time-string (format "%s %02d:%02d" date-str hour minute)))
+                       (active-task (cl-find-if (lambda (t2)
+                                                  (let ((ts (nth 1 t2))
+                                                        (te (nth 2 t2)))
+                                                    (and (not (time-less-p slot-time ts))
+                                                         (time-less-p slot-time te))))
+                                                day-tasks)))
+                  (insert (format "  %02d:%02d │ " hour minute))
+                  (if active-task
+                      (let* ((task-id (car active-task))
+                             (headline (nth 5 active-task))
+                             (marker (nth 7 active-task))
+                             (project-name (or (org-auto-scheduler--get-project-name marker) "—"))
+                             (proj-trunc (org-auto-scheduler--truncate project-name 18))
+                             (color (and org-auto-scheduler--project-colors
+                                         (gethash proj-trunc org-auto-scheduler--project-colors)))
+                             (bar-char (propertize "█" 'face (if color `(:foreground ,color) 'default))))
+                        (insert bar-char " ")
+                        (if (equal task-id last-printed-task-id)
+                            (insert (propertize "║" 'face (if color `(:foreground ,color) 'shadow)))
+                          (setq last-printed-task-id task-id)
+                          (let ((start-lbl (format-time-string "%H:%M" (nth 1 active-task)))
+                                (end-lbl (format-time-string "%H:%M" (nth 2 active-task))))
+                            (insert (propertize (format "[%s] %s (%s–%s)" proj-trunc headline start-lbl end-lbl)
+                                                'face (if color `(:foreground ,color) 'default)
+                                                'task-id task-id
+                                                'mouse-face 'highlight
+                                                'help-echo "RET/TAB to jump to task")))))
+                    (setq last-printed-task-id nil)
+                    (insert (propertize "·" 'face 'shadow)))
+                  (insert "\n")
+                  (setq minute (+ minute 15))
+                  (when (>= minute 60)
+                    (setq minute 0)
+                    (setq hour (1+ hour))))))
+            (insert "\n")))))
+    (goto-char (point-min))))
+
+(defun org-auto-scheduler-review-help ()
+  "Show help for the review buffer."
+  (interactive)
+  (with-output-to-temp-buffer "*Org Auto Scheduler Review Help*"
+    (with-current-buffer standard-output
+      (insert "Org Auto Scheduler Review Mode Keybindings:\n\n")
+      (insert "  SPC, m       Toggle application of task at point\n")
+      (insert "  TAB, RET     Jump to task in Org file\n")
+      (insert "  x, C-c C-c   Apply all checked scheduled times to Org files\n")
+      (insert "  U, p         Move task up (manually reorder)\n")
+      (insert "  D, n         Move task down (manually reorder)\n")
+      (insert "  r, C-c C-r   Recalculate times based on current visual order\n")
+      (insert "  R            Refresh/re-run auto-scheduler from scratch\n")
+      (insert "  u            Undo last toggle, move, filter, or override\n")
+      (insert "  e            Edit estimated effort of task at point (What-If)\n")
+      (insert "  v            Toggle between Table View and Calendar View\n\n")
+      (insert "Filters (prefix with 'f'):\n")
+      (insert "  f t          Show only tasks scheduled for today\n")
+      (insert "  f p          Filter tasks by project\n")
+      (insert "  f a          Clear active filter\n")
+      (insert "  /            Filter by regexp match on headline\n\n")
+      (insert "Bulk Marks (prefix with '*'):\n")
+      (insert "  * a          Mark all tasks\n")
+      (insert "  * n          Unmark/clear all tasks\n")
+      (insert "  * t          Mark all tasks scheduled for today\n")
+      (insert "  * p          Mark all tasks in a project\n")
+      (insert "  * %          Mark all tasks matching a regexp\n"))))
+
+(defun org-auto-scheduler-schedule-today ()
+  "Schedule tasks for the remainder of today only."
+  (interactive)
+  (let ((org-auto-scheduler-max-days-to-check 1))
+    (org-auto-scheduler-review-and-apply)))
+
+(defun org-auto-scheduler-dispatch ()
+  "Display the command menu for Org Auto Scheduler.
+Uses `transient` if available, otherwise falls back to a simple prompt."
+  (interactive)
+  (if (require 'transient nil t)
+      (call-interactively 'org-auto-scheduler-dispatch-menu)
+    (let ((choice (read-char-choice
+                   (concat "Org Auto Scheduler Menu:\n"
+                           " [s] Schedule Tasks\n"
+                           " [r] Review & Apply\n"
+                           " [t] Schedule Today Only\n"
+                           " [c] Score Adherence\n"
+                           " [a] Adherence Report\n"
+                           " [b] Bump Agenda\n"
+                           "Choice: ")
+                   '(?s ?r ?t ?c ?a ?b))))
+      (cond
+       ((eq choice ?s) (call-interactively 'org-auto-scheduler-schedule-tasks))
+       ((eq choice ?r) (call-interactively 'org-auto-scheduler-review-and-apply))
+       ((eq choice ?t) (call-interactively 'org-auto-scheduler-schedule-today))
+       ((eq choice ?c) (call-interactively 'org-auto-scheduler-score-schedule))
+       ((eq choice ?a) (call-interactively 'org-auto-scheduler-adherence-report))
+       ((eq choice ?b) (call-interactively 'org-auto-scheduler-bump-agenda))))))
+
+(with-eval-after-load 'transient
+  (transient-define-prefix org-auto-scheduler-dispatch-menu ()
+    "Org Auto Scheduler commands."
+    ["Schedule"
+     ("s" "Schedule tasks"       org-auto-scheduler-schedule-tasks)
+     ("r" "Review & Apply"       org-auto-scheduler-review-and-apply)
+     ("t" "Schedule today only"  org-auto-scheduler-schedule-today)]
+    ["Adherence"
+     ("S" "Snapshot schedule"    org-auto-scheduler-snapshot-schedule)
+     ("c" "Score adherence"      org-auto-scheduler-score-schedule)
+     ("a" "Adherence report"     org-auto-scheduler-adherence-report)]
+    ["Tools"
+     ("b" "Bump agenda"          org-auto-scheduler-bump-agenda)
+     ("h" "Historical insights"  org-auto-scheduler-historical-insights)
+     ("B" "Toggle background"    org-auto-scheduler-toggle-background)]))
 
 ;;; Agenda Bump Rescheduling
 
@@ -2441,11 +3010,12 @@ If NO-DISPLAY is non-nil, suppresses the graphical output."
                                  (actual-end (nth 3 interval)))
                             ;; Track earliest start
                             (unless first-start (setq first-start actual-start))
-                            ;; Add overlap
-                            (let ((o-start (time-since (max (float-time plan-start) (float-time actual-start))))
-                                  (o-end (time-since (min (float-time plan-end) (float-time actual-end)))))
-                              (when (> (float-time o-end) (float-time o-start))
-                                (cl-incf overlap-mins (/ (- (float-time o-end) (float-time o-start)) 60.0)))))))
+                            ;; Add overlap — compute the intersection of [plan-start,plan-end] and [actual-start,actual-end]
+                            (let* ((overlap-start (max (float-time plan-start) (float-time actual-start)))
+                                   (overlap-end (min (float-time plan-end) (float-time actual-end)))
+                                   (overlap-duration (max 0.0 (- overlap-end overlap-start))))
+                              (when (> overlap-duration 0)
+                                (cl-incf overlap-mins (/ overlap-duration 60.0)))))))
                       ;; Calculate punctuality multiplier
                       (when first-start
                         (let ((variance-mins (/ (abs (float-time (time-subtract first-start plan-start))) 60.0)))
