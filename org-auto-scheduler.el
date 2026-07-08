@@ -8,6 +8,7 @@
 (require 'time-date)
 (require 'org-clock)
 (require 'calendar)
+(require 'tabulated-list)
 
 
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
@@ -2028,14 +2029,15 @@ Returns a truncated string (max 20 chars) or nil."
         (let ((name (save-excursion
                       (with-current-buffer (marker-buffer marker)
                         (goto-char (marker-position marker))
-                        (let ((found nil))
-                          (catch 'found
-                            (when (member "PROJECT" (org-get-tags nil t))
-                              (throw 'found (org-get-heading t t t t)))
-                            (while (org-up-heading-safe)
-                              (when (member "PROJECT" (org-get-tags nil t))
+                        (catch 'found
+                          (let ((tags (org-get-tags nil t)))
+                            (when (cl-find-if (lambda (tag) (string-equal-ignore-case tag "PROJECT")) tags)
+                              (throw 'found (org-get-heading t t t t))))
+                          (while (org-up-heading-safe)
+                            (let ((tags (org-get-tags nil t)))
+                              (when (cl-find-if (lambda (tag) (string-equal-ignore-case tag "PROJECT")) tags)
                                 (throw 'found (org-get-heading t t t t)))))
-                          found)))))
+                          nil)))))
           (when name
             (unless org-auto-scheduler--project-name-cache
               (setq org-auto-scheduler--project-name-cache (make-hash-table :test 'equal)))
@@ -2049,16 +2051,17 @@ Returns a truncated string (max 20 chars) or nil."
       (concat (substring str 0 (- max 2)) "..")
     (or str "")))
 
-(defun org-auto-scheduler--assign-project-colors (entries)
-  "Build `org-auto-scheduler--project-colors' from ENTRIES (tabulated-list-entries).
-Each entry's vector has project-name at index 5."
+(defun org-auto-scheduler--assign-project-colors (tasks)
+  "Build `org-auto-scheduler--project-colors' from TASKS."
   (setq org-auto-scheduler--project-colors (make-hash-table :test 'equal))
   (let ((idx 0))
-    (dolist (entry entries)
-      (let ((proj (aref (cadr entry) 5)))
-        (when (and proj (not (string= proj "—"))
-                   (not (gethash proj org-auto-scheduler--project-colors)))
-          (puthash proj
+    (dolist (task tasks)
+      (let* ((marker (nth 7 task))
+             (proj-name (or (org-auto-scheduler--get-project-name marker) "—"))
+             (proj-trunc (org-auto-scheduler--truncate proj-name 18)))
+        (when (and proj-trunc (not (string= proj-trunc "—"))
+                   (not (gethash proj-trunc org-auto-scheduler--project-colors)))
+          (puthash proj-trunc
                    (nth (% idx (length org-auto-scheduler--project-color-palette))
                         org-auto-scheduler--project-color-palette)
                    org-auto-scheduler--project-colors)
@@ -2173,51 +2176,75 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                                        'face `(:foreground ,color))
                                    (format " %s(%d)" name count))))))
                projects)
-      (format " %d tasks │ %.1fh │ %d today │%s   [SPC]=toggle [U/D]=reorder [r]=recalc [x]=apply [v]=calendar [?]=help"
-              total hours today-count proj-legend))))
+      (let ((legend (format " %d tasks │ %.1fh │ %d today │%s   [RET]=toggle [K/J]=reorder [r]=recalc [x]=apply [c]=calendar [?]=help"
+                            total hours today-count proj-legend)))
+        (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
 ;;; Interactive Review Mode
 
 
-(defvar org-auto-scheduler-review-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map tabulated-list-mode-map)
-    ;; Core operations
-    (define-key map (kbd "SPC") #'org-auto-scheduler-review-toggle)
-    (define-key map (kbd "m")   #'org-auto-scheduler-review-toggle)
-    (define-key map (kbd "TAB") #'org-auto-scheduler-review-jump)
-    (define-key map (kbd "x")   #'org-auto-scheduler-review-execute)
-    (define-key map (kbd "C-c C-c") #'org-auto-scheduler-review-execute)
-    ;; Reorder
-    (define-key map (kbd "U")   #'org-auto-scheduler-review-move-up)
-    (define-key map (kbd "p")   #'org-auto-scheduler-review-move-up)
-    (define-key map (kbd "D")   #'org-auto-scheduler-review-move-down)
-    (define-key map (kbd "n")   #'org-auto-scheduler-review-move-down)
-    ;; Recalculate / Refresh
-    (define-key map (kbd "r")   #'org-auto-scheduler-review-recalculate)
-    (define-key map (kbd "C-c C-r") #'org-auto-scheduler-review-recalculate)
-    (define-key map (kbd "R")   #'org-auto-scheduler-review-refresh)
-    ;; Undo
-    (define-key map (kbd "u")   #'org-auto-scheduler-review-undo)
-    ;; Filters
-    (define-key map (kbd "f t") #'org-auto-scheduler-review-filter-today)
-    (define-key map (kbd "f p") #'org-auto-scheduler-review-filter-project)
-    (define-key map (kbd "f a") #'org-auto-scheduler-review-filter-clear)
-    (define-key map (kbd "/")   #'org-auto-scheduler-review-filter-regexp)
-    ;; Bulk operations
-    (define-key map (kbd "* a") #'org-auto-scheduler-review-mark-all)
-    (define-key map (kbd "* n") #'org-auto-scheduler-review-unmark-all)
-    (define-key map (kbd "* t") #'org-auto-scheduler-review-mark-today)
-    (define-key map (kbd "* p") #'org-auto-scheduler-review-mark-project)
-    (define-key map (kbd "* %") #'org-auto-scheduler-review-mark-regexp)
-    ;; What-if
-    (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
-    ;; Views
-    (define-key map (kbd "v")   #'org-auto-scheduler-review-toggle-calendar)
-    ;; Help
-    (define-key map (kbd "?")   #'org-auto-scheduler-review-help)
-    map)
+(defvar org-auto-scheduler-review-mode-map nil
   "Keymap for `org-auto-scheduler-review-mode'.")
+
+;; Ensure the map is a valid keymap (recovers from previous `nil` state)
+(unless (keymapp org-auto-scheduler-review-mode-map)
+  (setq org-auto-scheduler-review-mode-map (make-sparse-keymap))
+  (set-keymap-parent org-auto-scheduler-review-mode-map tabulated-list-mode-map))
+
+(let ((map org-auto-scheduler-review-mode-map))
+  ;; Core operations
+  (define-key map (kbd "SPC") #'org-auto-scheduler-review-toggle)
+  (define-key map (kbd "RET") #'org-auto-scheduler-review-toggle)
+  (define-key map (kbd "m")   #'org-auto-scheduler-review-toggle)
+  (define-key map (kbd "TAB") #'org-auto-scheduler-review-jump)
+  (define-key map (kbd "x")   #'org-auto-scheduler-review-execute)
+  (define-key map (kbd "C-c C-c") #'org-auto-scheduler-review-execute)
+  ;; Reorder
+  (define-key map (kbd "U")   #'org-auto-scheduler-review-move-up)
+  (define-key map (kbd "K")   #'org-auto-scheduler-review-move-up)
+  (define-key map (kbd "p")   #'org-auto-scheduler-review-move-up)
+  (define-key map (kbd "D")   #'org-auto-scheduler-review-move-down)
+  (define-key map (kbd "J")   #'org-auto-scheduler-review-move-down)
+  (define-key map (kbd "n")   #'org-auto-scheduler-review-move-down)
+  ;; Recalculate / Refresh
+  (define-key map (kbd "r")   #'org-auto-scheduler-review-recalculate)
+  (define-key map (kbd "C-c C-r") #'org-auto-scheduler-review-recalculate)
+  (define-key map (kbd "R")   #'org-auto-scheduler-review-refresh)
+  ;; Undo
+  (define-key map (kbd "u")   #'org-auto-scheduler-review-undo)
+  ;; Filters
+  (define-key map (kbd "f t") #'org-auto-scheduler-review-filter-today)
+  (define-key map (kbd "f p") #'org-auto-scheduler-review-filter-project)
+  (define-key map (kbd "f a") #'org-auto-scheduler-review-filter-clear)
+  (define-key map (kbd "/")   #'org-auto-scheduler-review-filter-regexp)
+  ;; Bulk operations
+  (define-key map (kbd "* a") #'org-auto-scheduler-review-mark-all)
+  (define-key map (kbd "* n") #'org-auto-scheduler-review-unmark-all)
+  (define-key map (kbd "* t") #'org-auto-scheduler-review-mark-today)
+  (define-key map (kbd "* p") #'org-auto-scheduler-review-mark-project)
+  (define-key map (kbd "* %") #'org-auto-scheduler-review-mark-regexp)
+  ;; What-if
+  (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
+  ;; Views
+  (define-key map (kbd "v")   #'org-auto-scheduler-review-toggle-calendar)
+  (define-key map (kbd "c")   #'org-auto-scheduler-review-toggle-calendar)
+  ;; Help
+  (define-key map (kbd "?")   #'org-auto-scheduler-review-help))
+
+;; Evil/Spacemacs compatibility
+(with-eval-after-load 'evil
+  (dolist (state '(normal motion))
+    (evil-define-key state org-auto-scheduler-review-mode-map
+      (kbd "RET") #'org-auto-scheduler-review-toggle
+      (kbd "m")   #'org-auto-scheduler-review-toggle
+      (kbd "x")   #'org-auto-scheduler-review-execute
+      (kbd "K")   #'org-auto-scheduler-review-move-up
+      (kbd "J")   #'org-auto-scheduler-review-move-down
+      (kbd "r")   #'org-auto-scheduler-review-recalculate
+      (kbd "R")   #'org-auto-scheduler-review-refresh
+      (kbd "u")   #'org-auto-scheduler-review-undo
+      (kbd "c")   #'org-auto-scheduler-review-toggle-calendar
+      (kbd "?")   #'org-auto-scheduler-review-help)))
 
 (define-derived-mode org-auto-scheduler-review-mode tabulated-list-mode "AutoSch-Review"
   "Major mode for reviewing proposed auto-scheduled tasks before applying them."
@@ -2230,7 +2257,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                ("Score" 7 t)
                                ("St" 3 nil)])
   (setq tabulated-list-padding 2)
-  (setq tabulated-list-sort-key (cons "Time" nil))
+  (setq tabulated-list-sort-key nil)  ; We sort chronologically ourselves in --build-review-entries
   (setq-local revert-buffer-function #'org-auto-scheduler-review-refresh-revert)
   (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
   (tabulated-list-init-header))
@@ -2268,8 +2295,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (let* ((id1 (tabulated-list-get-id))
          (id2 (save-excursion (forward-line -1) (tabulated-list-get-id))))
     (when (and id1 id2
-               (not (string-prefix-p "__sep_" id1))
-               (not (string-prefix-p "__sep_" id2)))
+               (not (string-prefix-p "__sep_" id1)))
       (org-auto-scheduler--review-push-undo)
       (let* ((entry1 (tabulated-list-get-entry))
              (entry2 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
@@ -2292,7 +2318,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
         (forward-line 1)
         (when (not (eobp))
           (let ((id2 (tabulated-list-get-id)))
-            (when (and id2 (not (string-prefix-p "__sep_" id2)))
+            (when id2
               (org-auto-scheduler--review-push-undo)
               (let* ((entry1 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
                      (entry2 (tabulated-list-get-entry))
@@ -2307,17 +2333,29 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (tabulated-list-print t))))
 
 (defun org-auto-scheduler--build-review-entries (tasks)
-  "Build tabulated-list-entries from TASKS with day separators and new columns."
+  "Build tabulated-list-entries from TASKS with day separators and new columns.
+TASKS are sorted chronologically by start time before display."
   (setq org-auto-scheduler--project-name-cache nil)
-  (let ((raw-entries nil) (prev-date nil))
-    (dolist (task tasks)
+  (org-auto-scheduler--assign-project-colors tasks)
+  ;; Sort tasks chronologically by start time so day separators are correct
+  (let* ((sorted-tasks (sort (copy-sequence tasks)
+                             (lambda (a b)
+                               (let ((sa (nth 1 a))
+                                     (sb (nth 1 b)))
+                                 (cond ((and sa sb) (time-less-p sa sb))
+                                       (sa t)
+                                       (t nil))))))
+         (raw-entries nil) (prev-date nil)
+         (today-str (format-time-string "%Y-%m-%d")))
+    (dolist (task sorted-tasks)
       (let* ((task-id (nth 0 task))
              (marker (nth 7 task))
              (headline (nth 5 task))
              (start (nth 1 task))
              (end (nth 2 task))
              (status (nth 9 task))
-             (duration (if (and start end (not (memq status '(:failed :blocked))))
+             (depth (nth 8 task))
+             (duration (if (and start end (not (memq status '(:failed :blocked :skipped))))
                           (round (/ (float-time (time-subtract end start)) 60)) 0))
              (project-name (or (org-auto-scheduler--get-project-name marker) "—"))
              (proj-trunc (org-auto-scheduler--truncate project-name 18))
@@ -2326,33 +2364,76 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
              (all-warnings (append (or (nth 10 task) '()) auto-warnings))
              (stat-str (cond ((eq status :failed)  (propertize "✗" 'face 'error))
                              ((eq status :blocked) (propertize "⊘" 'face 'warning))
+                             ((eq status :skipped) (propertize "⏸" 'face 'shadow))
                              (all-warnings         (propertize "⚠" 'face 'warning))
                              (t                    (propertize "✓" 'face 'success))))
              (time-str (cond ((eq status :failed)  (propertize "FAILED" 'face 'error))
                              ((eq status :blocked) (propertize "BLOCKED" 'face 'warning))
+                             ((eq status :skipped) (propertize "SKIPPED" 'face 'shadow))
                              (start (concat (org-auto-scheduler--format-time-short start) "–"
                                             (format-time-string "%H:%M" end)))
                              (t "—")))
-             (dur-str (if (memq status '(:failed :blocked)) "—"
+             (dur-str (if (memq status '(:failed :blocked :skipped)) "—"
                         (org-auto-scheduler--smart-effort-label marker)))
-             (display-headline (if (memq status '(:failed :blocked))
-                                   (propertize headline 'face 'shadow) headline))
-             (date-str (if start (format-time-string "%Y-%m-%d" start) "Unknown")))
-        ;; Day separator
-        (unless (equal date-str prev-date)
-          (let* ((day-label (if start (format-time-string "── %A, %b %d " start)
-                              "── Unknown Date "))
-                 (sep-line (concat day-label (make-string (max 0 (- 50 (length day-label))) ?─))))
-            (push (list (concat "__sep_" date-str)
-                        (vector "" "" (propertize sep-line 'face 'bold) "" "" "" "" ""))
-                  raw-entries))
-          (setq prev-date date-str))
-        (push (list task-id
-                    (vector (if (memq status '(:failed :blocked)) "[ ]" "[X]")
-                            (org-auto-scheduler--project-dot proj-trunc)
-                            display-headline time-str dur-str
-                            proj-trunc (format "%.1f" score) stat-str))
-              raw-entries)))
+             (date-str (if start (format-time-string "%Y-%m-%d" start) "Unknown"))
+             
+             (checked (if (memq status '(:failed :blocked :skipped)) "[ ]" "[X]"))
+             (is-today (string= date-str today-str))
+             (is-blocked (> depth 0))
+             (priority (org-with-point-at marker (org-entry-get nil "PRIORITY")))
+             (is-high-priority (and priority (string= priority "A")))
+             (is-unchecked (string= checked "[ ]"))
+             (display-headline (copy-sequence headline)))
+
+        ;; Apply face formatting
+        (let ((row-face nil)
+              (row-strike nil))
+          (when is-blocked
+            (setq display-headline (concat "  " display-headline))
+            (setq row-face 'warning))
+          (when (and (not is-blocked) (not is-today))
+            (setq row-face 'shadow))
+          (when is-high-priority
+            (setq row-face 'bold))
+          (when is-unchecked
+            (setq row-strike '(:strike-through t)))
+          
+          (let ((cols (list checked display-headline time-str dur-str stat-str)))
+            (dolist (col cols)
+              (when row-face
+                (add-face-text-property 0 (length col) row-face nil col))
+              (when row-strike
+                (add-face-text-property 0 (length col) row-strike t col))))
+
+          ;; Apply project color to the project name
+          (let* ((proj-color (and org-auto-scheduler--project-colors
+                                  (gethash proj-trunc org-auto-scheduler--project-colors)))
+                 (colored-proj (if proj-color
+                                   (propertize (copy-sequence proj-trunc) 'face `(:foreground ,proj-color))
+                                 (copy-sequence proj-trunc)))
+                 (colored-score (copy-sequence (format "%.1f" score))))
+            (when row-face
+              (add-face-text-property 0 (length colored-proj) row-face nil colored-proj)
+              (add-face-text-property 0 (length colored-score) row-face nil colored-score))
+            (when row-strike
+              (add-face-text-property 0 (length colored-proj) row-strike t colored-proj)
+              (add-face-text-property 0 (length colored-score) row-strike t colored-score))
+            
+            ;; Day separator
+            (unless (equal date-str prev-date)
+              (let* ((day-label (if start (format-time-string "-- %A, %b %d " start)
+                                  "-- Unknown Date "))
+                     (sep-line (concat day-label (make-string (max 0 (- 50 (length day-label))) ?-))))
+                (push (list (concat "__sep_" date-str)
+                            (vector "" "" (propertize sep-line 'face 'bold) "" "" "" "" ""))
+                      raw-entries))
+              (setq prev-date date-str))
+            (push (list task-id
+                        (vector checked
+                                (org-auto-scheduler--project-dot proj-trunc)
+                                display-headline time-str dur-str
+                                colored-proj colored-score stat-str))
+                  raw-entries)))))
     (nreverse raw-entries)))
 
 (defun org-auto-scheduler-review-recalculate ()
@@ -2378,7 +2459,8 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (org-auto-scheduler--build-agenda-cache)
       (setq org-auto-scheduler-completed-tasks '())
       (dolist (item ordered-tasks)
-        (let* ((task (cdr item))
+        (let* ((checked-state (car item))
+               (task (cdr item))
                (marker (nth 7 task))
                (depth (nth 8 task))
                (task-project (org-with-point-at marker
@@ -2386,8 +2468,12 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
           (when (or (not (equal task-project previous-project)) (null task-project))
             (setq current-time (org-auto-scheduler-get-start-time))
             (setq previous-project task-project))
-          (setq current-time
-                (org-auto-scheduler-schedule-single-task marker current-time depth)))))
+          (if (string= checked-state "[ ]")
+              (push (list (nth 0 task) current-time current-time '("AUTOSCH") nil (nth 5 task)
+                          "SKIPPED" marker (or depth 0) :skipped '("Unchecked by user"))
+                    org-auto-scheduler-completed-tasks)
+            (setq current-time
+                  (org-auto-scheduler-schedule-single-task marker current-time depth)))))
     (let ((check-map (make-hash-table :test 'equal)))
       (dolist (item ordered-tasks)
         (puthash (nth 0 (cdr item)) (car item) check-map))
@@ -2396,14 +2482,13 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
         (dolist (entry new-entries)
           (let ((saved (gethash (car entry) check-map)))
             (when saved (aset (cadr entry) 0 saved))))
-        (setq tabulated-list-entries new-entries)
-        (org-auto-scheduler--assign-project-colors new-entries)))
+        (setq tabulated-list-entries new-entries)))
     (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))
     (setq tabulated-list-sort-key nil)
     (tabulated-list-print t)
     (setq header-line-format
           (org-auto-scheduler--review-header-line tabulated-list-entries))
-    (message "Recalculation complete!")))
+    (message "Recalculation complete!"))))
 
 (defun org-auto-scheduler-review-refresh (&rest _args)
   "Recalculate the auto-schedule from scratch, resetting the view."
@@ -2484,7 +2569,6 @@ Automatically recalculates dependent times based on visual layout before executi
       (setq org-auto-scheduler--review-undo-stack nil)
       (setq tabulated-list-entries (org-auto-scheduler--build-review-entries
                                     org-auto-scheduler-completed-tasks))
-      (org-auto-scheduler--assign-project-colors tabulated-list-entries)
       (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))
       (tabulated-list-print t)
       (setq header-line-format
