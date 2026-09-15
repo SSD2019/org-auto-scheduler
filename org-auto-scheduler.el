@@ -2212,6 +2212,26 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
             (cl-subseq org-auto-scheduler--review-undo-stack 0
                        org-auto-scheduler--review-undo-max)))))
 
+(defsubst org-auto-scheduler--review-special-row-p (id)
+  "Return t if ID represents a non-task row (day separator or header shortcuts)."
+  (and id (string-prefix-p "__" id)))
+
+(defun org-auto-scheduler--tabulated-list-printer (id cols)
+  "Custom printer to render full-width day separators and header shortcut banner."
+  (cond
+   ((and (stringp id) (string= id "__header_shortcuts"))
+    (let ((beg (point)))
+      (insert (aref cols 2) "
+")
+      (put-text-property beg (point) 'tabulated-list-id id)))
+   ((and (stringp id) (string-prefix-p "__sep_" id))
+    (let ((beg (point)))
+      (insert "  " (aref cols 2) "
+")
+      (put-text-property beg (point) 'tabulated-list-id id)))
+   (t
+    (tabulated-list-print-entry id cols))))
+
 (defun org-auto-scheduler--review-header-line (entries)
   "Build the `header-line-format' string from ENTRIES."
   (let ((total 0) (hours 0.0) (projects (make-hash-table :test 'equal))
@@ -2220,12 +2240,11 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
     (dolist (e entries)
       (let* ((vec (cadr e))
              (id (car e)))
-        (unless (string-prefix-p "__sep_" (or id ""))
+        (unless (org-auto-scheduler--review-special-row-p id)
           (cl-incf total)
           (let* ((dur-str (aref vec 4))
                  (dur (string-to-number dur-str))
-                 (proj (aref vec 5))
-                 (time-str (aref vec 3)))
+                 (proj (aref vec 5)))
             (setq hours (+ hours (/ dur 60.0)))
             (when (and proj (not (string= proj "—")))
               (puthash proj (1+ (gethash proj projects 0)) projects))
@@ -2246,7 +2265,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                                        'face `(:foreground ,color))
                                    (format " %s(%d)" name count))))))
                projects)
-      (let ((legend (format " %d tasks │ %.1fh │ %d today │%s   [RET]=toggle [K/J]=reorder [r]=recalc [x]=apply [c]=calendar [?]=help"
+      (let ((legend (format " %d tasks │ %.1fh │ %d today │%s"
                             total hours today-count proj-legend)))
         (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
@@ -2306,16 +2325,41 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 (with-eval-after-load 'evil
   (dolist (state '(normal motion))
     (evil-define-key state org-auto-scheduler-review-mode-map
-      (kbd "RET") #'org-auto-scheduler-review-toggle
-      (kbd "m")   #'org-auto-scheduler-review-toggle
-      (kbd "x")   #'org-auto-scheduler-review-execute
-      (kbd "K")   #'org-auto-scheduler-review-move-up
-      (kbd "J")   #'org-auto-scheduler-review-move-down
-      (kbd "r")   #'org-auto-scheduler-review-recalculate
-      (kbd "R")   #'org-auto-scheduler-review-refresh
-      (kbd "u")   #'org-auto-scheduler-review-undo
-      (kbd "c")   #'org-auto-scheduler-review-toggle-calendar
-      (kbd "?")   #'org-auto-scheduler-review-help)))
+      ;; Core operations
+      (kbd "RET")     #'org-auto-scheduler-review-toggle
+      (kbd "TAB")     #'org-auto-scheduler-review-jump
+      (kbd "SPC")     #'org-auto-scheduler-review-toggle
+      (kbd "m")       #'org-auto-scheduler-review-toggle
+      (kbd "x")       #'org-auto-scheduler-review-execute
+      (kbd "C-c C-c") #'org-auto-scheduler-review-execute
+      ;; Reordering
+      (kbd "K")       #'org-auto-scheduler-review-move-up
+      (kbd "J")       #'org-auto-scheduler-review-move-down
+      (kbd "U")       #'org-auto-scheduler-review-move-up
+      (kbd "D")       #'org-auto-scheduler-review-move-down
+      ;; Recalculate / Refresh / Undo
+      (kbd "r")       #'org-auto-scheduler-review-recalculate
+      (kbd "C-c C-r") #'org-auto-scheduler-review-recalculate
+      (kbd "R")       #'org-auto-scheduler-review-refresh
+      (kbd "u")       #'org-auto-scheduler-review-undo
+      ;; What-if
+      (kbd "e")       #'org-auto-scheduler-review-edit-effort
+      ;; Views
+      (kbd "c")       #'org-auto-scheduler-review-toggle-calendar
+      (kbd "v")       #'org-auto-scheduler-review-toggle-calendar
+      ;; Filters
+      (kbd "f t")     #'org-auto-scheduler-review-filter-today
+      (kbd "f p")     #'org-auto-scheduler-review-filter-project
+      (kbd "f a")     #'org-auto-scheduler-review-filter-clear
+      (kbd "/")       #'org-auto-scheduler-review-filter-regexp
+      ;; Bulk operations
+      (kbd "* a")     #'org-auto-scheduler-review-mark-all
+      (kbd "* n")     #'org-auto-scheduler-review-unmark-all
+      (kbd "* t")     #'org-auto-scheduler-review-mark-today
+      (kbd "* p")     #'org-auto-scheduler-review-mark-project
+      (kbd "* %")     #'org-auto-scheduler-review-mark-regexp
+      ;; Help
+      (kbd "?")       #'org-auto-scheduler-review-help)))
 
 (define-derived-mode org-auto-scheduler-review-mode tabulated-list-mode "AutoSch-Review"
   "Major mode for reviewing proposed auto-scheduled tasks before applying them."
@@ -2331,25 +2375,30 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (setq tabulated-list-sort-key nil)  ; We sort chronologically ourselves in --build-review-entries
   (setq-local revert-buffer-function #'org-auto-scheduler-review-refresh-revert)
   (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
+  (setq-local tabulated-list-printer #'org-auto-scheduler--tabulated-list-printer)
   (tabulated-list-init-header))
 
 (defun org-auto-scheduler-review-toggle ()
-  "Toggle the apply checkmark for the task at point."
+  "Toggle the apply checkmark for the task at point.
+In calendar view, jumps to the task at point instead."
   (interactive)
-  (let* ((id (tabulated-list-get-id))
-         (entry (tabulated-list-get-entry)))
-    (when (and entry id (not (string-prefix-p "__sep_" id)))
-      (org-auto-scheduler--review-push-undo)
-      (aset entry 0 (if (string= (aref entry 0) "[X]") "[ ]" "[X]"))
-      (tabulated-list-print t)
-      (forward-line 1))))
+  (if (eq org-auto-scheduler--review-view 'calendar)
+      (org-auto-scheduler-review-jump)
+    (let* ((id (tabulated-list-get-id))
+           (entry (tabulated-list-get-entry)))
+      (when (and entry id (not (org-auto-scheduler--review-special-row-p id)))
+        (org-auto-scheduler--review-push-undo)
+        (aset entry 0 (if (string= (aref entry 0) "[X]") "[ ]" "[X]"))
+        (tabulated-list-print t)
+        (forward-line 1)))))
 
 (defun org-auto-scheduler-review-jump ()
   "Jump to the original Org task from the review buffer."
   (interactive)
-  (let ((task-id (tabulated-list-get-id)))
-    (when (and task-id (string-prefix-p "__sep_" task-id))
-      (user-error "This is a day separator, not a task"))
+  (let ((task-id (or (tabulated-list-get-id)
+                     (get-text-property (point) 'task-id))))
+    (when (and task-id (org-auto-scheduler--review-special-row-p task-id))
+      (user-error "This is a header/separator line, not a task"))
     (if task-id
         (let ((marker (org-id-find task-id t)))
           (if marker
@@ -2366,7 +2415,8 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (let* ((id1 (tabulated-list-get-id))
          (id2 (save-excursion (forward-line -1) (tabulated-list-get-id))))
     (when (and id1 id2
-               (not (string-prefix-p "__sep_" id1)))
+               (not (org-auto-scheduler--review-special-row-p id1))
+               (not (org-auto-scheduler--review-special-row-p id2)))
       (org-auto-scheduler--review-push-undo)
       (let* ((entry1 (tabulated-list-get-entry))
              (entry2 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
@@ -2384,12 +2434,12 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   "Move the current task down in the review list."
   (interactive)
   (let ((current-id (tabulated-list-get-id)))
-    (when (and current-id (not (string-prefix-p "__sep_" current-id)))
+    (when (and current-id (not (org-auto-scheduler--review-special-row-p current-id)))
       (save-excursion
         (forward-line 1)
         (when (not (eobp))
           (let ((id2 (tabulated-list-get-id)))
-            (when id2
+            (when (and id2 (not (org-auto-scheduler--review-special-row-p id2)))
               (org-auto-scheduler--review-push-undo)
               (let* ((entry1 (save-excursion (forward-line -1) (tabulated-list-get-entry)))
                      (entry2 (tabulated-list-get-entry))
@@ -2505,7 +2555,10 @@ TASKS are sorted chronologically by start time before display."
                                 display-headline time-str dur-str
                                 colored-proj colored-score stat-str))
                   raw-entries)))))
-    (nreverse raw-entries)))
+    (cons (list "__header_shortcuts"
+                (vector "" "" (propertize "  [RET]=toggle  [K/J]=reorder  [r]=recalc  [x]=apply  [v/c]=calendar  [?]=help" 'face 'shadow)
+                        "" "" "" "" ""))
+          (nreverse raw-entries))))
 
 (defun org-auto-scheduler-review-recalculate ()
   "Recalculate scheduled times based on visual order without resorting."
@@ -2518,7 +2571,7 @@ TASKS are sorted chronologically by start time before display."
         (let* ((task-id (tabulated-list-get-id))
                (entry (tabulated-list-get-entry))
                (checked-state (if entry (aref entry 0) "[X]"))
-               (data (and task-id (not (string-prefix-p "__sep_" task-id))
+               (data (and task-id (not (org-auto-scheduler--review-special-row-p task-id))
                           (assoc task-id org-auto-scheduler-completed-tasks))))
           (when data (push (cons checked-state data) ordered-tasks)))
         (forward-line 1)))
@@ -2583,7 +2636,7 @@ Automatically recalculates dependent times based on visual layout before executi
         (let* ((task-id (tabulated-list-get-id))
                (entry (tabulated-list-get-entry))
                (checked (and entry (string= (aref entry 0) "[X]"))))
-          (when (and checked task-id (not (string-prefix-p "__sep_" task-id)))
+          (when (and checked task-id (not (org-auto-scheduler--review-special-row-p task-id)))
             (let* ((data (assoc task-id org-auto-scheduler-completed-tasks)))
               (when data
                 (let* ((schedule-string (nth 6 data))
@@ -2666,7 +2719,7 @@ Automatically recalculates dependent times based on visual layout before executi
       (dolist (e org-auto-scheduler--review-all-entries)
         (let* ((id (car e))
                (vec (cadr e)))
-          (when (or (string-prefix-p "__sep_" id)
+          (when (or (org-auto-scheduler--review-special-row-p id)
                     (funcall org-auto-scheduler--review-active-filter id vec))
             (push e filtered))))
       (let ((cleaned nil) (prev-is-sep nil))
@@ -2736,7 +2789,7 @@ Automatically recalculates dependent times based on visual layout before executi
   (org-auto-scheduler--review-push-undo)
   (dolist (e tabulated-list-entries)
     (let ((id (car e)) (vec (cadr e)))
-      (unless (string-prefix-p "__sep_" id)
+      (unless (org-auto-scheduler--review-special-row-p id)
         (aset vec 0 "[X]")
         (aset vec 2 (substring-no-properties (aref vec 2))))))
   (tabulated-list-print t))
@@ -2747,7 +2800,7 @@ Automatically recalculates dependent times based on visual layout before executi
   (org-auto-scheduler--review-push-undo)
   (dolist (e tabulated-list-entries)
     (let ((id (car e)) (vec (cadr e)))
-      (unless (string-prefix-p "__sep_" id)
+      (unless (org-auto-scheduler--review-special-row-p id)
         (aset vec 0 "[ ]")
         (aset vec 2 (propertize (substring-no-properties (aref vec 2)) 'face 'shadow)))))
   (tabulated-list-print t))
@@ -2792,7 +2845,7 @@ Automatically recalculates dependent times based on visual layout before executi
     (org-auto-scheduler--review-push-undo)
     (dolist (e tabulated-list-entries)
       (let ((id (car e)) (vec (cadr e)))
-        (when (and (not (string-prefix-p "__sep_" id))
+        (when (and (not (org-auto-scheduler--review-special-row-p id))
                    (string-match-p regexp (substring-no-properties (aref vec 2))))
           (aset vec 0 "[X]")
           (aset vec 2 (substring-no-properties (aref vec 2))))))
@@ -2803,7 +2856,7 @@ Automatically recalculates dependent times based on visual layout before executi
   (interactive "nNew effort in minutes: ")
   (let* ((id (tabulated-list-get-id))
          (entry (tabulated-list-get-entry)))
-    (if (or (null id) (string-prefix-p "__sep_" id))
+    (if (or (null id) (org-auto-scheduler--review-special-row-p id))
         (user-error "Not on a task")
       (org-auto-scheduler--review-push-undo)
       (puthash id (plist-put (gethash id org-auto-scheduler--review-overrides) :effort new-effort)
@@ -2836,7 +2889,7 @@ Automatically recalculates dependent times based on visual layout before executi
     (erase-buffer)
     (setq header-line-format
           (concat " " (propertize "Auto Scheduler Calendar View" 'face 'bold)
-                  " │ [v] Table View │ [TAB/RET] Jump to task │ Scroll to navigate"))
+                  " │ [v/c] Table View │ [TAB/RET] Jump to task │ Scroll to navigate"))
     (insert (propertize " Proposed Schedule Calendar View \n" 'face 'org-document-title))
     (insert (propertize "========================================================\n\n" 'face 'shadow))
     (if (null tasks)
@@ -2879,10 +2932,16 @@ Automatically recalculates dependent times based on visual layout before executi
                              (proj-trunc (org-auto-scheduler--truncate project-name 18))
                              (color (and org-auto-scheduler--project-colors
                                          (gethash proj-trunc org-auto-scheduler--project-colors)))
-                             (bar-char (propertize "█" 'face (if color `(:foreground ,color) 'default))))
-                        (insert bar-char " ")
+                             (bar-char (propertize "█" 'face (if color `(:foreground ,color) 'default)
+                                                   'task-id task-id
+                                                   'mouse-face 'highlight
+                                                   'help-echo "RET/TAB to jump to task")))
+                        (insert bar-char (propertize " " 'task-id task-id))
                         (if (equal task-id last-printed-task-id)
-                            (insert (propertize "║" 'face (if color `(:foreground ,color) 'shadow)))
+                            (insert (propertize "║" 'face (if color `(:foreground ,color) 'shadow)
+                                                'task-id task-id
+                                                'mouse-face 'highlight
+                                                'help-echo "RET/TAB to jump to task"))
                           (setq last-printed-task-id task-id)
                           (let ((start-lbl (format-time-string "%H:%M" (nth 1 active-task)))
                                 (end-lbl (format-time-string "%H:%M" (nth 2 active-task))))
