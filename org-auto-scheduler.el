@@ -3382,6 +3382,18 @@ If NO-DISPLAY is non-nil, suppresses the graphical output."
           (display-buffer (current-buffer))))
       (message "Schedule scored: %.1f%% adherence calculated for %s." score score-date))))
 
+;;;###autoload
+(defun org-auto-scheduler-adherence-report (&optional date-str)
+  "Display the full adherence report buffer for DATE-STR (defaults to today).
+Calculates schedule adherence against the morning snapshot and displays the
+adherence report buffer."
+  (interactive
+   (list (when current-prefix-arg
+           (let ((prompt-date (org-read-date nil nil nil "Adherence report for date: ")))
+             (when prompt-date
+               (format-time-string "%Y-%m-%d" (org-time-string-to-time prompt-date)))))))
+  (org-auto-scheduler-score-schedule date-str))
+
 (defun org-auto-scheduler-get-adherence-streak ()
   "Calculate current adherence streak (> 80% score)."
   (let ((streak 0)
