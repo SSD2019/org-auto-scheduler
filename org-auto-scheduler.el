@@ -1,4 +1,38 @@
 ;;; org-auto-scheduler.el --- Auto task scheduler for Org -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2024-2026 SSD2019
+
+;; Author: SSD2019 <santosh.dayapule@gmail.com>
+;; URL: https://github.com/SSD2019/org-auto-scheduler
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1") (log4e "0.3.0"))
+;; Keywords: org, calendar, convenience
+;; License: GPL-3.0-or-later
+
+;; This file is not part of GNU Emacs.
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Org Auto Scheduler automatically scores tasks by priority, deadline,
+;; effort, state, and category; topologically sorts them via
+;; dependency-aware Kahn's algorithm; and packs them into available time
+;; windows while respecting time blocks, repeater conflicts, and blockers.
+
+;;; Code:
+
 (require 'org)
 (require 'cl-lib)
 (require 'org-id)
@@ -3792,3 +3826,5 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
   (message "Org Auto Scheduler adherence score disabled in mode line."))
 
 (provide 'org-auto-scheduler)
+
+;;; org-auto-scheduler.el ends here
