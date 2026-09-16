@@ -1,0 +1,6 @@
+<resources>
+    <color name="bg_app">#14161a</color>
+    <color name="bg_surface">#1d2128</color>
+    <color name="accent_blue">#61afef</color>
+    <color name="accent_green">#98c379</color>
+</resources>

@@ -160,6 +160,8 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
 | =org-auto-scheduler-adherence-mode-line-disable=    | Remove adherence score from the mode line.                                                 |
 | =org-auto-scheduler-adherence-generate=             | Regenerate adherence scores for all available snapshot dates.                               |
+| =org-auto-scheduler-server-start= ⭐                | Start local HTTP bridge server for mobile/Android app access.                               |
+| =org-auto-scheduler-server-stop=                    | Stop the local HTTP bridge server.                                                          |
 
 **** Backward-compatible aliases
 
@@ -167,6 +169,54 @@ M-x org-auto-scheduler-adherence-report
 |----------------------------------------------+--------------------------------------------------|
 | =org-auto-scheduler-show-habit-projections=  | =org-auto-scheduler-show-repeater-projections=   |
 | =org-auto-scheduler-clear-habit-cache=       | =org-auto-scheduler-clear-repeater-cache=        |
+
+
+** 📱 Android Mobile App & Emacs Server Bridge
+<<android-mobile-app>>
+
+Org Auto Scheduler includes a feature-complete Android mobile application and local Emacs HTTP bridge server, allowing you to manage your schedule from your phone or tablet on your local Wi-Fi or Tailscale/Wireguard VPN.
+
+*** Features at a Glance:
+- *Agenda Timeline:* View scheduled tasks, effort estimates, and fixed calendar events.
+- *Quick Agenda Bump:* Single-tap bump (+15m, +30m, +1h) to cascade-push today's remaining tasks when work runs overtime.
+- *Interactive Review & Apply:* Full mobile recreation of the Emacs review buffer:
+  - Toggle =[X]= / =[ ]= apply marks.
+  - Touch reordering (Move Up, Move Down, Move Day forward/backward).
+  - Inline / Modal What-If Effort editing and recalculation.
+  - Bulk actions (mark all, unmark all, mark today, filter today).
+  - Dependency blocker violation alerts and safe apply.
+  - One-tap *Apply Schedule* to update your Org files directly.
+- *Task Property Editor (Bottom Sheet):*
+  - Modify effort estimates with quick presets (15m, 30m, 45m, 1h, 1.5h, 2h, custom).
+  - Select TODO states (dynamically loaded from your Emacs configuration).
+  - Set priorities ([#A], [#B], [#C]), scheduled dates, and deadlines.
+  - Add/remove tags (=AUTOSCH=, =buffertime=, etc.).
+  - Edit properties drawer (=NOT_BEFORE=, =BLOCKER=, =DEPENDS_ON=, =RECURRING=, custom).
+  - Live task clocking (Clock In / Clock Out) and "Open Task in Emacs" jump.
+- *Schedule Adherence:* Capture morning snapshots and view adherence streaks directly on your phone.
+
+*** Starting the Server:
+
+From Emacs:
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-server-start
+#+end_src
+
+Or from the command line:
+#+begin_src shell
+python3 server/org_auto_scheduler_server.py --port 8989 --host 0.0.0.0
+#+end_src
+
+*** Connecting from Android:
+
+1. *Instant PWA Install (Recommended):*
+   - Connect your phone to the same Wi-Fi or Tailscale network.
+   - Open =http://<your-computer-ip>:8989= in Chrome or Brave on Android.
+   - Tap the browser menu and select *Install App* or *Add to Home Screen*.
+   - The app runs in full-screen standalone mode with native haptics, dark theme, and offline shell caching.
+
+2. *Native Android Studio Project:*
+   - The =android/= directory contains a complete Gradle wrapper project ready to build an APK via Android Studio or =./gradlew assembleDebug=.
 
 ** How Tasks Are Selected
 

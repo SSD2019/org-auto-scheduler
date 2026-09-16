@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.OrgAutoScheduler" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@color/bg_surface</item>
+        <item name="android:navigationBarColor">@color/bg_surface</item>
+        <item name="android:windowBackground">@color/bg_app</item>
+    </style>
+</resources>

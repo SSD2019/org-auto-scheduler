@@ -1,0 +1,18 @@
+{
+  "name": "Org Auto Scheduler",
+  "short_name": "OrgScheduler",
+  "description": "Mobile Android companion for Org Mode automated task scheduling and review",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#16181d",
+  "theme_color": "#1f232a",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

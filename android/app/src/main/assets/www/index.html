@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1d2128">
+  <title>Org Auto Scheduler</title>
+  
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icons/icon.svg">
+  <link rel="stylesheet" href="./css/app.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <img src="./icons/icon.svg" alt="Logo" class="brand-icon">
+        <h1 class="brand-title">Org <span>Auto Scheduler</span></h1>
+      </div>
+      <div class="header-actions">
+        <div class="connection-pill" id="connection-pill" title="Server Connection Status">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Connecting...</span>
+        </div>
+        <button class="icon-btn" id="header-refresh-btn" title="Refresh" aria-label="Refresh">🔄</button>
+        <button class="icon-btn" id="header-settings-btn" title="Settings" aria-label="Settings">⚙️</button>
+      </div>
+    </header>
+
+    <!-- Views Container -->
+    <main class="views-container">
+      <!-- 1. AGENDA VIEW -->
+      <section id="view-agenda" class="view active">
+        <!-- Date Navigator -->
+        <div class="date-navigator">
+          <div class="date-controls">
+            <button class="nav-arrow-btn" id="prev-day-btn" aria-label="Previous day">&lt;</button>
+            <span class="current-date-label" id="current-date-label">Today</span>
+            <button class="nav-arrow-btn" id="next-day-btn" aria-label="Next day">&gt;</button>
+          </div>
+          <button class="today-chip" id="today-chip-btn">TODAY</button>
+        </div>
+
+        <!-- Quick Actions Toolbar -->
+        <div class="quick-toolbar">
+          <button class="action-chip-btn warning" id="quick-bump-day-btn">
+            ⏩ Bump (+30m)
+          </button>
+          <button class="action-chip-btn primary" id="quick-run-scheduler-btn">
+            ⚡ Run Scheduler
+          </button>
+          <button class="action-chip-btn success" id="quick-new-task-btn" onclick="openNewTaskModal()">
+            ＋ New Task
+          </button>
+        </div>
+
+        <!-- Dynamic Agenda Cards -->
+        <div id="agenda-cards-container">
+          <div style="text-align:center; padding: 40px; color: var(--text-muted);">
+            Connecting to Emacs...
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. REVIEW & APPLY VIEW -->
+      <section id="view-review" class="view">
+        <!-- Review Summary Stats -->
+        <div class="review-stats-card">
+          <div class="stat-item">
+            <div class="stat-val" id="review-stat-total">0</div>
+            <div class="stat-label">Total Tasks</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-val" style="color: var(--color-green);" id="review-stat-checked">0</div>
+            <div class="stat-label">Marked [X]</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-val" style="color: var(--color-yellow);" id="review-stat-warns">0</div>
+            <div class="stat-label">Warnings</div>
+          </div>
+        </div>
+
+        <!-- Review Action Bar -->
+        <div class="review-action-bar">
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <button class="action-chip-btn primary" id="review-recalc-btn">
+              🔄 Recalculate (r)
+            </button>
+            <button class="action-chip-btn" id="review-mark-all-btn">
+              ✓ All (* a)
+            </button>
+            <button class="action-chip-btn" id="review-unmark-all-btn">
+              ✗ Clear (* n)
+            </button>
+            <button class="action-chip-btn" id="review-mark-today-btn">
+              ☀️ Today (* t)
+            </button>
+            <button class="action-chip-btn" id="review-filter-today-btn">
+              🔍 Filter Today
+            </button>
+            <button class="action-chip-btn" id="review-filter-clear-btn">
+              ❌ Clear Filter
+            </button>
+            <button class="action-chip-btn" id="review-undo-btn">
+              ↩️ Undo (u)
+            </button>
+            <button class="action-chip-btn" id="review-refresh-btn">
+              🔃 Discard/Refresh (R)
+            </button>
+          </div>
+        </div>
+
+        <!-- Review Entries List -->
+        <div id="review-entries-container">
+          <div style="text-align:center; padding: 40px; color: var(--text-muted);">
+            No preview generated yet.
+          </div>
+        </div>
+
+        <!-- Sticky Apply Button -->
+        <div class="apply-button-bar">
+          <button class="big-apply-btn" id="big-apply-review-btn">
+            🚀 Apply Schedule to Org Files (x)
+          </button>
+        </div>
+      </section>
+
+      <!-- 3. TASKS BACKLOG VIEW -->
+      <section id="view-tasks" class="view">
+        <div style="margin-bottom: 14px; display:flex; gap:8px;">
+          <input type="text" id="backlog-search-input" class="form-input" style="flex:1;" placeholder="Search schedulable tasks..." oninput="filterBacklog(this.value)">
+          <button class="btn btn-primary" style="flex:0 0 auto; width:auto; padding: 10px 14px;" onclick="openNewTaskModal()">＋ Task</button>
+        </div>
+        <div id="backlog-list-container">
+          <div style="text-align:center; padding: 40px; color: var(--text-muted);">
+            Loading tasks...
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. ADHERENCE VIEW -->
+      <section id="view-adherence" class="view">
+        <div class="adherence-card">
+          <div class="score-circle">
+            <span class="val" id="adherence-score-val">--%</span>
+            <span class="label">Adherence</span>
+          </div>
+          <div style="font-size: 1.1rem; font-weight: 800; color: #fff; margin-bottom: 4px;">
+            Current Streak: <span style="color: var(--color-yellow);" id="adherence-streak-val">-- Days</span>
+          </div>
+          <div style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 20px;">
+            Based on morning planned snapshots vs actual completed tasks.
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <button class="btn btn-primary" id="take-snapshot-btn">
+              📸 Take Morning Snapshot
+            </button>
+            <button class="btn btn-secondary" onclick="loadAdherence(); showToast('Scoring schedule adherence...', '📊');">
+              📊 Refresh Adherence Score
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Navigation -->
+    <nav class="bottom-nav" id="bottom-nav">
+      <div class="nav-item active" data-view="agenda">
+        <span class="nav-item-icon">📅</span>
+        <span class="nav-item-label">Agenda</span>
+      </div>
+      <div class="nav-item" data-view="review">
+        <span class="nav-item-icon">⚡</span>
+        <span class="nav-item-label">Review & Apply</span>
+      </div>
+      <div class="nav-item" data-view="tasks">
+        <span class="nav-item-icon">📋</span>
+        <span class="nav-item-label">Backlog</span>
+      </div>
+      <div class="nav-item" data-view="adherence">
+        <span class="nav-item-icon">🏆</span>
+        <span class="nav-item-label">Adherence</span>
+      </div>
+    </nav>
+
+    <!-- MODAL: TASK PROPERTY EDITOR -->
+    <div class="modal-overlay" id="task-editor-modal">
+      <div class="bottom-sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header">
+          <h2 class="sheet-title">Edit Task Properties</h2>
+          <button class="icon-btn" onclick="closeTaskEditor()" aria-label="Close">✕</button>
+        </div>
+        <div class="sheet-content">
+          <input type="hidden" id="edit-task-id">
+
+          <!-- Headline -->
+          <div class="form-group">
+            <label class="form-label" for="edit-headline">Task Headline</label>
+            <input type="text" id="edit-headline" class="form-input" placeholder="Task title">
+          </div>
+
+          <!-- TODO State -->
+          <div class="form-group">
+            <label class="form-label">TODO State</label>
+            <div class="chip-grid" id="edit-todo-chips">
+              <!-- Dynamically rendered -->
+            </div>
+          </div>
+
+          <!-- Priority -->
+          <div class="form-group">
+            <label class="form-label">Priority</label>
+            <div class="chip-grid" id="edit-priority-chips">
+              <!-- Dynamically rendered -->
+            </div>
+          </div>
+
+          <!-- Effort Estimate -->
+          <div class="form-group">
+            <label class="form-label" for="edit-effort">Estimated Effort (H:MM or minutes)</label>
+            <input type="text" id="edit-effort" class="form-input" placeholder="0:30">
+            <div class="chip-grid" id="editor-effort-presets" style="margin-top:6px;">
+              <div class="selectable-chip" data-effort="0:15">15m</div>
+              <div class="selectable-chip" data-effort="0:30">30m</div>
+              <div class="selectable-chip" data-effort="0:45">45m</div>
+              <div class="selectable-chip" data-effort="1:00">1h</div>
+              <div class="selectable-chip" data-effort="1:30">1.5h</div>
+              <div class="selectable-chip" data-effort="2:00">2h</div>
+              <div class="selectable-chip" data-effort="3:00">3h</div>
+            </div>
+          </div>
+
+          <!-- Scheduled Timestamp -->
+          <div class="form-group">
+            <label class="form-label" for="edit-scheduled">Scheduled Timestamp</label>
+            <input type="text" id="edit-scheduled" class="form-input" placeholder="<YYYY-MM-DD Day HH:MM-HH:MM>">
+          </div>
+
+          <!-- Deadline Timestamp -->
+          <div class="form-group">
+            <label class="form-label" for="edit-deadline">Deadline Timestamp</label>
+            <input type="text" id="edit-deadline" class="form-input" placeholder="<YYYY-MM-DD Day>">
+          </div>
+
+          <!-- Tags -->
+          <div class="form-group">
+            <label class="form-label" for="edit-tags">Tags (space separated)</label>
+            <input type="text" id="edit-tags" class="form-input" placeholder="AUTOSCH work urgent">
+          </div>
+
+          <!-- Properties Drawer Section -->
+          <div style="border-top: 1px solid var(--border-subtle); padding-top: 12px; margin-top: 4px;">
+            <div style="font-size: 0.8rem; font-weight: 700; color: var(--color-blue); margin-bottom: 10px;">
+              ⚡ Org Auto Scheduler Properties
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="edit-not-before">NOT_BEFORE (Earliest Allowed Date/Time)</label>
+              <input type="text" id="edit-not-before" class="form-input" placeholder="<2026-04-01 Wed 10:00>">
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="edit-blocker">BLOCKER / DEPENDS_ON (Task IDs)</label>
+              <input type="text" id="edit-blocker" class="form-input" placeholder="space separated org-ids">
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="edit-recurring">RECURRING Frequency</label>
+              <select id="edit-recurring" class="form-input" style="background-color: var(--bg-input);">
+                <option value="">None</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="bi-weekly">Bi-weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Quick Jump in Emacs -->
+          <button class="btn btn-secondary" style="margin-top: 6px;" onclick="jumpActiveTaskInEmacs()">
+            🎯 Open Task in Emacs
+          </button>
+        </div>
+
+        <div class="sheet-footer">
+          <button class="btn btn-secondary" onclick="closeTaskEditor()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveTaskProperties()">Save to Org</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: BUMP AGENDA -->
+    <div class="modal-overlay" id="bump-modal">
+      <div class="bottom-sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header">
+          <h2 class="sheet-title">Bump Today's Schedule</h2>
+          <button class="icon-btn" onclick="closeBumpModal()" aria-label="Close">✕</button>
+        </div>
+        <div class="sheet-content">
+          <input type="hidden" id="bump-task-id">
+          <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 12px;">
+            Push this task and all subsequent AUTOSCH tasks forward when running overtime.
+          </p>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <button class="btn btn-secondary" onclick="executeBump(15)">⏩ Push forward 15 minutes</button>
+            <button class="btn btn-primary" onclick="executeBump(30)">⏩ Push forward 30 minutes</button>
+            <button class="btn btn-secondary" onclick="executeBump(45)">⏩ Push forward 45 minutes</button>
+            <button class="btn btn-secondary" onclick="executeBump(60)">⏩ Push forward 1 hour</button>
+            <button class="btn btn-secondary" onclick="executeBump(90)">⏩ Push forward 1.5 hours</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: WHAT-IF EFFORT EDIT -->
+    <div class="modal-overlay" id="effort-modal">
+      <div class="bottom-sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header">
+          <h2 class="sheet-title">Edit Effort (What-If Planning)</h2>
+          <button class="icon-btn" onclick="closeWhatIfEffortModal()" aria-label="Close">✕</button>
+        </div>
+        <div class="sheet-content">
+          <input type="hidden" id="whatif-task-id">
+          <p style="color: var(--text-muted); font-size: 0.85rem;">
+            Test different task durations in preview mode without modifying the original Org file until applied.
+          </p>
+          <div class="form-group">
+            <label class="form-label" for="whatif-effort-input">New Effort Duration</label>
+            <input type="text" id="whatif-effort-input" class="form-input" placeholder="e.g. 0:45 or 45m">
+          </div>
+          <div class="chip-grid">
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='0:15'">15m</div>
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='0:30'">30m</div>
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='0:45'">45m</div>
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='1:00'">1h</div>
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='1:30'">1.5h</div>
+            <div class="selectable-chip" onclick="document.getElementById('whatif-effort-input').value='2:00'">2h</div>
+          </div>
+        </div>
+        <div class="sheet-footer">
+          <button class="btn btn-secondary" onclick="closeWhatIfEffortModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitWhatIfEffort()">Recalculate</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: NEW TASK -->
+    <div class="modal-overlay" id="new-task-modal">
+      <div class="bottom-sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header">
+          <h2 class="sheet-title">Create New Task</h2>
+          <button class="icon-btn" onclick="closeNewTaskModal()" aria-label="Close">✕</button>
+        </div>
+        <div class="sheet-content">
+          <div class="form-group">
+            <label class="form-label" for="new-task-heading">Heading / Title</label>
+            <input type="text" id="new-task-heading" class="form-input" placeholder="What needs to be done?">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="new-task-effort">Effort (e.g. 0:30)</label>
+            <input type="text" id="new-task-effort" class="form-input" value="0:30">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="new-task-priority">Priority</label>
+            <select id="new-task-priority" class="form-input" style="background-color: var(--bg-input);">
+              <option value="">None</option>
+              <option value="A">High [#A]</option>
+              <option value="B" selected>Medium [#B]</option>
+              <option value="C">Low [#C]</option>
+            </select>
+          </div>
+        </div>
+        <div class="sheet-footer">
+          <button class="btn btn-secondary" onclick="closeNewTaskModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitCreateTask()">Create Task</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: SERVER SETTINGS -->
+    <div class="modal-overlay" id="settings-modal">
+      <div class="bottom-sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header">
+          <h2 class="sheet-title">Connection & Settings</h2>
+          <button class="icon-btn" onclick="closeSettingsModal()" aria-label="Close">✕</button>
+        </div>
+        <div class="sheet-content">
+          <div class="form-group">
+            <label class="form-label" for="setting-server-url">Emacs Bridge Server URL</label>
+            <input type="url" id="setting-server-url" class="form-input" placeholder="http://192.168.1.50:8989">
+            <span style="font-size: 0.72rem; color: var(--text-muted);">
+              Enter your laptop/PC IP on your Wi-Fi or Tailscale VPN.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="setting-server-token">API Token (Optional)</label>
+            <input type="password" id="setting-server-token" class="form-input" placeholder="Leave blank if not set">
+          </div>
+        </div>
+        <div class="sheet-footer">
+          <button class="btn btn-secondary" onclick="closeSettingsModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveServerSettings()">Save & Reconnect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./js/api.js"></script>
+  <script src="./js/app.js"></script>
+  <script>
+    function openNewTaskModal() {
+      document.getElementById('new-task-modal').classList.add('active');
+    }
+    function closeNewTaskModal() {
+      document.getElementById('new-task-modal').classList.remove('active');
+    }
+    async function submitCreateTask() {
+      const heading = document.getElementById('new-task-heading').value.trim();
+      const effort = document.getElementById('new-task-effort').value.trim();
+      const priority = document.getElementById('new-task-priority').value;
+      if (!heading) return;
+
+      closeNewTaskModal();
+      showToast('Creating task in Org...', '⏳');
+      try {
+        await window.api.createTask({ heading, effort, priority, tags: ['AUTOSCH'] });
+        showToast('Task created successfully!', '✅');
+        loadAgenda();
+      } catch (err) {
+        showToast(err.message, '❌');
+      }
+    }
+    function filterBacklog(query) {
+      const q = (query || '').toLowerCase();
+      document.querySelectorAll('#backlog-list-container .task-card').forEach(card => {
+        const text = card.textContent.toLowerCase();
+        card.style.display = text.includes(q) ? 'flex' : 'none';
+      });
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f232a"/>
+      <stop offset="100%" stop-color="#111317"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#61afef"/>
+      <stop offset="100%" stop-color="#98c379"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#282c34"/>
+      <stop offset="100%" stop-color="#21252b"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- App Background with rounded squircle -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="12" y="12" width="488" height="488" rx="100" fill="none" stroke="#61afef" stroke-width="4" stroke-opacity="0.3"/>
+  
+  <!-- Calendar Body -->
+  <rect x="96" y="120" width="320" height="280" rx="28" fill="url(#card)" stroke="#3e4451" stroke-width="6"/>
+  
+  <!-- Calendar Header Bar -->
+  <path d="M 96 148 C 96 132.536 108.536 120 124 120 L 388 120 C 403.464 120 416 132.536 416 148 L 416 190 L 96 190 Z" fill="#61afef"/>
+  
+  <!-- Binder Rings -->
+  <rect x="156" y="94" width="28" height="52" rx="14" fill="#abb2bf"/>
+  <rect x="328" y="94" width="28" height="52" rx="14" fill="#abb2bf"/>
+  
+  <!-- Calendar Grid Lines / Task Bars -->
+  <rect x="136" y="220" width="130" height="20" rx="10" fill="#98c379"/>
+  <circle cx="370" cy="230" r="14" fill="#e5c07b"/>
+  
+  <rect x="136" y="265" width="200" height="20" rx="10" fill="#61afef"/>
+  <circle cx="370" cy="275" r="14" fill="#98c379"/>
+  
+  <rect x="136" y="310" width="160" height="20" rx="10" fill="#c678dd"/>
+  <circle cx="370" cy="320" r="14" fill="#e06c75"/>
+  
+  <rect x="136" y="355" width="210" height="20" rx="10" fill="#56b6c2"/>
+  
+  <!-- Fast Spark / Auto Lightning Badge -->
+  <circle cx="380" cy="380" r="64" fill="#21252b" stroke="#98c379" stroke-width="6"/>
+  <path d="M 386 336 L 354 382 L 382 382 L 374 424 L 408 376 L 382 376 Z" fill="#98c379"/>
+</svg>

@@ -44,6 +44,7 @@
 (require 'org-clock)
 (require 'calendar)
 (require 'tabulated-list)
+(require 'org-auto-scheduler-server nil t)
 
 
 

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Org Auto Scheduler</string>
+    <string name="default_server_url">http://10.0.2.2:8989</string>
+</resources>
