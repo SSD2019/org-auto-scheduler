@@ -34,7 +34,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 
 - *Smart Scoring:* Multi-factor scoring (priority, deadline urgency, effort, category, state).
 - *Dependency-Aware Sorting:* Topological sort via Kahn's algorithm respects =BLOCKER= / =DEPENDS_ON= chains.
-- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules before applying.
+- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules alongside existing fixed calendar events before applying.
 - *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
@@ -264,12 +264,16 @@ buffer.
 |-------------+--------------------------------------+--------------------------------------------------------------------------------|
 | =SPC= / =m= | =review-toggle=                      | Toggle the =[X]= / =[ ]= apply mark and advance one line.                      |
 | =TAB= / =RET=| =review-jump=                       | Open the original Org task in another window.                                  |
-| =U= / =p=   | =review-move-up=                     | Move the current task up in the list (manually reorder).                       |
-| =D= / =n=   | =review-move-down=                   | Move the current task down in the list (manually reorder).                     |
-| =r= / =C-c C-r=| =review-recalculate=               | Recalculate proposed times from the *current visual order*, without resorting. |
+| =U= / =p= / =K= | =review-move-up=                 | Move current task up in the list (crosses day separators into previous day).  |
+| =D= / =n= / =J= | =review-move-down=               | Move current task down in the list (crosses day separators into next day).    |
+| =>= / =+= / =M-down= | =review-move-day-forward=    | Move current task to next scheduled day (skips excluded days).                |
+| =<= / =-= / =M-up=   | =review-move-day-backward=   | Move current task to previous scheduled day (cannot move into past).          |
+| =d=             | =review-move-to-date=            | Move task to a specific date (interactive prompt via =org-read-date=).        |
+| =r= / =C-c C-r=| =review-recalculate=               | Recalculate proposed times from visual order (auto-compacts into earlier slots; =C-u r= keeps day sections). |
 | =R=         | =review-refresh=                     | Discard and re-run the full scheduler from scratch (picks up Org file changes).|
 | =u=         | =review-undo=                        | Undo the last modification (toggle, reorder, effort edit, mark, or filter).   |
 | =e=         | =review-edit-effort=                 | Edit estimated effort of task at point in-memory (What-If planning).           |
+| =E=         | =review-toggle-agenda-events=        | Toggle showing existing fixed agenda/calendar events in review list.           |
 | =v=         | =review-toggle-calendar=             | Toggle between the Column Table and the multi-day Chronological Calendar View. |
 | =x= / =C-c C-c=| =review-execute=                   | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
 | =?=         | =review-help=                        | Show help buffer detailing all review commands.                                |
