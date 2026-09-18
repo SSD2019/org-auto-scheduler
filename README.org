@@ -19,6 +19,12 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#how-scoring-works][How Scoring Works]]
 - [[#how-sorting-works][How Sorting Works]]
 - [[#review-and-apply-buffer][Review & Apply Buffer]]
+  - [[#dual-views-table-and-calendar][Dual Views: Table & Calendar]]
+  - [[#fixed-agenda-events-and-non-blocking-tasks][Fixed Agenda Events & Non-Blocking Tasks]]
+  - [[#persistent-review-decisions-and-state-file][Persistent Review Decisions & State File]]
+  - [[#smart-restore--merge][Smart Restore & Merge]]
+  - [[#multi-instance-and-file-synchronization][Multi-Instance & File Synchronization]]
+  - [[#review-keybindings][Review Keybindings]]
 - [[#schedule-adherence-tracking][Schedule Adherence Tracking]]
 - [[#background-scheduling][Background Scheduling]]
 - [[#historical-effort-tracking][Historical Effort Tracking]]
@@ -26,6 +32,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#recurring-tasks][Recurring Tasks]]
 - [[#agenda-bump][Agenda Bump]]
 - [[#customization-reference][Customization Reference]]
+  - [[#review-buffer-and-state-file-settings][Review Buffer & State-File Settings]]
 - [[#debugging][Debugging]]
 - [[#contributing][Contributing]]
 - [[#license][License]]
@@ -34,7 +41,9 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 
 - *Smart Scoring:* Multi-factor scoring (priority, deadline urgency, effort, category, state).
 - *Dependency-Aware Sorting:* Topological sort via Kahn's algorithm respects =BLOCKER= / =DEPENDS_ON= chains.
-- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules alongside existing fixed calendar events before applying.
+- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules with dual Column Table and 15-minute chronological Calendar timeline views.
+- *Non-Blocking Calendar Support:* Mark fixed events as non-blocking (=🔓=) so tasks can be scheduled concurrently in those time windows.
+- *Persistent Review Decisions & State File:* Save custom orderings, skipped tasks, and target dates across sessions with automatic multi-instance sync and smart restore-and-merge.
 - *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
@@ -86,12 +95,21 @@ Add to your Emacs configuration:
 #+begin_src emacs-lisp
 (global-set-key (kbd "C-c a s") #'org-auto-scheduler-schedule-tasks)
 (global-set-key (kbd "C-c a r") #'org-auto-scheduler-review-and-apply)
+(global-set-key (kbd "C-c a d") #'org-auto-scheduler-dispatch)
 #+end_src
 
 ** ⚡ Key Commands
 <<key-commands>>
 
 These are the most important interactive commands you will use day-to-day.
+
+*** 🧭 =M-x org-auto-scheduler-dispatch=
+
+Open the *command dispatch menu* (uses =transient= when installed, falling back to a lightweight interactive prompt). From here you can trigger scheduling, preview review, save/restore review decisions, score adherence, bump tasks, or toggle non-blocking events with single keystrokes.
+
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-dispatch
+#+end_src
 
 *** 🗓️ =M-x org-auto-scheduler-schedule-tasks=
 
@@ -103,7 +121,7 @@ M-x org-auto-scheduler-schedule-tasks
 
 *** 🔍 =M-x org-auto-scheduler-review-and-apply=
 
-Preview the proposed schedule in the *interactive review buffer* before applying. You can toggle tasks on/off, reorder them, and recalculate times — then press =x= to apply.
+Preview the proposed schedule in the *interactive review buffer* before applying. You can toggle tasks on/off, reorder them across days, toggle non-blocking calendar events, inspect the visual timeline, and recalculate times — then press =x= to apply.
 
 #+begin_src emacs-lisp
 M-x org-auto-scheduler-review-and-apply
@@ -146,6 +164,12 @@ M-x org-auto-scheduler-adherence-report
 |-----------------------------------------------------+--------------------------------------------------------------------------------------------|
 | =org-auto-scheduler-schedule-tasks= ⭐              | Run full scheduler, apply timestamps immediately.                                          |
 | =org-auto-scheduler-review-and-apply= ⭐            | Preview schedule in interactive review buffer.                                             |
+| =org-auto-scheduler-dispatch= ⭐                    | Open interactive command menu (Transient UI for quick dispatch).                          |
+| =org-auto-scheduler-review-save-decisions=          | Persist current review order, skips, target dates, and non-blocking state to state file.  |
+| =org-auto-scheduler-review-restore-and-merge=       | Restore saved review decisions and merge with live Org modifications.                      |
+| =org-auto-scheduler-clear-saved-decisions=          | Clear saved review decisions (all, skipped, order, non-blocking, or task at point).        |
+| =org-auto-scheduler-toggle-non-blocking=           | Toggle non-blocking status for task/event at point across Org, Agenda, Review, or Calendar. |
+| =org-auto-scheduler-agenda-toggle-non-blocking=     | Toggle non-blocking status for the agenda item at point (=C-c C-x n= in Org Agenda).       |
 | =org-auto-scheduler-snapshot-schedule= ⭐            | Snapshot today's planned tasks for adherence tracking.                                     |
 | =org-auto-scheduler-score-schedule= ⭐              | Score adherence against the morning snapshot.                                               |
 | =org-auto-scheduler-adherence-report= ⭐            | Display full adherence report buffer.                                                       |
@@ -240,43 +264,124 @@ Circular dependencies are detected; cyclic tasks are appended at the end with
 a depth marker of 99 as a warning signal.
 
 ** Review & Apply Buffer
+<<review-and-apply-buffer>>
 
-=M-x org-auto-scheduler-review-and-apply= runs the scheduler in *preview mode*
+=M-x org-auto-scheduler-review-and-apply= (or =C-c a r=) runs the scheduler in *preview mode*
 (nothing is written to your Org files) and opens the =*Org Auto Scheduler Review*=
 buffer.
 
-*** Buffer columns
+The review buffer lets you inspect proposed schedules, move tasks between slots and days,
+toggle fixed calendar events as non-blocking, preview the schedule in a visual 15-minute calendar
+timeline, and save decisions across sessions.
 
-| Column      | Description                                                    |
-|-------------+----------------------------------------------------------------|
-| =Apply=     | =[X]= means the task will be applied; =[ ]= means skip.        |
-| =●=         | Color-coded dot representing the project.                      |
-| =Task Name= | Headline (flat visual list; project colors define identity).   |
-| =Time=      | Calculated schedule string (e.g., =Mon 09:15 – 10:45=).         |
-| =Duration=  | Task duration in minutes (annotated with =[?]= if estimated).  |
-| =Project=   | Human-readable project name.                                   |
-| =Score=     | Composite scheduling score.                                    |
-| =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed).  |
+*** Dual Views: Table and Calendar
+<<dual-views-table-and-calendar>>
 
-*** Keybindings
+Switch between the two visual modes anytime by pressing =v= or =c=:
 
-| Key         | Command                              | Action                                                                         |
-|-------------+--------------------------------------+--------------------------------------------------------------------------------|
-| =SPC= / =m= | =review-toggle=                      | Toggle the =[X]= / =[ ]= apply mark and advance one line.                      |
-| =TAB= / =RET=| =review-jump=                       | Open the original Org task in another window.                                  |
-| =U= / =p= / =K= | =review-move-up=                 | Move current task up in the list (crosses day separators into previous day).  |
-| =D= / =n= / =J= | =review-move-down=               | Move current task down in the list (crosses day separators into next day).    |
-| =>= / =+= / =M-down= | =review-move-day-forward=    | Move current task to next scheduled day (skips excluded days).                |
-| =<= / =-= / =M-up=   | =review-move-day-backward=   | Move current task to previous scheduled day (cannot move into past).          |
-| =d=             | =review-move-to-date=            | Move task to a specific date (interactive prompt via =org-read-date=).        |
-| =r= / =C-c C-r=| =review-recalculate=               | Recalculate proposed times from visual order (auto-compacts into earlier slots; =C-u r= keeps day sections). |
-| =R=         | =review-refresh=                     | Discard and re-run the full scheduler from scratch (picks up Org file changes).|
-| =u=         | =review-undo=                        | Undo the last modification (toggle, reorder, effort edit, mark, or filter).   |
-| =e=         | =review-edit-effort=                 | Edit estimated effort of task at point in-memory (What-If planning).           |
-| =E=         | =review-toggle-agenda-events=        | Toggle showing existing fixed agenda/calendar events in review list.           |
-| =v=         | =review-toggle-calendar=             | Toggle between the Column Table and the multi-day Chronological Calendar View. |
-| =x= / =C-c C-c=| =review-execute=                   | Recalculate, then apply all =[X]= tasks and close the buffer.                  |
-| =?=         | =review-help=                        | Show help buffer detailing all review commands.                                |
+**** 1. Column Table View (Default)
+A structured list grouped by day with day header statistics (e.g. =─── Today (Monday, 2026-09-21) [3h 45m planned] ───=):
+
+| Column      | Description                                                                                          |
+|-------------+------------------------------------------------------------------------------------------------------|
+| =Apply=     | =[X]= means the task will be applied; =[ ]= means skip.                                              |
+| =●=         | Color-coded dot representing the project. Fixed events show =📅= (blocking) or =🔓= (non-blocking).   |
+| =Task Name= | Headline (flat visual list; project colors define identity).                                         |
+| =Time=      | Calculated schedule string (e.g., =Mon 09:15 – 10:45=).                                               |
+| =Duration=  | Task duration in minutes (annotated with =[?]= if estimated).                                        |
+| =Project=   | Human-readable project name or tag badge for calendar events.                                       |
+| =Score=     | Composite scheduling score (=—= for fixed calendar events).                                          |
+| =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking), =🔓= (non-blocking).   |
+
+**** 2. Chronological Calendar View (=v= / =c=)
+Pressing =v= or =c= transforms the buffer into an ASCII/Unicode 15-minute multi-day visual calendar:
+- Vertical timeline with 15-minute slots: =09:00=, =09:15=, =09:30=, etc.
+- Task blocks rendered with colored bar characters (=█=) and continuation lines (=║=).
+- Project badge and time range clearly visible: =[Work] Deploy API (09:15–10:45)=.
+- Interactive jumping: press =RET= or =TAB= on any task or event in the calendar to jump directly to its Org headline.
+- Concurrent non-blocking events rendered side-by-side on the same line (=█ [Proj] Task  │ 🔓 Team Sync=).
+
+*** Fixed Agenda Events and Non-Blocking Tasks
+<<fixed-agenda-events-and-non-blocking-tasks>>
+
+By default, existing scheduled tasks or timestamps in your agenda files that do *not* have the =AUTOSCH= tag are treated as *fixed agenda events*.
+- You can toggle showing or hiding these events in the review buffer by pressing =E=.
+- *Blocking Events (=🔒= / =📅=):* By default, fixed events block auto-scheduler slots. No tasks will be placed during their scheduled window.
+- *Non-Blocking Events (=🔓=):* Many calendar events (such as all-hands meetings, webinars, optional office hours, or background listening sessions) do not require exclusive focus. Marking an event as *non-blocking* tells the scheduler that this time slot remains available for scheduling work.
+
+**** How to Toggle Non-Blocking Status:
+- *In the Review Buffer:* Move point to the fixed event row and press =b= (or =SPC= / =m=). The icon changes from =📅= / =🔒= to =🔓= =[NB]=.
+  - Press =r= to immediately recalculate the schedule; auto-scheduler will pack tasks into the freed time window!
+- *In Org Agenda:* Move point to any non-AUTOSCH event and press =C-c C-x n= (or =C-c C-x N=).
+- *Universal Command:* Call =M-x org-auto-scheduler-toggle-non-blocking= from any buffer (Org file headline, Agenda, Review, or Calendar).
+
+Non-blocking states are automatically stored according to =org-auto-scheduler-non-blocking-backend= (by default in both the review state file and the =AUTOSCH_NON_BLOCKING= Org headline property).
+
+*** Persistent Review Decisions and State File
+<<persistent-review-decisions-and-state-file>>
+
+When organizing a full week, you often make careful manual adjustments in the review buffer:
+reordering tasks (=U= / =D=), deferring items to specific days (=d=, =>=, =<=), skipping tasks (=SPC= / =m=),
+or toggling non-blocking events (=b=).
+
+Org Auto Scheduler persists these review decisions so you never lose your manual planning:
+- *State File Location:* Saved to =org-auto-scheduler-review-state-file= (defaults to =~/.emacs.d/org-auto-scheduler-review-state.el=).
+- *Automatic Persistence:* When applying with =x= (=org-auto-scheduler-review-execute=), all decisions are saved automatically (controlled by =org-auto-scheduler-review-auto-save-decisions=, default =t=). State is also saved cleanly when exiting Emacs via =kill-emacs-hook=.
+- *Manual Save:* Press =S= or =C-c C-s= (=org-auto-scheduler-review-save-decisions=) anytime in the review buffer.
+- *Clearing Saved Decisions:* Press =C= or =C-c C-d= (=org-auto-scheduler-clear-saved-decisions=) to reset decisions. You can choose to clear:
+  - =all=: Clear all custom orders, skips, target dates, and non-blocking marks.
+  - =skipped=: Reset only skip flags (unskips all tasks).
+  - =order=: Reset only manual ordering back to default score-based order.
+  - =non-blocking=: Reset all non-blocking marks back to blocking events.
+  - =task=: Clear saved decisions for the specific task at point.
+
+*** Smart Restore & Merge
+<<smart-restore--merge>>
+
+If you edit Org files during the day (adding new tasks, changing TODO states, or checking off items), you can press =M= or =C-c C-m= (=org-auto-scheduler-review-restore-and-merge=).
+
+Rather than wiping out your manual schedule or creating inconsistencies, the merge algorithm:
+1. *Preserves Manual Order:* Retains your custom task order and day placements for all active tasks.
+2. *Prunes Completed Tasks:* Automatically removes tasks marked =DONE= or deleted from your files.
+3. *Sibling Outline Interpolation:* Newly added tasks are slotted next to their outline siblings based on tree position.
+4. *Score & Project Anchoring:* If a new task has no outline siblings in the queue, it is placed near existing tasks of the same project according to its priority/deadline score.
+5. *Smart Un-skip:* If a task was previously skipped in review, but you changed its TODO keyword to =NEXT= or gave it a manual schedule timestamp, it is automatically un-skipped.
+
+*** Multi-Instance and File Synchronization
+<<multi-instance-and-file-synchronization>>
+
+If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via Git, Syncthing, Dropbox, or iCloud) or have background idle scheduling active:
+- *External Modification Detection:* =org-auto-scheduler= tracks the state file's file-system modification time (=mtime=).
+- *Automatic Two-Way Reconciliation:* Before saving or loading, if the file on disk is newer than the in-memory timestamp, it parses the disk changes and merges them with in-memory decisions.
+- *Timestamp-Based Conflict Resolution:* Each task decision carries an internal =:updated-at= timestamp. Newer decisions supersede older ones on a per-task basis, preventing accidental clobbering or dropped tasks.
+
+*** Review Keybindings
+<<review-keybindings>>
+
+| Key                   | Command                                      | Action                                                                         |
+|-----------------------+----------------------------------------------+--------------------------------------------------------------------------------|
+| =SPC= / =m=           | =review-toggle=                              | Toggle =[X]= / =[ ]= apply mark (or toggle non-blocking on fixed event).        |
+| =b=                   | =review-toggle-non-blocking=                 | Toggle non-blocking status of fixed agenda event at point.                     |
+| =TAB= / =RET=         | =review-jump=                                | Open the original Org task or agenda event in another window.                  |
+| =x= / =C-c C-c=       | =review-execute=                             | Recalculate, persist decisions, apply =[X]= tasks to Org files, and close.     |
+| =U= / =p= / =K=       | =review-move-up=                             | Move current task up in list (crosses day separators into previous day).       |
+| =D= / =n= / =J=       | =review-move-down=                           | Move current task down in list (crosses day separators into next day).         |
+| =>= / =+= / =M-down=  | =review-move-day-forward=                    | Move current task to next scheduled day (skips excluded days).                 |
+| =<= / =-= / =M-up=    | =review-move-day-backward=                   | Move current task to previous scheduled day (cannot move into past).           |
+| =d=                   | =review-move-to-date=                        | Move task to a specific date (interactive prompt via =org-read-date=).         |
+| =r= / =C-c C-r=       | =review-recalculate=                         | Recalculate times from visual order (compacts into gaps; =C-u r= keeps days).   |
+| =R=                   | =review-refresh=                             | Discard in-memory edits and re-run full scheduler from Org files.              |
+| =S= / =C-c C-s=       | =review-save-decisions=                      | Explicitly persist ordering, skipping, and non-blocking decisions to file.     |
+| =M= / =C-c C-m=       | =review-restore-and-merge=                   | Restore previous review queue and intelligently merge live Org modifications.  |
+| =C= / =C-c C-d=       | =org-auto-scheduler-clear-saved-decisions=   | Clear saved decisions (=all=, =skipped=, =order=, =non-blocking=, or =task=).  |
+| =u=                   | =review-undo=                                | Undo last modification (toggle, reorder, effort edit, mark, or filter).        |
+| =e=                   | =review-edit-effort=                         | Edit estimated effort of task at point in-memory (What-If scenario planning).  |
+| =E=                   | =review-toggle-agenda-events=                | Toggle showing existing fixed agenda/calendar events in review list.            |
+| =v= / =c=             | =review-toggle-calendar=                     | Toggle between Column Table view and multi-day Chronological Calendar View.    |
+| =?=                   | =review-help=                                | Show interactive help buffer detailing all review commands.                   |
+
+**** Evil / Spacemacs Compatibility
+All review mode keybindings (including =K=, =J=, =U=, =D=, =b=, =c=, =v=, =S=, =M=, =C=, and prefix keys =f= and =*=) are natively bound in Evil's =normal= and =motion= states, ensuring seamless modal editing without key collisions.
 
 *** Filtering Commands (Prefix: =f= or =/=)
 
@@ -293,8 +398,7 @@ buffer.
 - =* p= : Mark all tasks belonging to a specific project.
 - =* %= : Mark all tasks matching a regular expression.
 
-*Note:* Pressing =x= always re-calculates times from the current visual order
-before writing, so you never need to press =r= first.
+*Note:* Pressing =x= always recalculates times from the current visual order before writing to Org files, so you never need to manually press =r= before applying.
 
 ** Schedule Adherence Tracking
 
@@ -574,6 +678,40 @@ Backward-compatible aliases:
 | Variable                            | Default | Description                                                     |
 |-------------------------------------+---------+-----------------------------------------------------------------|
 | =org-auto-scheduler-sync-caldav=    | =t=     | Sync via =org-caldav= before and after applying a full schedule.|
+
+*** Review Buffer & State-File Settings
+<<review-buffer-and-state-file-settings>>
+
+| Variable                                        | Default                                         | Description                                                                                     |
+|-------------------------------------------------+-------------------------------------------------+-------------------------------------------------------------------------------------------------|
+| =org-auto-scheduler-review-state-file=          | =~/.emacs.d/org-auto-scheduler-review-state.el= | File for persisting manual review decisions (order rankings, skips, dates, non-blocking tasks). |
+| =org-auto-scheduler-review-persistence-backend= | ='state-file=                                   | Storage backend for review decisions: ='state-file=, ='org-properties=, or ='both=.             |
+| =org-auto-scheduler-review-auto-save-decisions= | =t=                                             | Automatically save review decisions upon applying (=x=) or exiting Emacs.                       |
+| =org-auto-scheduler-order-property=             | ="AUTOSCH_ORDER"=                               | Org property name for task order rankings when using Org properties backend.                   |
+| =org-auto-scheduler-skip-property=              | ="AUTOSCH_SKIP"=                                | Org property name for task skip flags when using Org properties backend.                       |
+| =org-auto-scheduler-target-date-property=       | ="AUTOSCH_TARGET_DATE"=                         | Org property name for task target date overrides when using Org properties backend.            |
+| =org-auto-scheduler-non-blocking-property=      | ="AUTOSCH_NON_BLOCKING"=                        | Headline property name for non-blocking calendar tasks (="t"=, ="yes"=, ="true"=, ="1"=).        |
+| =org-auto-scheduler-non-blocking-backend=       | ='both=                                         | Storage backend for non-blocking status: ='both=, ='state-file=, or ='org-properties=.          |
+| =org-auto-scheduler-review-show-agenda-events=  | =t=                                             | Display existing fixed calendar/agenda events in the review buffer.                            |
+| =org-auto-scheduler-review-compact-schedule=    | =t=                                             | When non-nil, recalculation auto-compacts tasks into earlier available slots across days.       |
+| =org-auto-scheduler-review-dim-future-days=     | =nil=                                           | When non-nil, dims tasks on future days using shadow face (=nil= keeps vibrant colors).         |
+
+Example configuration:
+
+#+begin_src emacs-lisp
+;; Custom location for review decisions state file
+(setq org-auto-scheduler-review-state-file "~/.config/emacs/review-state.el")
+
+;; Persist review decisions to both state file and Org properties (for git sync)
+(setq org-auto-scheduler-review-persistence-backend 'both)
+
+;; Store non-blocking marks in both state file and Org property drawers (default)
+(setq org-auto-scheduler-non-blocking-backend 'both)
+
+;; Keep day sections strictly separated during recalculation (no compacting into earlier days)
+;; Note: you can invert this per-run using C-u r
+;; (setq org-auto-scheduler-review-compact-schedule nil)
+#+end_src
 
 ** Debugging
 
