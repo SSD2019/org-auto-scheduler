@@ -30,9 +30,11 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#historical-effort-tracking][Historical Effort Tracking]]
 - [[#repeater--habit-integration][Repeater / Habit Integration]]
 - [[#recurring-tasks][Recurring Tasks]]
+- [[#splittable-tasks--multi-day-placeholders][Splittable Tasks & Multi-Day Placeholders]]
 - [[#agenda-bump][Agenda Bump]]
 - [[#customization-reference][Customization Reference]]
   - [[#review-buffer-and-state-file-settings][Review Buffer & State-File Settings]]
+  - [[#splittable-task-settings][Splittable Task Settings]]
 - [[#debugging][Debugging]]
 - [[#contributing][Contributing]]
 - [[#license][License]]
@@ -44,6 +46,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules with dual Column Table and 15-minute chronological Calendar timeline views.
 - *Non-Blocking Calendar Support:* Mark fixed events as non-blocking (=🔓=) so tasks can be scheduled concurrently in those time windows.
 - *Persistent Review Decisions & State File:* Save custom orderings, skipped tasks, and target dates across sessions with automatic multi-instance sync and smart restore-and-merge.
+- *Splittable Tasks & Multi-Day Placeholders:* Tasks tagged =:SPLITTABLE:= schedule today's available chunk and pin temporary placeholder subtasks across subsequent days for remaining effort. Preserves clocked time into parent tasks, syncs with CalDAV/Google Calendar, and auto-cleans each morning.
 - *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
@@ -180,6 +183,7 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-show-repeater-projections=      | Display projected repeater/habit occurrences.                                              |
 | =org-auto-scheduler-clear-repeater-cache=           | Invalidate the repeater-projections cache.                                                 |
 | =org-auto-scheduler-bump-agenda=                    | Push the agenda item at point and all subsequent AUTOSCH tasks forward by N minutes.       |
+| =org-auto-scheduler-cleanup-placeholders=           | Clean up temporary placeholder subtasks and migrate any clock lines to parent tasks.       |
 | =org-auto-scheduler-validate-config=                | Verify configuration consistency.                                                          |
 | =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
 | =org-auto-scheduler-adherence-mode-line-disable=    | Remove adherence score from the mode line.                                                 |
@@ -197,7 +201,8 @@ M-x org-auto-scheduler-adherence-report
 A task is eligible for scheduling when it has:
 - The =AUTOSCH= tag, *and*
 - A TODO state that appears as a key in =org-auto-scheduler-state-weights=, *and*
-- Does *not* carry the =ARCHIVE= tag.
+- Does *not* carry the =ARCHIVE= tag, *and*
+- Does *not* carry the =AUTOSCH_PLACEHOLDER= tag or property (placeholders are managed automatically).
 
 Tasks blocked by incomplete =BLOCKER= / =DEPENDS_ON= dependencies are skipped unless all blocking tasks have already been scheduled in the current session.
 
@@ -209,6 +214,8 @@ These properties go inside the task's =:PROPERTIES:= drawer.
 |---------------------------+-------------------------------------------------+------------------------------------------------------------------------------------|
 | =NOT_BEFORE=              | Org timestamp (e.g. =<2025-06-01 Sun 09:00>=)  | Earliest allowed scheduling time for this task.                                    |
 | =RECURRING=               | =daily= / =weekly= / =bi-weekly= / =monthly=   | Creates sub-task instances for each upcoming occurrence.                           |
+| =SPLITTABLE=              | =t= / =yes=                                     | Allows task to be split across days if remaining effort exceeds available time.    |
+| =MIN_CHUNK=               | Integer (minutes)                               | Minimum duration required for today's slice of a splittable task (default: 30).    |
 | =BLOCKER=                 | Space-separated org-id strings                  | This task won't be scheduled before all listed tasks are DONE or scheduled.        |
 | =DEPENDS_ON=              | Space-separated org-id strings                  | Alias for =BLOCKER=. Both properties are combined.                                 |
 | =INHERITED_PRIORITY=      | Integer                                         | Adds a flat bonus to the task's priority score. Inherited from parent headings.    |
@@ -223,6 +230,12 @@ These properties go inside the task's =:PROPERTIES:= drawer.
   :NOT_BEFORE: <2026-04-01 Wed 10:00>
   :BLOCKER:   abc123-id-of-review-task
   :Effort:    1:30
+  :END:
+
+* TODO Long Architecture Proposal :AUTOSCH:SPLITTABLE:
+  :PROPERTIES:
+  :Effort:    4:00
+  :MIN_CHUNK: 45
   :END:
 #+end_src
 
@@ -514,7 +527,49 @@ Combine with =NOT_BEFORE= to set the earliest first occurrence:
   :NOT_BEFORE: <2026-04-01 Wed 09:00>
   :Effort:   2:00
   :END:
+** Splittable Tasks & Multi-Day Placeholders
+<<splittable-tasks--multi-day-placeholders>>
+
+When a large task has more remaining effort than fits in an available time window, standard scheduling normally pushes the entire task to the next open gap or next day. By marking a task as splittable, ~org-auto-scheduler~ slices the task into *Rolling Chunks*:
+1. *Initial Slice:* The parent task itself is scheduled for the first available window (down to a configurable minimum chunk, default 30 minutes).
+2. *Intra-Day & Subsequent Day Placeholders:* Any remaining effort is pinned into subsequent available slots—first consuming any later open windows on the same day (e.g. after an afternoon meeting or event until end of day), and then rolling over to subsequent days as temporary child subtasks (e.g. =** TODO Task Name (Remaining)= or =Part 1=, =Part 2=).
+
+*** Enabling Splittable Tasks
+
+You can mark a task as splittable with the =:SPLITTABLE:= tag or property:
+
+#+begin_src org
+* TODO Deep Research & Architecture Document :AUTOSCH:SPLITTABLE:
+  :PROPERTIES:
+  :Effort: 4:00
+  :MIN_CHUNK: 45
+  :END:
 #+end_src
+
+- Tag =:SPLITTABLE:= (or property =:SPLITTABLE: t=) marks the task as splittable.
+- =:MIN_CHUNK:= (optional) specifies the minimum minutes required to schedule a slice (defaults to =org-auto-scheduler-split-min-chunk=, 30m). If an available slot is smaller than this minimum chunk, the task skips that gap and seeks the next available slot meeting the minimum chunk threshold.
+
+*** Intra-Day & Multi-Day Rolling Split
+
+- *Intra-Day Splitting:* If you have a task of 4 hours, and your morning has 2 hours before a lunch meeting (12:00–13:00) followed by free time from 13:00 to 18:00:
+  - The parent task is scheduled from 10:00 to 12:00.
+  - A placeholder subtask =** TODO Task Name (Remaining)= is scheduled from 13:00 to 15:00 on the same day.
+- *Multi-Day Rolling Split:* If today has only 90 minutes remaining before the end of your workday:
+  - Today's slice schedules the main headline for the available 90 minutes.
+  - If tomorrow has only 60 minutes available, a subtask =** TODO Task Name (Remaining) Part 1= is pinned for 60 minutes tomorrow.
+  - The remaining effort continues to be pinned across subsequent days as =** TODO Task Name (Remaining) Part 2=, etc., until the entire task effort is accounted for.
+
+*** CalDAV & Calendar Sync
+
+Placeholder subtasks are generated as regular Org subheadings with their own unique =:ID:= properties and =SCHEDULED= timestamps, and do *not* carry the =:noexport:= tag. This ensures that external calendar sync tools like =org-caldav= or Google Calendar will cleanly sync all parts so your schedule is visible across all devices.
+
+*** Morning Sweep & Safeguards
+
+Placeholder subtasks are completely ephemeral:
+- *Automatic Cleanup:* Whenever you run =org-auto-scheduler-schedule-tasks= or open the Review buffer, all existing placeholder tasks across your agenda files are automatically swept and recalculated based on actual clocked time and latest availability.
+- *Clock Entry Safeguard:* If you clocked in on a temporary placeholder subtask, its =:LOGBOOK:= entries are preserved and migrated automatically to the parent task before the placeholder is removed.
+- *Completion Sync:* If you marked a placeholder subtask =DONE=, the parent task is automatically marked =DONE=.
+- *Manual Cleanup:* You can also run =M-x org-auto-scheduler-cleanup-placeholders= or press =k= in the dispatch menu (=M-x org-auto-scheduler-dispatch=) anytime.
 
 ** Agenda Bump
 
@@ -616,6 +671,18 @@ Same format as time blocks, but these are preferences, not hard constraints.
 |-----------------------------------------------+--------------------------+---------------------------------------------------------|
 | =org-auto-scheduler-inherited-priority-property= | ="INHERITED_PRIORITY"= | Property name used to add a flat priority bonus.        |
 | =org-auto-scheduler-scheduled-property=          | ="AUTOSCH_SCHEDULED"=  | Property set on tasks after they are scheduled.         |
+
+*** Splittable Task Settings
+<<splittable-task-settings>>
+
+| Variable                                | Default                 | Description                                                                 |
+|-----------------------------------------+-------------------------+-----------------------------------------------------------------------------|
+| =org-auto-scheduler-splittable-tag=     | ="SPLITTABLE"=          | Tag marking a task as eligible for split scheduling across days.            |
+| =org-auto-scheduler-split-property=     | ="SPLITTABLE"=          | Property name marking a task as eligible for split scheduling.              |
+| =org-auto-scheduler-split-min-chunk=    | =30=                    | Minimum duration (in minutes) to schedule for a split task slice today.     |
+| =org-auto-scheduler-min-chunk-property= | ="MIN_CHUNK"=           | Property name specifying per-task minimum chunk duration in minutes.        |
+| =org-auto-scheduler-placeholder-tag=   | ="AUTOSCH_PLACEHOLDER"= | Tag assigned to temporary next-day/subsequent placeholder subtasks.         |
+| =org-auto-scheduler-placeholder-suffix= | ="(Remaining)"=         | Suffix appended to parent task headline for placeholder subtasks.           |
 
 *** Files & Weights
 <<file-weights>>
