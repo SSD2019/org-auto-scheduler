@@ -44,7 +44,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Smart Scoring:* Multi-factor scoring (priority, deadline urgency, effort, category, state).
 - *Dependency-Aware Sorting:* Topological sort via Kahn's algorithm respects =BLOCKER= / =DEPENDS_ON= chains.
 - *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules with dual Column Table and 15-minute chronological Calendar timeline views.
-- *Non-Blocking Calendar Support:* Mark fixed events as non-blocking (=🔓=) so tasks can be scheduled concurrently in those time windows.
+- *Non-Blocking Calendar Support:* Mark fixed events as non-blocking so tasks can be scheduled concurrently in those time windows.
 - *Persistent Review Decisions & State File:* Save custom orderings, skipped tasks, and target dates across sessions with automatic multi-instance sync and smart restore-and-merge.
 - *Splittable Tasks & Multi-Day Placeholders:* Tasks tagged =:SPLITTABLE:= schedule today's available chunk and pin temporary placeholder subtasks across subsequent days for remaining effort. Preserves clocked time into parent tasks, syncs with CalDAV/Google Calendar, and auto-cleans each morning.
 - *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
@@ -216,6 +216,8 @@ These properties go inside the task's =:PROPERTIES:= drawer.
 | =RECURRING=               | =daily= / =weekly= / =bi-weekly= / =monthly=   | Creates sub-task instances for each upcoming occurrence.                           |
 | =SPLITTABLE=              | =t= / =yes=                                     | Allows task to be split across days if remaining effort exceeds available time.    |
 | =MIN_CHUNK=               | Integer (minutes)                               | Minimum duration required for today's slice of a splittable task (default: 30).    |
+| =PINNABLE=                | =t= / =yes=                                     | Marks task as pinnable to a specific time during review reordering.                |
+| =PINNED_TIME=             | =HH:MM= or =YYYY-MM-DD HH:MM=                   | Pinned start time (allows exceeding day hours, splits at midnight if needed).     |
 | =BLOCKER=                 | Space-separated org-id strings                  | This task won't be scheduled before all listed tasks are DONE or scheduled.        |
 | =DEPENDS_ON=              | Space-separated org-id strings                  | Alias for =BLOCKER=. Both properties are combined.                                 |
 | =INHERITED_PRIORITY=      | Integer                                         | Adds a flat bonus to the task's priority score. Inherited from parent headings.    |
@@ -298,13 +300,13 @@ A structured list grouped by day with day header statistics (e.g. =─── Tod
 | Column      | Description                                                                                          |
 |-------------+------------------------------------------------------------------------------------------------------|
 | =Apply=     | =[X]= means the task will be applied; =[ ]= means skip.                                              |
-| =●=         | Color-coded dot representing the project. Fixed events show =📅= (blocking) or =🔓= (non-blocking).   |
+| =●=         | Color-coded dot representing the project. Fixed events show =📅=.                                    |
 | =Task Name= | Headline (flat visual list; project colors define identity).                                         |
 | =Time=      | Calculated schedule string (e.g., =Mon 09:15 – 10:45=).                                               |
 | =Duration=  | Task duration in minutes (annotated with =[?]= if estimated).                                        |
 | =Project=   | Human-readable project name or tag badge for calendar events.                                       |
 | =Score=     | Composite scheduling score (=—= for fixed calendar events).                                          |
-| =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking), =🔓= (non-blocking).   |
+| =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking fixed event).          |
 
 **** 2. Chronological Calendar View (=v= / =c=)
 Pressing =v= or =c= transforms the buffer into an ASCII/Unicode 15-minute multi-day visual calendar:
@@ -312,18 +314,18 @@ Pressing =v= or =c= transforms the buffer into an ASCII/Unicode 15-minute multi-
 - Task blocks rendered with colored bar characters (=█=) and continuation lines (=║=).
 - Project badge and time range clearly visible: =[Work] Deploy API (09:15–10:45)=.
 - Interactive jumping: press =RET= or =TAB= on any task or event in the calendar to jump directly to its Org headline.
-- Concurrent non-blocking events rendered side-by-side on the same line (=█ [Proj] Task  │ 🔓 Team Sync=).
+- Concurrent non-blocking events rendered side-by-side on the same line (=█ [Proj] Task  │ Team Sync=).
 
 *** Fixed Agenda Events and Non-Blocking Tasks
 <<fixed-agenda-events-and-non-blocking-tasks>>
 
 By default, existing scheduled tasks or timestamps in your agenda files that do *not* have the =AUTOSCH= tag are treated as *fixed agenda events*.
 - You can toggle showing or hiding these events in the review buffer by pressing =E=.
-- *Blocking Events (=🔒= / =📅=):* By default, fixed events block auto-scheduler slots. No tasks will be placed during their scheduled window.
-- *Non-Blocking Events (=🔓=):* Many calendar events (such as all-hands meetings, webinars, optional office hours, or background listening sessions) do not require exclusive focus. Marking an event as *non-blocking* tells the scheduler that this time slot remains available for scheduling work.
+- *Blocking Events (=🔒=):* By default, fixed events block auto-scheduler slots. No tasks will be placed during their scheduled window.
+- *Non-Blocking Events:* Many calendar events (such as all-hands meetings, webinars, optional office hours, or background listening sessions) do not require exclusive focus. Marking an event as *non-blocking* tells the scheduler that this time slot remains available for scheduling work.
 
 **** How to Toggle Non-Blocking Status:
-- *In the Review Buffer:* Move point to the fixed event row and press =b= (or =SPC= / =m=). The icon changes from =📅= / =🔒= to =🔓= =[NB]=.
+- *In the Review Buffer:* Move point to the fixed event row and press =b= (or =SPC= / =m=). The lock icon =🔒= is removed and =[NB]= is appended to the project tag.
   - Press =r= to immediately recalculate the schedule; auto-scheduler will pack tasks into the freed time window!
 - *In Org Agenda:* Move point to any non-AUTOSCH event and press =C-c C-x n= (or =C-c C-x N=).
 - *Universal Command:* Call =M-x org-auto-scheduler-toggle-non-blocking= from any buffer (Org file headline, Agenda, Review, or Calendar).
@@ -377,7 +379,9 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | =b=                   | =review-toggle-non-blocking=                 | Toggle non-blocking status of fixed agenda event at point.                     |
 | =TAB= / =RET=         | =review-jump=                                | Open the original Org task or agenda event in another window.                  |
 | =x= / =C-c C-c=       | =review-execute=                             | Recalculate, persist decisions, apply =[X]= tasks to Org files, and close.     |
-| =U= / =p= / =K=       | =review-move-up=                             | Move current task up in list (crosses day separators into previous day).       |
+| =U= / =K=             | =review-move-up=                             | Move current task up in list (crosses day separators into previous day).       |
+| =s=                   | =review-toggle-splittable=                   | Toggle SPLITTABLE status of task (splits across days/events when fitting).     |
+| =p= / =i=             | =review-toggle-pinnable=                     | Mark/toggle PINNABLE (prompts for time; other tasks reschedule to after).      |
 | =D= / =n= / =J=       | =review-move-down=                           | Move current task down in list (crosses day separators into next day).         |
 | =>= / =+= / =M-down=  | =review-move-day-forward=                    | Move current task to next scheduled day (skips excluded days).                 |
 | =<= / =-= / =M-up=    | =review-move-day-backward=                   | Move current task to previous scheduled day (cannot move into past).           |
@@ -570,6 +574,26 @@ Placeholder subtasks are completely ephemeral:
 - *Clock Entry Safeguard:* If you clocked in on a temporary placeholder subtask, its =:LOGBOOK:= entries are preserved and migrated automatically to the parent task before the placeholder is removed.
 - *Completion Sync:* If you marked a placeholder subtask =DONE=, the parent task is automatically marked =DONE=.
 - *Manual Cleanup:* You can also run =M-x org-auto-scheduler-cleanup-placeholders= or press =k= in the dispatch menu (=M-x org-auto-scheduler-dispatch=) anytime.
+
+*** Review Shortcuts for Splittable Tasks
+Inside the Review & Apply buffer (both Column Table view and Chronological Calendar view):
+- Press =s= on any task to toggle its =SPLITTABLE= status.
+- Tasks marked splittable display an =[s]= indicator in the duration column.
+- The schedule automatically recalculates, splitting the task into available gaps or multi-day chunks as needed.
+
+** Pinnable Tasks & Reordering Behavior
+<<pinnable-tasks--reordering-behavior>>
+
+The =:PINNABLE:= tag and property allow tasks to be anchored to specific times while dynamically adjusting the rest of the schedule around them.
+
+*** Initial Scheduling vs. Reordering Behavior
+- *Initial Scheduling:* Tasks marked with =:PINNABLE:= are initially scheduled according to the *usual order*, strictly respecting your normal working hours (=org-auto-scheduler-start-time= to =org-auto-scheduler-end-time=) and calculated task scores.
+- *Reordering in Review Window:* In the Review & Apply buffer, pressing =p= or =i= marks the task as =PINNABLE= and prompts for a pinned start time (e.g. =14:00= or =2026-09-20 18:30=, defaulting to its current schedule):
+  1. *Pinned to Specific Time:* The task is placed strictly at that designated start time.
+  2. *Subsequent Tasks Rescheduled:* Other tasks are automatically rescheduled to start *after* the pinned task, preventing collisions.
+  3. *Exceeding Working Hours:* Pinned tasks are allowed to exceed normal day boundaries (=org-auto-scheduler-start-time= and =org-auto-scheduler-end-time=), making them ideal for early-morning commitments or evening study/work sessions.
+  4. *Midnight Splitting:* If the pinned task still does not fit before midnight (=24:00=), it is automatically treated as =SPLITTABLE= to the next day: today's chunk runs until midnight, and remaining effort rolls over to the next day as a placeholder subtask starting at normal morning hours.
+  5. *Unpinning:* Pressing =p= on an already-pinned task prompts to unpin, or with prefix argument =C-u p= immediately clears the pinned time and restores normal scheduling flexibility.
 
 ** Agenda Bump
 
