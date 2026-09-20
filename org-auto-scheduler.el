@@ -284,13 +284,23 @@ to the next day in its entirety rather than being split into small fragments."
   :type 'string
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-pinnable-tag "PINNABLE"
-  "Tag used to mark a task as pinnable to a specific time."
+(defcustom org-auto-scheduler-freeset-tag "FREESET"
+  "Tag used to mark a task as free to schedule outside normal working hours."
   :type 'string
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-pinnable-property "PINNABLE"
-  "Org headline property used to mark a task as pinnable."
+(defcustom org-auto-scheduler-freeset-property "FREESET"
+  "Org headline property used to mark a task as free to schedule outside working hours."
+  :type 'string
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-pinned-tag "PINNED"
+  "Tag used to mark a task as pinned to an exact scheduled time."
+  :type 'string
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-pinned-property "PINNED"
+  "Org headline property indicating that a task is pinned."
   :type 'string
   :group 'org-auto-scheduler)
 
@@ -298,6 +308,10 @@ to the next day in its entirety rather than being split into small fragments."
   "Org headline property storing the pinned start time for a task."
   :type 'string
   :group 'org-auto-scheduler)
+
+;; Backward compatibility aliases for old PINNABLE configuration variables
+(defvaralias 'org-auto-scheduler-pinnable-tag 'org-auto-scheduler-freeset-tag)
+(defvaralias 'org-auto-scheduler-pinnable-property 'org-auto-scheduler-freeset-property)
 
 (defvar org-auto-scheduler-report-buffer-name "*Org Auto Scheduler Report*"
   "Name of the buffer for the Org Auto Scheduler Report.")
@@ -879,22 +893,29 @@ the task's Org properties."
           (let* ((prop-order (org-entry-get nil org-auto-scheduler-order-property))
                  (prop-skip (org-entry-get nil org-auto-scheduler-skip-property))
                  (prop-target (org-entry-get nil org-auto-scheduler-target-date-property))
-                 (prop-pinnable (org-entry-get nil org-auto-scheduler-pinnable-property))
+                 (prop-freeset (or (org-entry-get nil org-auto-scheduler-freeset-property)
+                                   (org-entry-get nil "PINNABLE")))
+                 (prop-pinned (org-entry-get nil org-auto-scheduler-pinned-property))
                  (prop-pinned-time (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
-                                       (org-entry-get nil "PINNED")))
+                                       (let ((p (org-entry-get nil "PINNED")))
+                                         (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p))))
                  (order (if prop-order (string-to-number prop-order) (plist-get entry :order)))
                  (skipped (cond ((string= prop-skip "t") t)
                                 ((string= prop-skip "nil") nil)
                                 (prop-skip t)
                                 (t (plist-get entry :skipped))))
                  (target-date (or prop-target (plist-get entry :target-date)))
-                 (pinnable (cond ((string= prop-pinnable "t") t)
-                                 ((string= prop-pinnable "nil") nil)
-                                 (prop-pinnable t)
-                                 (t (plist-get entry :pinnable))))
+                 (freeset (cond ((string= prop-freeset "t") t)
+                                ((string= prop-freeset "nil") nil)
+                                (prop-freeset t)
+                                (t (or (plist-get entry :freeset) (plist-get entry :pinnable)))))
+                 (pinned (cond ((string= prop-pinned "t") t)
+                               ((string= prop-pinned "nil") nil)
+                               (prop-pinned t)
+                               (t (plist-get entry :pinned))))
                  (pinned-time (or prop-pinned-time (plist-get entry :pinned-time))))
             (list :order order :skipped skipped :target-date target-date
-                  :pinnable pinnable :pinned-time pinned-time)))
+                  :freeset freeset :pinnable freeset :pinned pinned :pinned-time pinned-time)))
       entry)))
 
 (defun org-auto-scheduler-review-save-decisions (&optional silent)
@@ -928,12 +949,15 @@ When SILENT is non-nil, suppress confirmation message."
                                   (and current-sep-date
                                        (not (string= current-sep-date "Unknown"))
                                        current-sep-date)))
-                 (pinnable (plist-get override :pinnable))
+                 (freeset (or (plist-get override :freeset) (plist-get override :pinnable)))
+                 (pinned (plist-get override :pinned))
                  (pinned-time (plist-get override :pinned-time))
                  (decision (list :order order-rank
                                  :skipped skipped
                                  :target-date target-date
-                                 :pinnable pinnable
+                                 :freeset freeset
+                                 :pinnable freeset
+                                 :pinned pinned
                                  :pinned-time pinned-time
                                  :headline (or headline "task")
                                  :is-new nil
@@ -954,9 +978,15 @@ When SILENT is non-nil, suppress confirmation message."
                 (if target-date
                     (org-set-property org-auto-scheduler-target-date-property target-date)
                   (org-delete-property org-auto-scheduler-target-date-property))
-                (if pinnable
-                    (org-set-property org-auto-scheduler-pinnable-property "t")
-                  (org-delete-property org-auto-scheduler-pinnable-property))
+                (if freeset
+                    (progn
+                      (org-set-property org-auto-scheduler-freeset-property "t")
+                      (org-delete-property "PINNABLE"))
+                  (org-delete-property org-auto-scheduler-freeset-property)
+                  (org-delete-property "PINNABLE"))
+                (if pinned
+                    (org-set-property org-auto-scheduler-pinned-property "t")
+                  (org-delete-property org-auto-scheduler-pinned-property))
                 (if pinned-time
                     (org-set-property org-auto-scheduler-pinned-time-property pinned-time)
                   (org-delete-property org-auto-scheduler-pinned-time-property)))))))))
@@ -1537,12 +1567,11 @@ Hash table with date strings as keys and lists of items as values.")
             (when (string= task-date date-string)
               (push task agenda-items))))
 
-        ;; Add reservations for pinned tasks not yet completed during review reordering
-        (when (bound-and-true-p org-auto-scheduler--reordering-p)
-          (dolist (item (org-auto-scheduler--get-pinned-tasks-reservations date-string))
-            (let ((tid (nth 0 item)))
-              (unless (cl-some (lambda (tk) (equal (nth 0 tk) tid)) org-auto-scheduler-completed-tasks)
-                (push item agenda-items)))))
+        ;; Add reservations for pinned tasks not yet completed
+        (dolist (item (org-auto-scheduler--get-pinned-tasks-reservations date-string))
+          (let ((tid (nth 0 item)))
+            (unless (cl-some (lambda (tk) (equal (nth 0 tk) tid)) org-auto-scheduler-completed-tasks)
+              (push item agenda-items))))
 
         ;; Add projected repeater occurrences for the current date
         (when org-auto-scheduler-repeater-integration
@@ -2061,14 +2090,22 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
   (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
          (agenda-items (org-auto-scheduler-get-agenda-items start-time))
          (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
-         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time)))
+         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time))
+         (is-freeset (or (bound-and-true-p org-auto-scheduler--scheduling-freeset-p)
+                         (bound-and-true-p org-auto-scheduler--scheduling-pinnable-p)
+                         (and (bound-and-true-p org-auto-scheduler--reordering-p)
+                              (or (member org-auto-scheduler-freeset-tag proposed-tags)
+                                  (member "PINNABLE" proposed-tags)))))
+         (is-pinned (or (member org-auto-scheduler-pinned-tag proposed-tags)
+                        (and ignore-id (org-auto-scheduler-task-pinned-p nil ignore-id)))))
     (org-auto-scheduler--log-debug "Checking time slot %s to %s"
                                    (format-time-string "%Y-%m-%d %H:%M" start-time)
                                    (format-time-string "%Y-%m-%d %H:%M" end-time))
     (or
-     ;; Check day boundaries
-     (and (time-less-p start-time day-start) day-start)
-     (and (time-less-p day-end end-time) day-end)
+     ;; Check day boundaries (bypassed for FREESET during review reordering or PINNED tasks)
+     (unless (or is-freeset is-pinned)
+       (or (and (time-less-p start-time day-start) day-start)
+           (and (time-less-p day-end end-time) day-end)))
      ;; Check conflicts with existing tasks.
      ;; We scan ALL conflicting items and return the MAXIMUM end-with-gap so that
      ;; next-available-time jumps past every overlapping item in one step.
@@ -2496,6 +2533,78 @@ or property (`org-auto-scheduler-split-property')."
               (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))))))
      (t nil))))
 
+(defun org-auto-scheduler-task-freeset-p (marker &optional task-id)
+  "Return non-nil if task at MARKER or TASK-ID is marked as FREESET (or legacy PINNABLE).
+FREESET tasks can be scheduled or moved outside normal working hours,
+and split at midnight to the next day."
+  (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
+                            (org-with-point-at marker (org-id-get)))))
+         (override (org-auto-scheduler--get-review-override tid))
+         (override-freeset (and override (or (plist-get override :freeset)
+                                             (plist-get override :pinnable))))
+         (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid marker)))
+         (saved-freeset (and saved-dec (or (plist-get saved-dec :freeset)
+                                           (plist-get saved-dec :pinnable)))))
+    (cond
+     (override-freeset t)
+     ((and override (plist-member override :freeset) (null (plist-get override :freeset))) nil)
+     ((and override (plist-member override :pinnable) (null (plist-get override :pinnable))) nil)
+     (saved-freeset t)
+     ((and marker (markerp marker) (marker-buffer marker))
+      (org-with-point-at marker
+        (let* ((tags (org-get-tags))
+               (prop (or (org-entry-get nil org-auto-scheduler-freeset-property)
+                         (org-entry-get nil "PINNABLE"))))
+          (or (member org-auto-scheduler-freeset-tag tags)
+              (member "PINNABLE" tags)
+              (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))))))
+     (t nil))))
+
+(defalias 'org-auto-scheduler-task-pinnable-p 'org-auto-scheduler-task-freeset-p)
+
+(defun org-auto-scheduler-task-toggle-freeset (&optional marker task-id)
+  "Toggle FREESET status of task at MARKER or TASK-ID.
+Updates tag `org-auto-scheduler-freeset-tag' and property
+`org-auto-scheduler-freeset-property'.  Also updates review overrides.
+Returns non-nil if now freeset."
+  (let* ((m (or marker
+                (when (and task-id (stringp task-id))
+                  (org-id-find task-id t))
+                (and (derived-mode-p 'org-mode) (point-marker))))
+         (tid (or task-id
+                  (when (and m (markerp m) (marker-buffer m))
+                    (org-with-point-at m (or (org-id-get) (org-id-get-create)))))))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "Cannot find task marker"))
+    (let* ((currently-freeset (org-auto-scheduler-task-freeset-p m tid))
+           (new-freeset (not currently-freeset)))
+      (org-with-point-at m
+        (let ((tags (org-get-tags nil t)))
+          (if currently-freeset
+              (progn
+                (setq tags (delete org-auto-scheduler-freeset-tag tags))
+                (setq tags (delete "PINNABLE" tags))
+                (if (fboundp 'org-set-tags-to)
+                    (org-set-tags-to tags)
+                  (org-set-tags tags))
+                (org-delete-property org-auto-scheduler-freeset-property)
+                (org-delete-property "PINNABLE"))
+            (progn
+              (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
+              (if (fboundp 'org-set-tags-to)
+                  (org-set-tags-to tags)
+                (org-set-tags tags))
+              (org-set-property org-auto-scheduler-freeset-property "t")))
+          (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
+            (let ((over (or (gethash tid org-auto-scheduler--review-overrides)
+                            (list :order nil :skipped nil :target-date nil))))
+              (puthash tid (plist-put (plist-put over :freeset new-freeset)
+                                      :pinnable new-freeset)
+                       org-auto-scheduler--review-overrides)))
+          new-freeset)))))
+
+(defalias 'org-auto-scheduler-task-toggle-pinnable 'org-auto-scheduler-task-toggle-freeset)
+
 (defun org-auto-scheduler-task-toggle-splittable (&optional marker task-id)
   "Toggle SPLITTABLE status of task at MARKER or TASK-ID.
 Adds or removes `org-auto-scheduler-splittable-tag' and sets/clears
@@ -2533,28 +2642,26 @@ Returns non-nil if task is now splittable, nil otherwise."
                      org-auto-scheduler--review-overrides)))
         new-split))))
 
-(defun org-auto-scheduler-task-pinnable-p (marker &optional task-id)
-  "Return non-nil if task at MARKER or TASK-ID is marked as pinnable.
-Checks review overrides, headline tags, properties, and saved decisions."
+(defun org-auto-scheduler-task-pinned-p (marker &optional task-id)
+  "Return non-nil if task at MARKER or TASK-ID has an anchored pinned time."
   (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
                             (org-with-point-at marker (org-id-get)))))
          (override (org-auto-scheduler--get-review-override tid))
-         (override-pinnable (and override (or (plist-get override :pinnable)
-                                              (plist-get override :pinned-time))))
+         (override-pinned (and override (or (plist-get override :pinned)
+                                            (plist-get override :pinned-time))))
          (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid marker)))
-         (saved-pinnable (and saved-dec (or (plist-get saved-dec :pinnable)
-                                            (plist-get saved-dec :pinned-time)))))
+         (saved-pinned (and saved-dec (or (plist-get saved-dec :pinned)
+                                          (plist-get saved-dec :pinned-time)))))
     (cond
-     (override-pinnable t)
-     ((and override (plist-member override :pinnable) (null (plist-get override :pinnable))) nil)
-     (saved-pinnable t)
+     (override-pinned t)
+     ((and override (plist-member override :pinned) (null (plist-get override :pinned))) nil)
+     (saved-pinned t)
      ((and marker (markerp marker) (marker-buffer marker))
       (org-with-point-at marker
         (let* ((tags (org-get-tags))
-               (prop (org-entry-get nil org-auto-scheduler-pinnable-property))
-               (time-prop (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
-                              (org-entry-get nil "PINNED"))))
-          (or (member org-auto-scheduler-pinnable-tag tags)
+               (prop (org-entry-get nil org-auto-scheduler-pinned-property))
+               (time-prop (org-entry-get nil org-auto-scheduler-pinned-time-property)))
+          (or (member org-auto-scheduler-pinned-tag tags)
               (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))
               (and time-prop (not (string-empty-p (string-trim time-prop))))))))
      (t nil))))
@@ -2571,17 +2678,14 @@ Checks review overrides, headline tags, properties, and saved decisions."
          (prop-time (when (and marker (markerp marker) (marker-buffer marker))
                       (org-with-point-at marker
                         (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
-                            (org-entry-get nil "PINNED")))))
-         (sched-time (when (and marker (markerp marker) (marker-buffer marker)
-                                (org-auto-scheduler-task-pinnable-p marker tid))
-                       (org-with-point-at marker
-                         (org-entry-get nil "SCHEDULED"))))
-         (raw-time (or override-time saved-time prop-time sched-time)))
+                            (let ((p (org-entry-get nil "PINNED")))
+                              (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p))))))
+         (raw-time (or override-time saved-time prop-time)))
     (when raw-time
       (org-auto-scheduler--parse-flexible-time raw-time marker))))
 
-(defun org-auto-scheduler-task-set-pinnable (marker &optional task-id time-str unpin)
-  "Mark or unmark task at MARKER or TASK-ID as PINNABLE.
+(defun org-auto-scheduler-task-set-pinned-time (marker &optional task-id time-str unpin)
+  "Anchor or unanchor task at MARKER or TASK-ID to a pinned time TIME-STR.
 If UNPIN is non-nil or TIME-STR is nil/empty, unpins the task.
 Otherwise pins the task to TIME-STR.  Returns the formatted pinned time or nil."
   (let* ((m (or marker
@@ -2597,49 +2701,54 @@ Otherwise pins the task to TIME-STR.  Returns the formatted pinned time or nil."
       (let ((tags (org-get-tags nil t)))
         (if (or unpin (null time-str) (string-empty-p (string-trim time-str)))
             (progn
-              (setq tags (delete org-auto-scheduler-pinnable-tag tags))
+              (setq tags (delete org-auto-scheduler-pinned-tag tags))
               (if (fboundp 'org-set-tags-to)
                   (org-set-tags-to tags)
                 (org-set-tags tags))
-              (org-delete-property org-auto-scheduler-pinnable-property)
+              (org-delete-property org-auto-scheduler-pinned-property)
               (org-delete-property org-auto-scheduler-pinned-time-property)
-              (org-delete-property "PINNED")
               (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
                 (let ((over (gethash tid org-auto-scheduler--review-overrides)))
                   (when over
-                    (setq over (plist-put over :pinnable nil))
+                    (setq over (plist-put over :pinned nil))
                     (setq over (plist-put over :pinned-time nil))
                     (puthash tid over org-auto-scheduler--review-overrides))))
               nil)
           (let* ((parsed (org-auto-scheduler--parse-flexible-time time-str m))
                  (formatted-time (format-time-string "%Y-%m-%d %H:%M" parsed))
                  (date-str (format-time-string "%Y-%m-%d" parsed)))
-            (cl-pushnew org-auto-scheduler-pinnable-tag tags :test #'string=)
+            (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
             (if (fboundp 'org-set-tags-to)
                 (org-set-tags-to tags)
               (org-set-tags tags))
-            (org-set-property org-auto-scheduler-pinnable-property "t")
+            (org-set-property org-auto-scheduler-pinned-property "t")
             (org-set-property org-auto-scheduler-pinned-time-property formatted-time)
             (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
               (let ((over (gethash tid org-auto-scheduler--review-overrides)))
-                (puthash tid (plist-put (plist-put (plist-put (plist-put over :pinnable t)
+                (puthash tid (plist-put (plist-put (plist-put (plist-put over :pinned t)
                                                               :pinned-time formatted-time)
                                                    :pinned-date date-str)
                                         :target-date date-str)
                          org-auto-scheduler--review-overrides)))
             formatted-time))))))
 
+(defalias 'org-auto-scheduler-task-set-pinnable 'org-auto-scheduler-task-set-pinned-time)
+
 (defun org-auto-scheduler--get-pinned-tasks-reservations (&optional target-date-str)
-  "Return a list of pseudo agenda items for all tasks marked PINNABLE with a time.
+  "Return a list of pseudo agenda items for all tasks pinned to an exact time.
 Each item is (TASK-ID START-TIME END-TIME TAGS t HEADLINE t MARKER).
-If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date."
+If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date.
+Checks:
+1. Review overrides
+2. Saved review decisions
+3. Active Org tasks in agenda files or current buffer with property `org-auto-scheduler-pinned-time-property'."
   (let ((items '())
         (seen (make-hash-table :test 'equal)))
     ;; 1. Check review overrides
     (when (bound-and-true-p org-auto-scheduler--review-overrides)
       (maphash
        (lambda (tid over)
-         (when (and (plist-get over :pinnable)
+         (when (and (or (plist-get over :pinned) (plist-get over :pinned-time))
                     (plist-get over :pinned-time))
            (let* ((pt (org-auto-scheduler-task-pinned-time nil tid))
                   (d-str (and pt (format-time-string "%Y-%m-%d" pt))))
@@ -2650,7 +2759,7 @@ If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date."
                       (chunk (min eff (max 1 avail)))
                       (end (time-add pt (seconds-to-time (* 60 chunk)))))
                  (puthash tid t seen)
-                 (push (list tid pt end '("AUTOSCH" "PINNABLE") t "Pinned Task" t nil) items))))))
+                 (push (list tid pt end '("AUTOSCH" "PINNED") t "Pinned Task" t nil) items))))))
        org-auto-scheduler--review-overrides))
     ;; 2. Check saved review decisions
     (when (bound-and-true-p org-auto-scheduler--saved-review-decisions)
@@ -2658,7 +2767,7 @@ If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date."
         (let* ((tid (car pair))
                (dec (cdr pair)))
           (when (and (not (gethash tid seen))
-                     (plist-get dec :pinnable)
+                     (or (plist-get dec :pinned) (plist-get dec :pinned-time))
                      (plist-get dec :pinned-time))
             (let* ((pt (org-auto-scheduler-task-pinned-time nil tid))
                    (d-str (and pt (format-time-string "%Y-%m-%d" pt))))
@@ -2669,8 +2778,42 @@ If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date."
                        (chunk (min eff (max 1 avail)))
                        (end (time-add pt (seconds-to-time (* 60 chunk)))))
                   (puthash tid t seen)
-                  (push (list tid pt end '("AUTOSCH" "PINNABLE") t "Pinned Task" t nil) items))))))))
+                  (push (list tid pt end '("AUTOSCH" "PINNED") t "Pinned Task" t nil) items))))))))
+    ;; 3. Check live org agenda tasks and current buffer that have property :PINNED_TIME:
+    (let ((buffers (delete-dups
+                    (append (when (and (boundp 'org-agenda-files) (fboundp 'org-agenda-files))
+                              (delq nil (mapcar (lambda (f) (when (file-exists-p f) (find-file-noselect f)))
+                                                (org-agenda-files t))))
+                            (when (derived-mode-p 'org-mode) (list (current-buffer)))))))
+      (dolist (b buffers)
+        (when (and b (buffer-live-p b))
+          (with-current-buffer b
+            (save-excursion
+              (save-restriction
+                (widen)
+                (goto-char (point-min))
+                (while (re-search-forward "^\*+[ 	]+" nil t)
+                  (let* ((tid (or (org-entry-get nil "ID")
+                                  (ignore-errors (org-id-get))
+                                  (format "%s:%d" (or (buffer-file-name) (buffer-name)) (point))))
+                         (time-str (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
+                                       (let ((p (org-entry-get nil "PINNED")))
+                                         (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p)))))
+                    (when (and tid (not (gethash tid seen)) time-str (not (string-empty-p time-str)))
+                      (let* ((m (point-marker))
+                             (pt (org-auto-scheduler-task-pinned-time m tid))
+                             (d-str (and pt (format-time-string "%Y-%m-%d" pt))))
+                        (when (and pt (or (null target-date-str) (string= d-str target-date-str)))
+                          (let* ((eff (or (org-auto-scheduler-get-effort m) 60))
+                                 (midnight (org-auto-scheduler--get-day-midnight pt))
+                                 (avail (floor (/ (float-time (time-subtract midnight pt)) 60)))
+                                 (chunk (min eff (max 1 avail)))
+                                 (end (time-add pt (seconds-to-time (* 60 chunk))))
+                                 (hl (org-get-heading t t t t)))
+                            (puthash tid t seen)
+                            (push (list tid pt end '("AUTOSCH" "PINNED") t hl t m) items)))))))))))))
     items))
+
 
 (defun org-auto-scheduler--place-split-placeholders (origin-id headline marker topo-depth rem-effort min-chunk tags time-block active-gap search-time start-date-str)
   "Place REM-EFFORT across subsequent slots/days as placeholder subtasks.
@@ -3075,47 +3218,54 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
           (let* ((tags (org-get-tags marker))
                  (needs-buffer (member "buffertime" tags))
                  (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
-                 (is-pinnable (when (bound-and-true-p org-auto-scheduler--reordering-p)
-                                (org-auto-scheduler-task-pinnable-p marker task-id)))
-                 (pinned-time (when (and (bound-and-true-p org-auto-scheduler--reordering-p) is-pinnable)
-                                (org-auto-scheduler-task-pinned-time marker task-id)))
+                 (is-freeset (org-auto-scheduler-task-freeset-p marker task-id))
+                 (is-pinned (org-auto-scheduler-task-pinned-p marker task-id))
+                 (pinned-time (org-auto-scheduler-task-pinned-time marker task-id))
                  (is-splittable (or (org-auto-scheduler-task-splittable-p marker task-id)
-                                    (and is-pinnable pinned-time)))
+                                    (and is-freeset (bound-and-true-p org-auto-scheduler--reordering-p))
+                                    (and is-pinned pinned-time)))
                  (min-chunk (org-auto-scheduler-get-min-chunk marker))
                  (split-result nil))
             (cond
              ;; -------------------------------------------------------------
-             ;; PINNABLE task path: set to given time, can exceed day hours,
-             ;; and if remaining effort crosses midnight, treat as SPLITTABLE.
+             ;; PINNED task or FREESET reordered task path:
              ;; -------------------------------------------------------------
-             ((and (bound-and-true-p org-auto-scheduler--reordering-p) is-pinnable pinned-time)
+             ((or (and is-pinned pinned-time)
+                  (and (bound-and-true-p org-auto-scheduler--reordering-p) is-freeset))
               (let* ((origin-id (or task-id (org-with-point-at marker (org-id-get-create))))
-                     (start-date-str (format-time-string "%Y-%m-%d" pinned-time))
-                     (midnight (org-auto-scheduler--get-day-midnight pinned-time))
-                     (avail-before-midnight (max 1 (floor (/ (float-time (time-subtract midnight pinned-time)) 60))))
+                     (eff-id (or task-id origin-id))
+                     (eff-start (or (and pinned-time
+                                         (or (null available-time)
+                                             (string= (format-time-string "%Y-%m-%d" pinned-time)
+                                                      (format-time-string "%Y-%m-%d" available-time)))
+                                         pinned-time)
+                                    available-time))
+                     (start-date-str (format-time-string "%Y-%m-%d" eff-start))
+                     (midnight (org-auto-scheduler--get-day-midnight eff-start))
+                     (avail-before-midnight (max 1 (floor (/ (float-time (time-subtract midnight eff-start)) 60))))
                      (fits-before-midnight (<= remaining-effort avail-before-midnight)))
                 (if fits-before-midnight
-                    ;; Fits before midnight: schedule entire task today at pinned-time
-                    (let* ((end-time (time-add pinned-time (seconds-to-time (* 60 remaining-effort))))
+                    ;; Fits before midnight: schedule entire task today at eff-start
+                    (let* ((end-time (time-add eff-start (seconds-to-time (* 60 remaining-effort))))
                            (end-day-str (format-time-string "%Y-%m-%d" end-time))
                            (schedule-string
                             (if (string= start-date-str end-day-str)
                                 (format "<%s-%s>"
-                                        (format-time-string "%Y-%m-%d %a %H:%M" pinned-time)
+                                        (format-time-string "%Y-%m-%d %a %H:%M" eff-start)
                                         (format-time-string "%H:%M" end-time))
                               (format "<%s>--<%s>"
-                                      (format-time-string "%Y-%m-%d %a %H:%M" pinned-time)
+                                      (format-time-string "%Y-%m-%d %a %H:%M" eff-start)
                                       (format-time-string "%Y-%m-%d %a %H:%M" end-time)))))
                       (if org-auto-scheduler--preview-mode
-                          (push (list (or task-id origin-id) pinned-time end-time '("AUTOSCH") t headline schedule-string marker topo-depth)
+                          (push (list eff-id eff-start end-time '("AUTOSCH") t headline schedule-string marker topo-depth)
                                 org-auto-scheduler-completed-tasks)
                         (org-auto-scheduler--set-scheduled schedule-string)
                         (org-set-property org-auto-scheduler-scheduled-property "t")
-                        (push (list (or task-id origin-id) pinned-time end-time '("AUTOSCH") t headline schedule-string nil topo-depth)
+                        (push (list eff-id eff-start end-time '("AUTOSCH") t headline schedule-string nil topo-depth)
                               org-auto-scheduler-completed-tasks))
-                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled PINNED task '%s' from %s to %s (Effort: %dm)"
+                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled PINNABLE task '%s' from %s to %s (Effort: %dm)"
                                                     headline
-                                                    (format-time-string "%Y-%m-%d %H:%M" pinned-time)
+                                                    (format-time-string "%Y-%m-%d %H:%M" eff-start)
                                                     (format-time-string "%Y-%m-%d %H:%M" end-time)
                                                     remaining-effort)
                       (time-add end-time (seconds-to-time (* 60 active-gap))))
@@ -3127,28 +3277,27 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                          (schedule-string
                           (if (string= start-date-str today-end-day)
                               (format "<%s-%s>"
-                                      (format-time-string "%Y-%m-%d %a %H:%M" pinned-time)
+                                      (format-time-string "%Y-%m-%d %a %H:%M" eff-start)
                                       (format-time-string "%H:%M" today-end))
                             (format "<%s>--<%s>"
-                                    (format-time-string "%Y-%m-%d %a %H:%M" pinned-time)
+                                    (format-time-string "%Y-%m-%d %a %H:%M" eff-start)
                                     (format-time-string "%Y-%m-%d %a %H:%M" today-end)))))
                     (if org-auto-scheduler--preview-mode
-                        (push (list (or task-id origin-id) pinned-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
+                        (push (list eff-id eff-start today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
                               org-auto-scheduler-completed-tasks)
                       (org-auto-scheduler--set-scheduled schedule-string)
                       (org-set-property org-auto-scheduler-scheduled-property "t")
-                      (push (list (or task-id origin-id) pinned-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
+                      (push (list eff-id eff-start today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
                             org-auto-scheduler-completed-tasks))
                     ;; Place remaining effort on subsequent days starting from next day start
-                    (let* ((next-day-start (org-auto-scheduler-next-day-start pinned-time))
+                    (let* ((next-day-start (org-auto-scheduler-next-day-start eff-start))
                            (last-end (org-auto-scheduler--place-split-placeholders
                                       origin-id headline marker topo-depth rem-effort min-chunk
                                       tags time-block active-gap next-day-start start-date-str)))
-                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Split PINNED task '%s': today %dm (until midnight), remaining %dm across subsequent days"
+                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Split PINNABLE task '%s': today %dm (until midnight), remaining %dm across subsequent days"
                                                     headline today-chunk rem-effort)
                       (time-add last-end (seconds-to-time (* 60 active-gap))))))))
 
-             ;; -------------------------------------------------------------
              ;; Standard task path (with normal SPLITTABLE support)
              ;; -------------------------------------------------------------
              (t
@@ -3243,6 +3392,13 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                             "FAILED" marker (or topo-depth 0) :failed '("No available slot within 7 days"))
                       org-auto-scheduler-completed-tasks))
               current-time)))))))))))
+
+(defvar org-auto-scheduler--scheduling-freeset-p nil
+  "Internal flag bound non-nil when scheduling a FREESET task during review recalculation.
+Bypasses day working-hours checks (start-time and end-time) so the task can be
+scheduled early morning or late evening up to midnight.")
+
+(defvaralias 'org-auto-scheduler--scheduling-pinnable-p 'org-auto-scheduler--scheduling-freeset-p)
 
 (defvar org-auto-scheduler--reordering-p nil
   "Internal flag non-nil when recalculating schedule during review reordering.
@@ -3377,20 +3533,25 @@ configuration variables and raises errors if any are found."
 Checks for what-if overrides in the review buffer or saved decisions if active."
   (let* ((task-id (org-with-point-at marker (org-id-get)))
          (override (org-auto-scheduler--get-review-override task-id))
+         (override-time (plist-get override :pinned-time))
          (override-date (or (plist-get override :pinned-date)
                             (unless (bound-and-true-p org-auto-scheduler--ignore-target-dates-p)
                               (plist-get override :target-date))))
-         (saved-dec (and task-id (null override-date)
+         (saved-dec (and task-id (null override-date) (null override-time)
                          (org-auto-scheduler-get-saved-decision task-id marker)))
          (saved-date (and saved-dec
                           (unless (bound-and-true-p org-auto-scheduler--ignore-target-dates-p)
                             (plist-get saved-dec :target-date))))
          (effective-date (or override-date saved-date)))
-    (if effective-date
-        (org-auto-scheduler-parse-time-string (concat effective-date " 00:00"))
+    (cond
+     (override-time
+      (org-time-string-to-time override-time))
+     (effective-date
+      (org-auto-scheduler-parse-time-string (concat effective-date " 00:00")))
+     (t
       (let ((not-before-string (org-entry-get marker "NOT_BEFORE")))
         (when not-before-string
-          (org-time-string-to-time not-before-string))))))
+          (org-time-string-to-time not-before-string)))))))
 
 (defun org-auto-scheduler-has-repeater-task (marker)
   "Check if the task at MARKER has a repeater interval.
@@ -4126,17 +4287,16 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   ;; What-if
   (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
   ;; Views
-  (define-key map (kbd "v")   #'org-auto-scheduler-review-toggle-calendar)
-  (define-key map (kbd "c")   #'org-auto-scheduler-review-toggle-calendar)
   (define-key map (kbd "T")   #'org-auto-scheduler-review-open-timegrid)
   ;; Toggle fixed agenda events
   (define-key map (kbd "E")   #'org-auto-scheduler-review-toggle-agenda-events)
   ;; Non-blocking toggle for fixed events
   (define-key map (kbd "b")   #'org-auto-scheduler-review-toggle-non-blocking)
-  ;; Splittable and Pinnable shortcuts
+  ;; Splittable, Freeset, and Pinned shortcuts
   (define-key map (kbd "s")   #'org-auto-scheduler-review-toggle-splittable)
-  (define-key map (kbd "p")   #'org-auto-scheduler-review-toggle-pinnable)
-  (define-key map (kbd "i")   #'org-auto-scheduler-review-toggle-pinnable)
+  (define-key map (kbd "F")   #'org-auto-scheduler-review-toggle-freeset)
+  (define-key map (kbd "i")   #'org-auto-scheduler-review-toggle-freeset)
+  (define-key map (kbd "p")   #'org-auto-scheduler-review-pin-task)
   ;; Help
   (define-key map (kbd "?")   #'org-auto-scheduler-review-help))
 
@@ -4152,8 +4312,9 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "m")       #'org-auto-scheduler-review-toggle
       (kbd "b")       #'org-auto-scheduler-review-toggle-non-blocking
       (kbd "s")       #'org-auto-scheduler-review-toggle-splittable
-      (kbd "p")       #'org-auto-scheduler-review-toggle-pinnable
-      (kbd "i")       #'org-auto-scheduler-review-toggle-pinnable
+      (kbd "F")       #'org-auto-scheduler-review-toggle-freeset
+      (kbd "i")       #'org-auto-scheduler-review-toggle-freeset
+      (kbd "p")       #'org-auto-scheduler-review-pin-task
       (kbd "x")       #'org-auto-scheduler-review-execute
       (kbd "C-c C-c") #'org-auto-scheduler-review-execute
       ;; Reordering
@@ -4180,8 +4341,6 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       ;; What-if
       (kbd "e")       #'org-auto-scheduler-review-edit-effort
       ;; Views
-      (kbd "c")       #'org-auto-scheduler-review-toggle-calendar
-      (kbd "v")       #'org-auto-scheduler-review-toggle-calendar
       (kbd "T")       #'org-auto-scheduler-review-open-timegrid
       ;; Move before another task (keyboard drag-to-position)
       (kbd "P")       #'org-auto-scheduler-review-move-before
@@ -4220,109 +4379,78 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 
 (defun org-auto-scheduler-review-toggle ()
   "Toggle the apply checkmark for the task at point.
-On fixed agenda events, toggles their non-blocking status instead.
-In calendar view on fixed agenda events, toggles their non-blocking status."
+On fixed agenda events, toggles their non-blocking status instead."
   (interactive)
-  (if (eq org-auto-scheduler--review-view 'calendar)
-      (let ((event-marker (get-text-property (point) 'event-marker))
-            (event-id (get-text-property (point) 'event-id)))
-        (if (or event-marker event-id)
-            (org-auto-scheduler-review-toggle-non-blocking)
-          (org-auto-scheduler-review-jump)))
-    (let* ((id (tabulated-list-get-id))
-           (entry (tabulated-list-get-entry)))
-      (cond
-       ((and id (string-prefix-p "__event_" id))
-        (org-auto-scheduler-review-toggle-non-blocking))
-       ((and entry id (not (org-auto-scheduler--review-special-row-p id)))
-        (org-auto-scheduler--review-push-undo)
-        (aset entry 0 (if (string= (aref entry 0) "[X]") "[ ]" "[X]"))
-        (tabulated-list-print t)
-        (forward-line 1))))))
+  (let* ((id (tabulated-list-get-id))
+         (entry (tabulated-list-get-entry)))
+    (cond
+     ((and id (string-prefix-p "__event_" id))
+      (org-auto-scheduler-review-toggle-non-blocking))
+     ((and entry id (not (org-auto-scheduler--review-special-row-p id)))
+      (org-auto-scheduler--review-push-undo)
+      (aset entry 0 (if (string= (aref entry 0) "[X]") "[ ]" "[X]"))
+      (tabulated-list-print t)
+      (forward-line 1)))))
 
 (defun org-auto-scheduler-review-toggle-non-blocking ()
-  "Toggle non-blocking status of the event at point in the review buffer.
-Works in both Table view and Calendar view."
+  "Toggle non-blocking status of the event at point in the review buffer."
   (interactive)
   (unless (eq major-mode 'org-auto-scheduler-review-mode)
     (user-error "Not in an Org Auto Scheduler Review buffer"))
-  (if (eq org-auto-scheduler--review-view 'calendar)
-      ;; Calendar View
-      (let* ((event-id (get-text-property (point) 'event-id))
-             (event-marker (get-text-property (point) 'event-marker))
-             (task-id (get-text-property (point) 'task-id)))
-        (cond
-         ((or event-id event-marker)
-          (let* ((m (or event-marker (when event-id (org-id-find event-id t))))
-                 (tid (or event-id (when m (org-with-point-at m (or (org-id-get) (org-id-get-create))))))
-                 (headline (or (and m (org-with-point-at m (org-get-heading t t t t))) "Event"))
-                 (is-nb (org-auto-scheduler-task-non-blocking-p tid m)))
-            (if is-nb
-                (progn
-                  (org-auto-scheduler-unmark-non-blocking tid m)
-                  (message "Event '%s' marked BLOCKING. Press 'r' to recalculate schedule." headline))
-              (org-auto-scheduler-mark-non-blocking tid m headline)
-              (message "Event '%s' marked NON-BLOCKING. Press 'r' to recalculate schedule." headline))
-            (org-auto-scheduler--render-calendar-view)))
-         (task-id
-          (user-error "This is an AUTOSCH task; non-blocking status is for fixed agenda events"))
-         (t
-          (user-error "No event at point in calendar view"))))
-    ;; Table View
-    (let* ((row-id (tabulated-list-get-id))
-           (entry (tabulated-list-get-entry)))
-      (cond
-       ((and row-id (string-prefix-p "__event_" row-id))
-        (org-auto-scheduler--review-push-undo)
-        (let* ((marker (or (get-text-property (point) 'event-marker)
-                           (and entry (get-text-property 0 'event-marker (aref entry 2)))
-                           (and entry (get-text-property 0 'event-marker (aref entry 1)))
-                           (and entry (get-text-property 0 'event-marker (aref entry 0)))))
-               (task-id (or (get-text-property (point) 'event-id)
-                            (and entry (get-text-property 0 'event-id (aref entry 2)))
-                            (and entry (get-text-property 0 'event-id (aref entry 1)))
-                            (and entry (get-text-property 0 'event-id (aref entry 0)))))
-               (m (or marker (when task-id (org-id-find task-id t))))
-               (tid (or task-id (when m (org-with-point-at m (or (org-id-get) (org-id-get-create))))))
-               (headline (or (and m (org-with-point-at m (org-get-heading t t t t)))
-                             (and entry (string-trim (substring-no-properties (aref entry 2))))
-                             "Event"))
-               (is-nb (org-auto-scheduler-task-non-blocking-p tid m)))
-          (if is-nb
-              (progn
-                (org-auto-scheduler-unmark-non-blocking tid m)
-                (message "Event '%s' marked BLOCKING. Press 'r' to recalculate schedule." headline))
-            (org-auto-scheduler-mark-non-blocking tid m headline)
-            (message "Event '%s' marked NON-BLOCKING. Press 'r' to recalculate schedule." headline))
-          ;; Update entry in place in tabulated-list-entries and org-auto-scheduler--review-all-entries
-          (when entry
-            (let ((new-nb (not is-nb)))
-              (aset entry 1 (propertize "📅"
-                                        'face (if new-nb 'default 'shadow)
-                                        'event-marker m 'event-id tid))
-              (let ((hl-text (substring-no-properties (aref entry 2))))
-                (aset entry 2 (propertize hl-text
-                                          'face (if new-nb 'italic 'shadow)
-                                          'event-marker m
-                                          'event-id tid
-                                          'non-blocking new-nb)))
-              (let* ((orig-tag (substring-no-properties (aref entry 5)))
-                     (clean-tag (replace-regexp-in-string " \\[NB\\]" "" orig-tag))
-                     (new-tag (if new-nb (concat clean-tag " [NB]") clean-tag)))
-                (aset entry 5 (propertize new-tag
-                                          'face (if new-nb 'font-lock-doc-face 'shadow)
-                                          'event-marker m 'event-id tid)))
-              (aset entry 7 (propertize (if new-nb "" "🔒")
+  (let* ((row-id (tabulated-list-get-id))
+         (entry (tabulated-list-get-entry)))
+    (cond
+     ((and row-id (string-prefix-p "__event_" row-id))
+      (org-auto-scheduler--review-push-undo)
+      (let* ((marker (or (get-text-property (point) 'event-marker)
+                         (and entry (get-text-property 0 'event-marker (aref entry 2)))
+                         (and entry (get-text-property 0 'event-marker (aref entry 1)))
+                         (and entry (get-text-property 0 'event-marker (aref entry 0)))))
+             (task-id (or (get-text-property (point) 'event-id)
+                          (and entry (get-text-property 0 'event-id (aref entry 2)))
+                          (and entry (get-text-property 0 'event-id (aref entry 1)))
+                          (and entry (get-text-property 0 'event-id (aref entry 0)))))
+             (m (or marker (when task-id (org-id-find task-id t))))
+             (tid (or task-id (when m (org-with-point-at m (or (org-id-get) (org-id-get-create))))))
+             (headline (or (and m (org-with-point-at m (org-get-heading t t t t)))
+                           (and entry (string-trim (substring-no-properties (aref entry 2))))
+                           "Event"))
+             (is-nb (org-auto-scheduler-task-non-blocking-p tid m)))
+        (if is-nb
+            (progn
+              (org-auto-scheduler-unmark-non-blocking tid m)
+              (message "Event '%s' marked BLOCKING. Press 'r' to recalculate schedule." headline))
+          (org-auto-scheduler-mark-non-blocking tid m headline)
+          (message "Event '%s' marked NON-BLOCKING. Press 'r' to recalculate schedule." headline))
+        ;; Update entry in place in tabulated-list-entries and org-auto-scheduler--review-all-entries
+        (when entry
+          (let ((new-nb (not is-nb)))
+            (aset entry 1 (propertize "📅"
+                                      'face (if new-nb 'default 'shadow)
+                                      'event-marker m 'event-id tid))
+            (let ((hl-text (substring-no-properties (aref entry 2))))
+              (aset entry 2 (propertize hl-text
+                                        'face (if new-nb 'italic 'shadow)
+                                        'event-marker m
+                                        'event-id tid
+                                        'non-blocking new-nb)))
+            (let* ((orig-tag (substring-no-properties (aref entry 5)))
+                   (clean-tag (replace-regexp-in-string " \\[NB\\]" "" orig-tag))
+                   (new-tag (if new-nb (concat clean-tag " [NB]") clean-tag)))
+              (aset entry 5 (propertize new-tag
                                         'face (if new-nb 'font-lock-doc-face 'shadow)
-                                        'event-marker m 'event-id tid))
-              (let ((cached (assoc row-id org-auto-scheduler--review-all-entries)))
-                (when cached
-                  (setcdr cached (list entry))))
-              (tabulated-list-print t)))))
-       ((and row-id (not (org-auto-scheduler--review-special-row-p row-id)))
-        (user-error "This is an AUTOSCH task; non-blocking status is for fixed agenda events"))
-       (t
-        (user-error "Not on an agenda event row"))))))
+                                        'event-marker m 'event-id tid)))
+            (aset entry 7 (propertize (if new-nb "" "🔒")
+                                      'face (if new-nb 'font-lock-doc-face 'shadow)
+                                      'event-marker m 'event-id tid))
+            (let ((cached (assoc row-id org-auto-scheduler--review-all-entries)))
+              (when cached
+                (setcdr cached (list entry))))
+            (tabulated-list-print t)))))
+     ((and row-id (not (org-auto-scheduler--review-special-row-p row-id)))
+      (user-error "This is an AUTOSCH task; non-blocking status is for fixed agenda events"))
+     (t
+      (user-error "Not on an agenda event row")))))
 
 (defun org-auto-scheduler-agenda-toggle-non-blocking ()
   "Toggle non-blocking status of the agenda event at point."
@@ -4737,7 +4865,7 @@ Recalculates the schedule immediately afterward unless
         (org-auto-scheduler-review-move-to-day prev-day)))))
 
 (defun org-auto-scheduler-review-move-to-date ()
-  "Prompt for a date and move the task at point to that day."
+  "Prompt for a date (and optional time if pinnable) and move the task at point."
   (interactive)
   (let* ((task-id (tabulated-list-get-id))
          (current-day (org-auto-scheduler--review-get-task-day task-id)))
@@ -4745,16 +4873,30 @@ Recalculates the schedule immediately afterward unless
         (if (and task-id (string-prefix-p "__event_" task-id))
             (user-error "Cannot move fixed agenda event")
           (user-error "Not on a task"))
-      (let* ((prompt (format "Move task to date (current: %s): " current-day))
-             (date-input (org-read-date nil nil nil prompt))
+      (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
+             (marker (and task (nth 7 task)))
+             (is-pinnable (org-auto-scheduler-task-pinnable-p marker task-id))
+             (prompt (if is-pinnable
+                         (format "Move pinnable task to date/time (current: %s): " current-day)
+                       (format "Move task to date (current: %s): " current-day)))
+             (date-input (org-read-date is-pinnable nil nil prompt))
+             (final-ans (or (bound-and-true-p org-read-date-final-answer) date-input))
+             (has-time (string-match-p "[0-9]\{2\}:[0-9]\{2\}" final-ans))
+             (target-day (if (and date-input (>= (length date-input) 10))
+                             (substring date-input 0 10)
+                           date-input))
              (today-str (format-time-string "%Y-%m-%d")))
-        (when (string< date-input today-str)
+        (when (string< target-day today-str)
           (user-error "Cannot schedule tasks in the past (before %s)" today-str))
-        (puthash task-id
-                 (plist-put (gethash task-id org-auto-scheduler--review-overrides)
-                            :pinned-date date-input)
-                 org-auto-scheduler--review-overrides)
-        (org-auto-scheduler-review-move-to-day date-input)))))
+        (let ((over (or (gethash task-id org-auto-scheduler--review-overrides)
+                        (list :order nil :skipped nil))))
+          (setq over (plist-put (plist-put over :target-date target-day)
+                                :pinned-date target-day))
+          (when (and is-pinnable has-time)
+            (setq over (plist-put (plist-put over :pinnable t)
+                                  :pinned-time final-ans)))
+          (puthash task-id over org-auto-scheduler--review-overrides))
+        (org-auto-scheduler-review-move-to-day target-day)))))
 
 (defun org-auto-scheduler--review-entries-day-before (entries id)
   "Return the day string of the nearest day separator at/before ID in ENTRIES.
@@ -4900,7 +5042,8 @@ BLOCKERS-INFO, if non-nil, indicates explicit BLOCKER or DEPENDS_ON dependencies
          (proj-color (and org-auto-scheduler--project-colors
                           (gethash proj-trunc org-auto-scheduler--project-colors)))
          (score (car (org-auto-scheduler-calculate-score marker)))
-         (is-pinned (org-auto-scheduler-task-pinnable-p marker task-id))
+         (is-pinned (org-auto-scheduler-task-pinned-p marker task-id))
+         (is-freeset (org-auto-scheduler-task-freeset-p marker task-id))
          (is-splittable (org-auto-scheduler-task-splittable-p marker task-id))
          (blockers-info (and marker (markerp marker) (marker-buffer marker)
                              (org-auto-scheduler--get-task-blockers-info marker)))
@@ -4970,24 +5113,21 @@ BLOCKERS-INFO, if non-nil, indicates explicit BLOCKER or DEPENDS_ON dependencies
       ;; A placeholder/continuation chunk is marked by blending its badge toward gold rather
       ;; than by a "[Placeholder]" text label -- the St column's ⏳ icon already says what it
       ;; is, so the badge just needs to draw the eye, not repeat it in words.
-      (setq display-headline (concat (org-auto-scheduler--format-depth-prefix
-                                      depth
-                                      (if (eq status :placeholder)
-                                          (org-auto-scheduler--status-blend-color proj-color task marker)
-                                        proj-color)
-                                      blockers-info)
-                                     (cond
-                                      ((and is-pinned is-new)
-                                       (concat (propertize "📌 " 'face '(:inherit bold :foreground "#e5c07b"))
-                                               (propertize "[NEW] " 'face '(:inherit bold :foreground "#98c379"))
-                                               display-headline))
-                                      (is-pinned
-                                       (concat (propertize "📌 " 'face '(:inherit bold :foreground "#e5c07b"))
-                                               display-headline))
-                                      (is-new
-                                       (concat (propertize "[NEW] " 'face '(:inherit bold :foreground "#98c379"))
-                                               display-headline))
-                                      (t display-headline))))
+      (let ((badge-icons (concat
+                          (when is-pinned (propertize "📌 " 'face '(:inherit bold :foreground "#e5c07b")))
+                          (when is-freeset (propertize "⚡ " 'face '(:inherit bold :foreground "#61afef"))))))
+        (setq display-headline (concat (org-auto-scheduler--format-depth-prefix
+                                        depth
+                                        (if (eq status :placeholder)
+                                            (org-auto-scheduler--status-blend-color proj-color task marker)
+                                          proj-color)
+                                        blockers-info)
+                                       badge-icons
+                                       (cond
+                                        (is-new
+                                         (concat (propertize "[NEW] " 'face '(:inherit bold :foreground "#98c379"))
+                                                 display-headline))
+                                        (t display-headline)))))
 
       ;; Apply project color to the project name (blank, not "—", when there is none)
       (let* (
@@ -5251,13 +5391,17 @@ tasks are constrained to start on or after their current day section."
               (unless compact
                 (when (and task-day (not (equal task-day current-day)))
                   (setq current-day task-day)
-                  (let ((day-start (if (string= task-day today-str)
+                  (let* ((task-pinned-time (org-auto-scheduler-task-pinned-time marker task-id))
+                         (day-start (if (string= task-day today-str)
                                        (org-auto-scheduler-get-start-time)
                                      (org-auto-scheduler-time-with-time-string
                                       (org-auto-scheduler-parse-time-string (concat task-day " 00:00"))
                                       org-auto-scheduler-start-time))))
-                    (when (time-less-p current-time day-start)
-                      (setq current-time day-start)))))
+                    (if (and task-pinned-time
+                             (string= (format-time-string "%Y-%m-%d" task-pinned-time) task-day))
+                        (setq current-time task-pinned-time)
+                      (when (time-less-p current-time day-start)
+                        (setq current-time day-start))))))
               (if (string= checked-state "[ ]")
                   (push (list (nth 0 task) current-time current-time '("AUTOSCH") nil (nth 5 task)
                               "SKIPPED" marker (or depth 0) :skipped '("Unchecked by user"))
@@ -5489,26 +5633,16 @@ Automatically recalculates dependent times based on visual layout before executi
         (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))))))
 
 (defun org-auto-scheduler-review-toggle-splittable ()
-  "Toggle SPLITTABLE status of the task at point in the review buffer.
-Works in both Table view and Calendar view."
+  "Toggle SPLITTABLE status of the task at point in the review buffer."
   (interactive)
   (unless (eq major-mode 'org-auto-scheduler-review-mode)
     (user-error "Not in an Org Auto Scheduler Review buffer"))
-  (let* ((is-calendar (eq org-auto-scheduler--review-view 'calendar))
-         (task-id (if is-calendar
-                      (get-text-property (point) 'task-id)
-                    (tabulated-list-get-id)))
-         (entry (unless is-calendar (tabulated-list-get-entry))))
+  (let* ((task-id (tabulated-list-get-id)))
     (cond
-     ((and (not is-calendar)
-           (or (null task-id) (org-auto-scheduler--review-special-row-p task-id)))
+     ((or (null task-id) (org-auto-scheduler--review-special-row-p task-id))
       (if (and task-id (string-prefix-p "__event_" task-id))
           (user-error "Fixed agenda events cannot be marked splittable")
         (user-error "Not on a task")))
-     ((and is-calendar (null task-id))
-      (if (or (get-text-property (point) 'event-id) (get-text-property (point) 'event-marker))
-          (user-error "Fixed agenda events cannot be marked splittable")
-        (user-error "No task at point in calendar view")))
      (t
       (let* ((task-data (assoc task-id org-auto-scheduler-completed-tasks))
              (raw-marker (and task-data (nth 7 task-data)))
@@ -5519,90 +5653,92 @@ Works in both Table view and Calendar view."
           (user-error "Cannot split a placeholder chunk; mark the parent task splittable"))
         (org-auto-scheduler--review-push-undo)
         (let ((now-splittable (org-auto-scheduler-task-toggle-splittable marker task-id)))
-          (if is-calendar
-              (progn
-                (message "Task '%s' marked %s."
-                         headline (if now-splittable "SPLITTABLE" "NOT splittable"))
-                (org-auto-scheduler-review-recalculate)
-                (org-auto-scheduler--render-calendar-view))
-            (message "Task '%s' marked %s.%s"
-                     headline
-                     (if now-splittable "SPLITTABLE" "NOT splittable")
-                     (if org-auto-scheduler-review-auto-recalculate-on-move ""
-                       " Press 'r' to recalculate schedule."))
-            (if org-auto-scheduler-review-auto-recalculate-on-move
-                (org-auto-scheduler-review-recalculate)
-              (tabulated-list-print t)))))))))
+          (message "Task '%s' marked %s.%s"
+                   headline
+                   (if now-splittable "SPLITTABLE" "NOT splittable")
+                   (if org-auto-scheduler-review-auto-recalculate-on-move ""
+                     " Press 'r' to recalculate schedule."))
+          (if org-auto-scheduler-review-auto-recalculate-on-move
+              (org-auto-scheduler-review-recalculate)
+            (tabulated-list-print t))))))))
 
-(defun org-auto-scheduler-review-toggle-pinnable (&optional unpin-arg)
-  "Mark or toggle PINNABLE status of the task at point in the review buffer.
-Prompts for pinned start time.  If given an empty string, or with prefix UNPIN-ARG,
-unpins the task.  Recalculates the schedule so the task starts at the given time
-and other tasks are rescheduled to after.  Works in Table and Calendar views."
-  (interactive "P")
+(defun org-auto-scheduler-review-toggle-freeset ()
+  "Toggle FREESET status of the task at point in the review buffer.
+When marked FREESET, the task can be freely rescheduled in the timegrid
+and table view review buffers without considering day working hours,
+and if it goes beyond midnight, splits to the next day."
+  (interactive)
   (unless (eq major-mode 'org-auto-scheduler-review-mode)
     (user-error "Not in an Org Auto Scheduler Review buffer"))
-  (let* ((is-calendar (eq org-auto-scheduler--review-view 'calendar))
-         (task-id (if is-calendar
-                      (get-text-property (point) 'task-id)
-                    (tabulated-list-get-id))))
+  (let* ((task-id (tabulated-list-get-id)))
     (cond
-     ((and (not is-calendar)
-           (or (null task-id) (org-auto-scheduler--review-special-row-p task-id)))
+     ((or (null task-id) (org-auto-scheduler--review-special-row-p task-id))
       (if (and task-id (string-prefix-p "__event_" task-id))
-          (user-error "Fixed agenda events are already pinned calendar events")
+          (user-error "Fixed agenda events cannot be marked freeset")
         (user-error "Not on a task")))
-     ((and is-calendar (null task-id))
-      (if (or (get-text-property (point) 'event-id) (get-text-property (point) 'event-marker))
-          (user-error "Fixed agenda events are already pinned calendar events")
-        (user-error "No task at point in calendar view")))
      (t
       (let* ((task-data (assoc task-id org-auto-scheduler-completed-tasks))
              (raw-marker (and task-data (nth 7 task-data)))
              (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id))
              (headline (if task-data (nth 5 task-data) "Task"))
-             (status (and task-data (nth 9 task-data)))
-             (is-already-pinned (org-auto-scheduler-task-pinnable-p marker task-id))
-             (current-start (and task-data (nth 1 task-data)))
-             (default-str (cond
-                           (is-already-pinned
-                            (let ((pt (org-auto-scheduler-task-pinned-time marker task-id)))
-                              (if pt (format-time-string "%Y-%m-%d %H:%M" pt) "")))
-                           (current-start
-                            (format-time-string "%Y-%m-%d %H:%M" current-start))
-                           (t (format-time-string "%Y-%m-%d 09:00")))))
+             (status (and task-data (nth 9 task-data))))
+        (when (eq status :placeholder)
+          (user-error "Cannot set a placeholder chunk; set the parent task"))
+        (org-auto-scheduler--review-push-undo)
+        (let ((now-freeset (org-auto-scheduler-task-toggle-freeset marker task-id)))
+          (message "Task '%s' marked %s.%s"
+                   headline
+                   (if now-freeset "FREESET" "NOT freeset")
+                   (if org-auto-scheduler-review-auto-recalculate-on-move ""
+                     " Press 'r' to recalculate schedule."))
+          (if org-auto-scheduler-review-auto-recalculate-on-move
+              (org-auto-scheduler-review-recalculate)
+            (tabulated-list-print t))))))))
+
+(defalias 'org-auto-scheduler-review-toggle-pinnable 'org-auto-scheduler-review-toggle-freeset)
+
+(defun org-auto-scheduler-review-pin-task (&optional arg)
+  "Pin the task at point to an exact scheduled date/time (prompted).
+Defaults to the task's currently scheduled time in the preview review buffer.
+With prefix ARG (C-u p) or empty input, unpins the task."
+  (interactive "P")
+  (unless (eq major-mode 'org-auto-scheduler-review-mode)
+    (user-error "Not in an Org Auto Scheduler Review buffer"))
+  (let* ((task-id (tabulated-list-get-id)))
+    (cond
+     ((or (null task-id) (org-auto-scheduler--review-special-row-p task-id))
+      (if (and task-id (string-prefix-p "__event_" task-id))
+          (user-error "Fixed agenda events cannot be pinned")
+        (user-error "Not on a task")))
+     (t
+      (let* ((task-data (assoc task-id org-auto-scheduler-completed-tasks))
+             (raw-marker (and task-data (nth 7 task-data)))
+             (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id))
+             (headline (if task-data (nth 5 task-data) "Task"))
+             (status (and task-data (nth 9 task-data))))
         (when (eq status :placeholder)
           (user-error "Cannot pin a placeholder chunk; pin the parent task"))
-        (if (or unpin-arg
-                (and is-already-pinned
-                     (string= (read-string (format "Task '%s' is pinned (%s). Unpin? [y/N]: "
-                                                   headline default-str)
-                                           nil nil "n")
-                              "y")))
-            ;; Unpin path
+        (if arg
             (progn
               (org-auto-scheduler--review-push-undo)
-              (org-auto-scheduler-task-set-pinnable marker task-id nil t)
-              (message "Unpinned '%s'. Recalculating..." headline)
-              (org-auto-scheduler-review-recalculate)
-              (when is-calendar (org-auto-scheduler--render-calendar-view)))
-          ;; Prompt for pin time
-          (let* ((prompt (format "Pin '%s' to time (e.g. '14:00' or 'YYYY-MM-DD HH:MM', empty to cancel): "
-                                 headline))
-                 (time-input (read-string prompt default-str)))
-            (if (or (null time-input) (string-empty-p (string-trim time-input)))
-                (message "Pin cancelled")
-              (org-auto-scheduler--review-push-undo)
-              (let* ((res-time (org-auto-scheduler-task-set-pinnable marker task-id time-input nil))
-                     (parsed (org-auto-scheduler-task-pinned-time marker task-id)))
-                (when parsed
-                  (org-auto-scheduler--review-reposition-task-chronologically task-id parsed))
-                (message "Pinned '%s' to %s. Rescheduling subsequent tasks..." headline res-time)
-                (org-auto-scheduler-review-recalculate)
-                (when is-calendar (org-auto-scheduler--render-calendar-view))
-                (unless is-calendar
-                  (org-auto-scheduler--review-goto-task task-id)))))))))))
-
+              (org-auto-scheduler-task-set-pinned-time marker task-id nil t)
+              (message "Task '%s' unpinned." headline)
+              (org-auto-scheduler--review-maybe-auto-recalculate task-id))
+          (let* ((curr-start (and task-data (nth 1 task-data)))
+                 (default-time-str (if curr-start
+                                       (format-time-string "%Y-%m-%d %H:%M" curr-start)
+                                     (format-time-string "%Y-%m-%d %H:%M")))
+                 (prompt (format "Pin task to date/time (default %s, empty to unpin): " default-time-str))
+                 (date-input (org-read-date t nil nil prompt nil default-time-str))
+                 (final-ans (or (bound-and-true-p org-read-date-final-answer) date-input)))
+            (org-auto-scheduler--review-push-undo)
+            (if (or (null final-ans) (string-empty-p (string-trim final-ans)))
+                (progn
+                  (org-auto-scheduler-task-set-pinned-time marker task-id nil t)
+                  (message "Task '%s' unpinned." headline))
+              (let ((formatted (org-auto-scheduler-task-set-pinned-time marker task-id final-ans)))
+                (message "Task '%s' pinned to %s." headline formatted)))
+            (org-auto-scheduler--review-maybe-auto-recalculate task-id))))))))
 (defun org-auto-scheduler-review-undo ()
   "Undo the last modification in the review buffer."
   (interactive)
@@ -5771,197 +5907,6 @@ and other tasks are rescheduled to after.  Works in Table and Calendar views."
       (tabulated-list-print t)
       (message "Effort updated to %d min (press 'r' to recalculate schedule)" new-effort))))
 
-(defun org-auto-scheduler-review-toggle-calendar ()
-  "Toggle between table view and calendar view in the review buffer."
-  (interactive)
-  (if (eq org-auto-scheduler--review-view 'calendar)
-      (progn
-        (setq org-auto-scheduler--review-view 'table)
-        (let ((inhibit-read-only t))
-          (erase-buffer))
-        (tabulated-list-init-header)
-        (tabulated-list-print t)
-        (setq header-line-format
-              (org-auto-scheduler--review-header-line tabulated-list-entries))
-        (message "Switched to Table View"))
-    (setq org-auto-scheduler--review-view 'calendar)
-    (org-auto-scheduler--render-calendar-view)))
-
-(defun org-auto-scheduler--render-calendar-view ()
-  "Render the calendar view of the proposed schedule."
-  (let ((inhibit-read-only t)
-        (tasks (cl-remove-if (lambda (t2) (memq (nth 9 t2) '(:failed :blocked)))
-                             org-auto-scheduler-completed-tasks)))
-    (erase-buffer)
-    (setq header-line-format
-          (concat " " (propertize "Auto Scheduler Calendar View" 'face 'bold)
-                  " │ [v/c] Table View │ [b] Toggle Non-Blocking │ [TAB/RET] Jump to task │ Scroll to navigate"))
-    (insert (propertize " Proposed Schedule Calendar View \n" 'face 'org-document-title))
-    (insert (propertize "========================================================\n\n" 'face 'shadow))
-    (let ((days-hash (make-hash-table :test 'equal))
-          (dates nil))
-      (dolist (task tasks)
-        (let* ((start (nth 1 task))
-               (date-str (format-time-string "%Y-%m-%d" start)))
-          (cl-pushnew date-str dates :test #'string=)
-          (puthash date-str (cons task (gethash date-str days-hash)) days-hash)))
-      (when org-auto-scheduler-review-show-agenda-events
-        (let ((today-str (format-time-string "%Y-%m-%d")))
-          (when (org-auto-scheduler--get-existing-events-for-date today-str)
-            (cl-pushnew today-str dates :test #'string=))))
-      (if (null dates)
-          (insert "  No scheduled tasks or events to display.\n")
-        (setq dates (sort dates #'string<))
-        (dolist (date-str dates)
-          (let* ((day-tasks (nreverse (gethash date-str days-hash)))
-                 (day-events (when org-auto-scheduler-review-show-agenda-events
-                               (org-auto-scheduler--get-existing-events-for-date date-str)))
-                 (all-time-ranges (append
-                                   (mapcar (lambda (tk) (cons (nth 1 tk) (nth 2 tk))) day-tasks)
-                                   (delq nil (mapcar (lambda (ev)
-                                                       (when (nth 6 ev)
-                                                         (cons (nth 1 ev) (nth 2 ev))))
-                                                     day-events))))
-                 (parsed-date (if all-time-ranges
-                                  (car (car all-time-ranges))
-                                (org-auto-scheduler-parse-time-string (concat date-str " 09:00"))))
-                 (min-start (if all-time-ranges
-                                (cl-reduce (lambda (a b) (if (time-less-p a b) a b))
-                                           (mapcar #'car all-time-ranges))
-                              (org-auto-scheduler-parse-time-string (concat date-str " 09:00"))))
-                 (max-end (if all-time-ranges
-                              (cl-reduce (lambda (a b) (if (time-less-p a b) b a))
-                                         (mapcar #'cdr all-time-ranges))
-                            (org-auto-scheduler-parse-time-string (concat date-str " 17:00"))))
-                 (start-hour (max 0 (- (string-to-number (format-time-string "%H" min-start)) 1)))
-                 (end-hour (min 23 (+ (string-to-number (format-time-string "%H" max-end)) 1))))
-            (insert (propertize (format " 📅 %s \n" (format-time-string "%A, %B %d, %Y" parsed-date))
-                                'face 'bold-italic))
-            (insert (propertize " ──────────────────────────────────────────────────────\n" 'face 'shadow))
-            (let ((hour start-hour)
-                  (minute 0)
-                  (last-printed-task-id nil)
-                  (last-printed-ev-id nil))
-              (while (<= hour end-hour)
-                (let* ((slot-time (org-auto-scheduler-parse-time-string (format "%s %02d:%02d" date-str hour minute)))
-                       (active-task (cl-find-if (lambda (t2)
-                                                  (let ((ts (nth 1 t2))
-                                                        (te (nth 2 t2)))
-                                                    (and (not (time-less-p slot-time ts))
-                                                         (time-less-p slot-time te))))
-                                                day-tasks))
-                       (active-event (cl-find-if (lambda (ev)
-                                                   (let ((es (nth 1 ev))
-                                                         (ee (nth 2 ev))
-                                                         (ht (nth 6 ev)))
-                                                     (and ht
-                                                          (not (time-less-p slot-time es))
-                                                          (time-less-p slot-time ee))))
-                                                 day-events)))
-                  (insert (format "  %02d:%02d │ " hour minute))
-                  (cond
-                   ((and active-task active-event)
-                    ;; Both task and non-blocking event in same slot
-                    (let* ((task-id (car active-task))
-                           (headline (nth 5 active-task))
-                           (marker (nth 7 active-task))
-                           (project-name (or (org-auto-scheduler--get-project-name marker) "—"))
-                           (proj-trunc (org-auto-scheduler--truncate project-name 18))
-                           (color (and org-auto-scheduler--project-colors
-                                       (gethash proj-trunc org-auto-scheduler--project-colors)))
-                           (ev-id (nth 0 active-event))
-                           (ev-marker (or (nth 7 active-event)
-                                          (when (and ev-id (stringp ev-id)) (org-id-find ev-id t))))
-                           (ev-hl (or (nth 5 active-event) "Event")))
-                      (insert (propertize "█" 'face (if color `(:foreground ,color) 'default)
-                                          'task-id task-id 'mouse-face 'highlight 'help-echo "RET/TAB to jump to task")
-                              (propertize " " 'task-id task-id))
-                      (if (equal task-id last-printed-task-id)
-                          (insert (propertize "║" 'face (if color `(:foreground ,color) 'shadow) 'task-id task-id))
-                        (setq last-printed-task-id task-id)
-                        (insert (propertize (format "[%s] %s" proj-trunc headline)
-                                            'face (if color `(:foreground ,color) 'default)
-                                            'task-id task-id 'mouse-face 'highlight 'help-echo "RET/TAB to jump")))
-                      (insert (propertize (format "  │ %s" ev-hl)
-                                          'face 'font-lock-doc-face
-                                          'event-id ev-id
-                                          'event-marker ev-marker
-                                          'non-blocking t
-                                          'mouse-face 'highlight
-                                          'help-echo "b: toggle non-blocking | RET/TAB: jump"))))
-                   (active-task
-                    (setq last-printed-ev-id nil)
-                    (let* ((task-id (car active-task))
-                           (headline (nth 5 active-task))
-                           (marker (nth 7 active-task))
-                           (project-name (or (org-auto-scheduler--get-project-name marker) "—"))
-                           (proj-trunc (org-auto-scheduler--truncate project-name 18))
-                           (color (and org-auto-scheduler--project-colors
-                                       (gethash proj-trunc org-auto-scheduler--project-colors)))
-                           (bar-char (propertize "█" 'face (if color `(:foreground ,color) 'default)
-                                                 'task-id task-id
-                                                 'mouse-face 'highlight
-                                                 'help-echo "RET/TAB to jump to task")))
-                      (insert bar-char (propertize " " 'task-id task-id))
-                      (if (equal task-id last-printed-task-id)
-                          (insert (propertize "║" 'face (if color `(:foreground ,color) 'shadow)
-                                              'task-id task-id
-                                              'mouse-face 'highlight
-                                              'help-echo "RET/TAB to jump to task"))
-                        (setq last-printed-task-id task-id)
-                        (let ((start-lbl (format-time-string "%H:%M" (nth 1 active-task)))
-                              (end-lbl (format-time-string "%H:%M" (nth 2 active-task))))
-                          (insert (propertize (format "[%s] %s (%s–%s)" proj-trunc headline start-lbl end-lbl)
-                                              'face (if color `(:foreground ,color) 'default)
-                                              'task-id task-id
-                                              'mouse-face 'highlight
-                                              'help-echo "RET/TAB to jump to task"))))))
-                   (active-event
-                    (setq last-printed-task-id nil)
-                    (let* ((ev-id (nth 0 active-event))
-                           (ev-marker (or (nth 7 active-event)
-                                          (when (and ev-id (stringp ev-id)) (org-id-find ev-id t))))
-                           (is-nb (org-auto-scheduler-task-non-blocking-p ev-id ev-marker))
-                           (ev-hl (or (nth 5 active-event) "Event"))
-                           (ev-face (if is-nb 'font-lock-doc-face 'shadow))
-                           (bar-char (propertize (if is-nb "░" "▓") 'face ev-face
-                                                 'event-id ev-id
-                                                 'event-marker ev-marker
-                                                 'non-blocking is-nb
-                                                 'mouse-face 'highlight
-                                                 'help-echo "b: toggle non-blocking | RET/TAB: jump")))
-                      (insert bar-char (propertize " " 'event-id ev-id 'event-marker ev-marker))
-                      (if (equal ev-id last-printed-ev-id)
-                          (insert (propertize "║" 'face ev-face
-                                              'event-id ev-id 'event-marker ev-marker
-                                              'mouse-face 'highlight
-                                              'help-echo "b: toggle non-blocking | RET/TAB: jump"))
-                        (setq last-printed-ev-id ev-id)
-                        (let ((start-lbl (format-time-string "%H:%M" (nth 1 active-event)))
-                              (end-lbl (format-time-string "%H:%M" (nth 2 active-event))))
-                          (insert (propertize (if is-nb
-                                                  (format "[Non-Blocking] %s (%s–%s)"
-                                                          ev-hl start-lbl end-lbl)
-                                                (format "🔒 [Event] %s (%s–%s)"
-                                                        ev-hl start-lbl end-lbl))
-                                              'face ev-face
-                                              'event-id ev-id
-                                              'event-marker ev-marker
-                                              'non-blocking is-nb
-                                              'mouse-face 'highlight
-                                              'help-echo "b: toggle non-blocking | RET/TAB: jump"))))))
-                   (t
-                    (setq last-printed-task-id nil
-                          last-printed-ev-id nil)
-                    (insert (propertize "·" 'face 'shadow))))
-                  (insert "\n")
-                  (setq minute (+ minute 15))
-                  (when (>= minute 60)
-                    (setq minute 0)
-                    (setq hour (1+ hour))))))
-            (insert "\n")))))
-    (goto-char (point-min))))
-
 ;;; org-timegrid integration (optional)
 
 (defvar-local org-auto-scheduler--timegrid-source-buffer nil
@@ -6079,7 +6024,7 @@ grid entirely (skipped tasks in particular are never shown, per request)."
 (defun org-auto-scheduler--timegrid-event-from-fixed-event (ev)
   "Convert a fixed (non-AUTOSCH) agenda item EV into an `org-timegrid-event'.
 Marked with a lock icon 🔒 when blocking, none when toggled non-blocking,
-matching the display used in the review buffer and plain-text calendar view."
+matching the display used in the review buffer."
   (let ((start (nth 1 ev))
         (end (nth 2 ev)))
     (when (and start end (time-less-p start end))
@@ -6166,6 +6111,18 @@ only decides ordering; the task's own effort still decides duration."
          (today-str (format-time-string "%Y-%m-%d")))
     (when (string< new-day today-str)
       (user-error "Cannot schedule tasks in the past (before %s)" today-str))
+    ;; If the task is PINNED or FREESET, record new-start as its target time in review overrides
+    (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
+           (marker (and task (nth 7 task)))
+           (is-pinned (org-auto-scheduler-task-pinned-p marker task-id))
+           (is-freeset (org-auto-scheduler-task-freeset-p marker task-id)))
+      (when (or is-pinned is-freeset)
+        (let ((over (or (gethash task-id org-auto-scheduler--review-overrides)
+                        (list :order nil :skipped nil :target-date new-day))))
+          (puthash task-id
+                   (plist-put (plist-put over :pinned-time (format-time-string "%Y-%m-%d %H:%M" new-start))
+                              :pinned (or is-pinned t))
+                   org-auto-scheduler--review-overrides))))
     (let ((next-id
            (catch 'found
              (dolist (row tabulated-list-entries)
@@ -6254,7 +6211,6 @@ it -- only a genuine week navigation should move it."
   (when (and (derived-mode-p 'org-timegrid-mode)
              org-auto-scheduler--timegrid-source-buffer
              (buffer-live-p org-auto-scheduler--timegrid-source-buffer)
-             (eq (buffer-local-value 'org-auto-scheduler--review-view org-auto-scheduler--timegrid-source-buffer) 'table)
              (boundp 'org-timegrid--state) org-timegrid--state
              (fboundp 'org-timegrid--calendar-state-week-start))
     (let* ((week-start (org-timegrid--calendar-state-week-start org-timegrid--state))
@@ -6423,7 +6379,8 @@ buffer."
       (insert "  SPC, m       Toggle application of task at point (or toggle non-blocking on event)\n")
       (insert "  b            Toggle non-blocking status of fixed agenda event\n")
       (insert "  s            Toggle SPLITTABLE status on task at point\n")
-      (insert "  p, i         Mark task PINNABLE (pin to specific time; other tasks reschedule after)\n")
+      (insert "  F, i         Toggle FREESET status (off-hours flexible; splits at midnight)\n")
+      (insert "  p            Pin task to prompted time (default: preview time; C-u to unpin)\n")
       (insert "  TAB, RET     Jump to task or event in Org file\n")
       (insert "  x, C-c C-c   Apply all checked scheduled times to Org files\n")
       (insert "  U, p         Move task up (manually reorder / cross days)\n")
@@ -6440,7 +6397,6 @@ buffer."
       (insert "  u            Undo last toggle, move, filter, or override\n")
       (insert "  e            Edit estimated effort of task at point (What-If)\n")
       (insert "  E            Toggle showing existing fixed agenda events\n")
-      (insert "  v, c         Toggle between Table View and Calendar View\n")
       (insert "  T            Open proposed schedule in org-timegrid (if enabled/installed)\n\n")
       (insert "Filters (prefix with 'f'):\n")
       (insert "  f t          Show only tasks scheduled for today\n")

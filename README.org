@@ -19,7 +19,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#how-scoring-works][How Scoring Works]]
 - [[#how-sorting-works][How Sorting Works]]
 - [[#review-and-apply-buffer][Review & Apply Buffer]]
-  - [[#dual-views-table-and-calendar][Dual Views: Table & Calendar]]
+  - [[#column-table-view][Column Table View]]
   - [[#fixed-agenda-events-and-non-blocking-tasks][Fixed Agenda Events & Non-Blocking Tasks]]
   - [[#persistent-review-decisions-and-state-file][Persistent Review Decisions & State File]]
   - [[#smart-restore--merge][Smart Restore & Merge]]
@@ -43,7 +43,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 
 - *Smart Scoring:* Multi-factor scoring (priority, deadline urgency, effort, category, state).
 - *Dependency-Aware Sorting:* Topological sort via Kahn's algorithm respects =BLOCKER= / =DEPENDS_ON= chains.
-- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules with dual Column Table and 15-minute chronological Calendar timeline views.
+- *Interactive Review Buffer:* Preview, reorder, toggle, and approve proposed schedules with a structured Column Table and optional visual =org-timegrid= timeline integration.
 - *Non-Blocking Calendar Support:* Mark fixed events as non-blocking so tasks can be scheduled concurrently in those time windows.
 - *Persistent Review Decisions & State File:* Save custom orderings, skipped tasks, and target dates across sessions with automatic multi-instance sync and smart restore-and-merge.
 - *Splittable Tasks & Multi-Day Placeholders:* Tasks tagged =:SPLITTABLE:= schedule today's available chunk and pin temporary placeholder subtasks across subsequent days for remaining effort. Preserves clocked time into parent tasks, syncs with CalDAV/Google Calendar, and auto-cleans each morning.
@@ -286,15 +286,12 @@ a depth marker of 99 as a warning signal.
 buffer.
 
 The review buffer lets you inspect proposed schedules, move tasks between slots and days,
-toggle fixed calendar events as non-blocking, preview the schedule in a visual 15-minute calendar
-timeline, and save decisions across sessions.
+toggle fixed calendar events as non-blocking, preview the schedule in an interactive weekly grid
+via =org-timegrid= (=T=), and save decisions across sessions.
 
-*** Dual Views: Table and Calendar
-<<dual-views-table-and-calendar>>
+*** Column Table View
+<<column-table-view>>
 
-Switch between the two visual modes anytime by pressing =v= or =c=:
-
-**** 1. Column Table View (Default)
 A structured list grouped by day with day header statistics (e.g. =─── Today (Monday, 2026-09-21) [3h 45m planned] ───=):
 
 | Column      | Description                                                                                          |
@@ -307,14 +304,6 @@ A structured list grouped by day with day header statistics (e.g. =─── Tod
 | =Project=   | Human-readable project name or tag badge for calendar events.                                       |
 | =Score=     | Composite scheduling score (=—= for fixed calendar events).                                          |
 | =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking fixed event).          |
-
-**** 2. Chronological Calendar View (=v= / =c=)
-Pressing =v= or =c= transforms the buffer into an ASCII/Unicode 15-minute multi-day visual calendar:
-- Vertical timeline with 15-minute slots: =09:00=, =09:15=, =09:30=, etc.
-- Task blocks rendered with colored bar characters (=█=) and continuation lines (=║=).
-- Project badge and time range clearly visible: =[Work] Deploy API (09:15–10:45)=.
-- Interactive jumping: press =RET= or =TAB= on any task or event in the calendar to jump directly to its Org headline.
-- Concurrent non-blocking events rendered side-by-side on the same line (=█ [Proj] Task  │ Team Sync=).
 
 *** Fixed Agenda Events and Non-Blocking Tasks
 <<fixed-agenda-events-and-non-blocking-tasks>>
@@ -380,8 +369,9 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | =TAB= / =RET=         | =review-jump=                                | Open the original Org task or agenda event in another window.                  |
 | =x= / =C-c C-c=       | =review-execute=                             | Recalculate, persist decisions, apply =[X]= tasks to Org files, and close.     |
 | =U= / =K=             | =review-move-up=                             | Move current task up in list (crosses day separators into previous day).       |
-| =s=                   | =review-toggle-splittable=                   | Toggle SPLITTABLE status of task (splits across days/events when fitting).     |
-| =p= / =i=             | =review-toggle-pinnable=                     | Mark/toggle PINNABLE (prompts for time; other tasks reschedule to after).      |
+| =p=                   | =review-pin-task=                            | Pin task to prompted start time (default: preview time; C-u p clears). 📌      |
+| =F= / =i=             | =review-toggle-freeset=                      | Toggle FREESET (bypass workday hours; midnight split; no prompt). ⚡          |
+| =s=                   | =review-toggle-splittable=                   | Toggle SPLITTABLE status of task (splits across gaps/days). [s]               |
 | =D= / =n= / =J=       | =review-move-down=                           | Move current task down in list (crosses day separators into next day).         |
 | =>= / =+= / =M-down=  | =review-move-day-forward=                    | Move current task to next scheduled day (skips excluded days).                 |
 | =<= / =-= / =M-up=    | =review-move-day-backward=                   | Move current task to previous scheduled day (cannot move into past).           |
@@ -394,11 +384,10 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | =u=                   | =review-undo=                                | Undo last modification (toggle, reorder, effort edit, mark, or filter).        |
 | =e=                   | =review-edit-effort=                         | Edit estimated effort of task at point in-memory (What-If scenario planning).  |
 | =E=                   | =review-toggle-agenda-events=                | Toggle showing existing fixed agenda/calendar events in review list.            |
-| =v= / =c=             | =review-toggle-calendar=                     | Toggle between Column Table view and multi-day Chronological Calendar View.    |
 | =?=                   | =review-help=                                | Show interactive help buffer detailing all review commands.                   |
 
 **** Evil / Spacemacs Compatibility
-All review mode keybindings (including =K=, =J=, =U=, =D=, =b=, =c=, =v=, =S=, =M=, =C=, and prefix keys =f= and =*=) are natively bound in Evil's =normal= and =motion= states, ensuring seamless modal editing without key collisions.
+All review mode keybindings (including =K=, =J=, =U=, =D=, =p=, =F=, =i=, =s=, =b=, =S=, =M=, =C=, =T=, and prefix keys =f= and =*=) are natively bound in Evil's =normal= and =motion= states, ensuring seamless modal editing without key collisions.
 
 *** Filtering Commands (Prefix: =f= or =/=)
 
@@ -576,24 +565,33 @@ Placeholder subtasks are completely ephemeral:
 - *Manual Cleanup:* You can also run =M-x org-auto-scheduler-cleanup-placeholders= or press =k= in the dispatch menu (=M-x org-auto-scheduler-dispatch=) anytime.
 
 *** Review Shortcuts for Splittable Tasks
-Inside the Review & Apply buffer (both Column Table view and Chronological Calendar view):
+Inside the Review & Apply buffer:
 - Press =s= on any task to toggle its =SPLITTABLE= status.
 - Tasks marked splittable display an =[s]= indicator in the duration column.
 - The schedule automatically recalculates, splitting the task into available gaps or multi-day chunks as needed.
 
-** Pinnable Tasks & Reordering Behavior
-<<pinnable-tasks--reordering-behavior>>
+** FREESET Tasks (Flexible Hours & Midnight Splitting)
+<<freeset-tasks-flexible-hours--midnight-splitting>>
 
-The =:PINNABLE:= tag and property allow tasks to be anchored to specific times while dynamically adjusting the rest of the schedule around them.
+A task marked as =FREESET= (via tag =:freeset:= or property =:FREESET: t=) bypasses normal working hour constraints during review and reordering:
 
-*** Initial Scheduling vs. Reordering Behavior
-- *Initial Scheduling:* Tasks marked with =:PINNABLE:= are initially scheduled according to the *usual order*, strictly respecting your normal working hours (=org-auto-scheduler-start-time= to =org-auto-scheduler-end-time=) and calculated task scores.
-- *Reordering in Review Window:* In the Review & Apply buffer, pressing =p= or =i= marks the task as =PINNABLE= and prompts for a pinned start time (e.g. =14:00= or =2026-09-20 18:30=, defaulting to its current schedule):
-  1. *Pinned to Specific Time:* The task is placed strictly at that designated start time.
-  2. *Subsequent Tasks Rescheduled:* Other tasks are automatically rescheduled to start *after* the pinned task, preventing collisions.
-  3. *Exceeding Working Hours:* Pinned tasks are allowed to exceed normal day boundaries (=org-auto-scheduler-start-time= and =org-auto-scheduler-end-time=), making them ideal for early-morning commitments or evening study/work sessions.
-  4. *Midnight Splitting:* If the pinned task still does not fit before midnight (=24:00=), it is automatically treated as =SPLITTABLE= to the next day: today's chunk runs until midnight, and remaining effort rolls over to the next day as a placeholder subtask starting at normal morning hours.
-  5. *Unpinning:* Pressing =p= on an already-pinned task prompts to unpin, or with prefix argument =C-u p= immediately clears the pinned time and restores normal scheduling flexibility.
+- *Initial Automatic Scheduling:* Scheduled according to usual order, priority, and working hours (=org-auto-scheduler-start-time= to =org-auto-scheduler-end-time=).
+- *Freely Reorderable:* In the review table and timegrid buffers, =FREESET= tasks can be moved anywhere, including before workday start or after workday end.
+- *Midnight Splitting:* If a =FREESET= task extends past midnight (=24:00=), it automatically splits across midnight: today's chunk runs until 00:00, and the remainder rolls over to the next day as a placeholder subtask.
+- *Toggle Shortcut:* Press =F= or =i= in the Review buffer to toggle =FREESET= without any prompt. Displays the =⚡ = badge in the review table.
+- *Backwards Compatibility:* Legacy tag =:pinnable:= and property =:PINNABLE: t= are fully supported as aliases for =FREESET=.
+
+** PINNED Tasks (Exact-Time Anchoring)
+<<pinned-tasks-exact-time-anchoring>>
+
+A task marked as =PINNED= is anchored to an exact designated time (=YYYY-MM-DD HH:MM= or =HH:MM=):
+
+- *Exact Anchor:* Pinned tasks are locked directly to their specified time.
+- *Collision Avoidance:* Other flexible tasks are automatically scheduled around the pinned task reservation.
+- *Subsequent Operations:* Pinned times persist across subsequent scheduler runs and review recalculations until explicitly cleared.
+- *Review Shortcut:* Press =p= in the Review buffer to pin a task. By default, the prompt is pre-filled with the task's current preview start time in the buffer.
+- *Unpinning:* To unpin, press =C-u p= or submit an empty string at the prompt. Displays the =📌 = badge in the review table.
+- *Properties & Tags:* Saved as property =:PINNED_TIME: YYYY-MM-DD HH:MM= and =:PINNED: t= (or tag =:pinned:=).
 
 ** Agenda Bump
 
