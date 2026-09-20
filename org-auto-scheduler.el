@@ -324,23 +324,53 @@ to the next day in its entirety rather than being split into small fragments."
 (defcustom org-auto-scheduler-background-enabled nil
   "When non-nil, enable background auto-scheduling when Emacs is idle."
   :type 'boolean
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (fboundp 'org-auto-scheduler-setup-background)
+           (org-auto-scheduler-setup-background)))
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-idle-time 300
   "Number of idle seconds before running the background scheduler."
   :type 'integer
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (fboundp 'org-auto-scheduler-setup-background)
+           (org-auto-scheduler-setup-background)))
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-background-interval 300
-  "Interval in seconds for background scheduling (default: 5 minutes)."
+  "Interval in seconds between background scheduling runs during continuous idle."
   :type 'integer
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (fboundp 'org-auto-scheduler-setup-background)
+           (org-auto-scheduler-setup-background)))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-background-async t
+  "When non-nil, execute background auto-scheduling asynchronously in a thread.
+This prevents Emacs from freezing or blocking user input during background runs."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-background-pause-on-clock nil
+  "When non-nil, pause background auto-scheduling while a task is clocked in.
+When nil (default), background scheduling proceeds even if a clock is running."
+  :type 'boolean
   :group 'org-auto-scheduler)
 
 (defvar org-auto-scheduler--idle-timer nil
-  "Timer for background auto-scheduling.")
+  "Primary idle timer for background auto-scheduling.")
+
+(defvar org-auto-scheduler--repeat-idle-timer nil
+  "Timer for repeating background auto-scheduling during continuous idle.")
 
 (defvar org-auto-scheduler--background-running nil
   "Flag to prevent concurrent background scheduling runs.")
+
+(defvar org-auto-scheduler--background-thread nil
+  "Thread object running the background scheduler asynchronously.")
 
 (defcustom org-auto-scheduler-sync-caldav t
   "When non-nil, automatically sync with CalDAV before and after scheduling tasks."
@@ -387,6 +417,30 @@ installed; it is not a dependency of org-auto-scheduler and is not
 pulled in automatically."
   :type 'boolean
   :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-review-timegrid-layout 'horizontal
+  "Default layout style when opening the review timegrid view.
+Can be `horizontal' (timegrid above the review buffer, showing full week / 7 days)
+or `side-by-side' (timegrid on the left showing `org-auto-scheduler-review-timegrid-side-by-side-days'
+days, and review table on the right).
+You can toggle between these layouts anytime with `i' in either the review
+table or the timegrid."
+  :type '(choice (const :tag "Horizontal split (timegrid above, table below)" horizontal)
+                 (const :tag "Side-by-side (timegrid on left, table on right)" side-by-side))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-review-timegrid-side-by-side-days 3
+  "Number of days displayed in the timegrid when in side-by-side layout."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-review-timegrid-horizontal-days 7
+  "Number of days displayed in the timegrid when in horizontal layout."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defvar-local org-auto-scheduler--timegrid-current-layout nil
+  "Tracks whether the active timegrid split is 'side-by-side or 'horizontal.")
 
 (defvar org-auto-scheduler--ignore-target-dates-p nil
   "Internal flag: when non-nil, ignore transient target-date overrides during recalculation.")
@@ -622,6 +676,11 @@ Each entry is of the form:
 
 (defvar org-auto-scheduler--state-file-last-mtime nil
   "Last recorded modification time of `org-auto-scheduler-review-state-file`.")
+
+(defvar org-auto-scheduler--pinned-cache nil
+  "Cache for pinned task reservations during a scheduling/recalculating run.
+Hash table mapping date string (or all-dates key) to list of reservation items.")
+
 
 (defun org-auto-scheduler--state-file-mtime ()
   "Return modification time of `org-auto-scheduler-review-state-file`, or nil if non-existent."
@@ -1009,6 +1068,7 @@ Interactively, prompts the user to select SCOPE."
    (list (intern (completing-read "Clear saved decisions: "
                                   '("all" "skipped" "order" "non-blocking" "task")
                                   nil t nil nil "all"))))
+  (setq org-auto-scheduler--pinned-cache nil)
   (pcase scope
     ('all
      (setq org-auto-scheduler--saved-review-decisions nil)
@@ -1474,6 +1534,8 @@ VISITED is an internal list to prevent infinite loops from circular dependencies
   "Cache for agenda items during a scheduling run.
 Hash table with date strings as keys and lists of items as values.")
 
+(declare-function org-auto-scheduler--build-pinned-cache "org-auto-scheduler")
+
 (defun org-auto-scheduler--build-agenda-cache ()
   "Scan all agenda files once and build a cache of agenda items per date."
   (setq org-auto-scheduler--agenda-cache (make-hash-table :test 'equal))
@@ -1500,6 +1562,7 @@ Hash table with date strings as keys and lists of items as values.")
                           (existing (gethash date-string org-auto-scheduler--agenda-cache)))
                      (puthash date-string (cons item existing) org-auto-scheduler--agenda-cache))))))))))
    nil 'agenda)
+  (org-auto-scheduler--build-pinned-cache)
   (org-auto-scheduler--log-info "Built agenda cache with %d days." (hash-table-count org-auto-scheduler--agenda-cache)))
 
 (defun org-auto-scheduler--fetch-base-agenda-items-for-date (date-string)
@@ -2315,8 +2378,15 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                (total-tasks (length sorted-tasks-info))
                (previous-project nil))
 
-          (let ((reporter (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
+          (let ((reporter (unless org-auto-scheduler-silent-mode
+                            (make-progress-reporter "Scheduling tasks..." 0 total-tasks))))
             (dolist (task-info sorted-tasks-info)
+              ;; Cooperative yield if running in a background worker thread
+              (when (and (fboundp 'thread-yield)
+                         (fboundp 'current-thread)
+                         (fboundp 'main-thread)
+                         (not (eq (current-thread) (main-thread))))
+                (thread-yield))
               (let* ((task-id (nth 5 task-info))
                      (raw-marker (car task-info))
                      (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id))
@@ -2337,8 +2407,10 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                              (nth 1 (car org-auto-scheduler-completed-tasks)))))
                       (org-auto-scheduler-add-to-report task-info scheduled-start))))
                 (setq tasks-scheduled (1+ tasks-scheduled))
-                (progress-reporter-update reporter tasks-scheduled)))
-            (progress-reporter-done reporter))
+                (when reporter
+                  (progress-reporter-update reporter tasks-scheduled))))
+            (when reporter
+              (progress-reporter-done reporter)))
 
           ;; Normalize completed-tasks to chronological order (built via push)
           (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
@@ -2697,45 +2769,71 @@ Otherwise pins the task to TIME-STR.  Returns the formatted pinned time or nil."
                     (org-with-point-at m (or (org-id-get) (org-id-get-create)))))))
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "Cannot find task marker"))
-    (org-with-point-at m
-      (let ((tags (org-get-tags nil t)))
-        (if (or unpin (null time-str) (string-empty-p (string-trim time-str)))
-            (progn
-              (setq tags (delete org-auto-scheduler-pinned-tag tags))
-              (if (fboundp 'org-set-tags-to)
-                  (org-set-tags-to tags)
-                (org-set-tags tags))
-              (org-delete-property org-auto-scheduler-pinned-property)
-              (org-delete-property org-auto-scheduler-pinned-time-property)
-              (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
-                (let ((over (gethash tid org-auto-scheduler--review-overrides)))
-                  (when over
-                    (setq over (plist-put over :pinned nil))
-                    (setq over (plist-put over :pinned-time nil))
-                    (puthash tid over org-auto-scheduler--review-overrides))))
-              nil)
-          (let* ((parsed (org-auto-scheduler--parse-flexible-time time-str m))
-                 (formatted-time (format-time-string "%Y-%m-%d %H:%M" parsed))
-                 (date-str (format-time-string "%Y-%m-%d" parsed)))
-            (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
-            (if (fboundp 'org-set-tags-to)
-                (org-set-tags-to tags)
-              (org-set-tags tags))
-            (org-set-property org-auto-scheduler-pinned-property "t")
-            (org-set-property org-auto-scheduler-pinned-time-property formatted-time)
-            (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
-              (let ((over (gethash tid org-auto-scheduler--review-overrides)))
-                (puthash tid (plist-put (plist-put (plist-put (plist-put over :pinned t)
-                                                              :pinned-time formatted-time)
-                                                   :pinned-date date-str)
-                                        :target-date date-str)
-                         org-auto-scheduler--review-overrides)))
-            formatted-time))))))
+    (prog1
+        (org-with-point-at m
+          (let ((tags (org-get-tags nil t)))
+            (if (or unpin (null time-str) (string-empty-p (string-trim time-str)))
+                (progn
+                  (setq tags (delete org-auto-scheduler-pinned-tag tags))
+                  (if (fboundp 'org-set-tags-to)
+                      (org-set-tags-to tags)
+                    (org-set-tags tags))
+                  (org-delete-property org-auto-scheduler-pinned-property)
+                  (org-delete-property org-auto-scheduler-pinned-time-property)
+                  (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
+                    (let ((over (gethash tid org-auto-scheduler--review-overrides)))
+                      (when over
+                        (setq over (plist-put over :pinned nil))
+                        (setq over (plist-put over :pinned-time nil))
+                        (puthash tid over org-auto-scheduler--review-overrides))))
+                  nil)
+              (let* ((parsed (org-auto-scheduler--parse-flexible-time time-str m))
+                     (formatted-time (format-time-string "%Y-%m-%d %H:%M" parsed))
+                     (date-str (format-time-string "%Y-%m-%d" parsed)))
+                (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
+                (if (fboundp 'org-set-tags-to)
+                    (org-set-tags-to tags)
+                  (org-set-tags tags))
+                (org-set-property org-auto-scheduler-pinned-property "t")
+                (org-set-property org-auto-scheduler-pinned-time-property formatted-time)
+                (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
+                  (let ((over (gethash tid org-auto-scheduler--review-overrides)))
+                    (puthash tid (plist-put (plist-put (plist-put (plist-put over :pinned t)
+                                                                  :pinned-time formatted-time)
+                                                       :pinned-date date-str)
+                                            :target-date date-str)
+                             org-auto-scheduler--review-overrides)))
+                formatted-time))))
+      (setq org-auto-scheduler--pinned-cache nil))))
 
 (defalias 'org-auto-scheduler-task-set-pinnable 'org-auto-scheduler-task-set-pinned-time)
 
+(defun org-auto-scheduler--build-pinned-cache ()
+  "Build the cache of pinned task reservations across all dates.
+Populates `org-auto-scheduler--pinned-cache' with a hash table mapping
+date strings (YYYY-MM-DD) and all-dates key to lists of reservation pseudo items."
+  (let ((cache (make-hash-table :test 'equal))
+        (all-items (org-auto-scheduler--compute-pinned-tasks-reservations nil)))
+    (puthash "__all__" all-items cache)
+    (dolist (item all-items)
+      (let* ((pt (nth 1 item))
+             (d-str (and pt (format-time-string "%Y-%m-%d" pt))))
+        (when d-str
+          (puthash d-str (cons item (gethash d-str cache)) cache))))
+    (setq org-auto-scheduler--pinned-cache cache)))
+
 (defun org-auto-scheduler--get-pinned-tasks-reservations (&optional target-date-str)
   "Return a list of pseudo agenda items for all tasks pinned to an exact time.
+Each item is (TASK-ID START-TIME END-TIME TAGS t HEADLINE t MARKER).
+If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date.
+Uses `org-auto-scheduler--pinned-cache' if available, otherwise computes fresh."
+  (if (and (boundp 'org-auto-scheduler--pinned-cache)
+           (hash-table-p org-auto-scheduler--pinned-cache))
+      (gethash (or target-date-str "__all__") org-auto-scheduler--pinned-cache)
+    (org-auto-scheduler--compute-pinned-tasks-reservations target-date-str)))
+
+(defun org-auto-scheduler--compute-pinned-tasks-reservations (&optional target-date-str)
+  "Compute a list of pseudo agenda items for all tasks pinned to an exact time.
 Each item is (TASK-ID START-TIME END-TIME TAGS t HEADLINE t MARKER).
 If TARGET-DATE-STR is non-nil (YYYY-MM-DD), only returns items for that date.
 Checks:
@@ -3777,30 +3875,80 @@ to ensure fresh projections are generated."
         (pop-to-buffer buffer)))))
 
 (defun org-auto-scheduler-background-run ()
-  "Run the scheduler silently in the background."
+  "Run the scheduler silently in the background.
+If `org-auto-scheduler-background-async' is non-nil and `make-thread' is supported,
+runs asynchronously in a worker thread so the Emacs UI remains fully responsive."
   (interactive)
-  (when (and org-auto-scheduler-background-enabled
-             (org-auto-scheduler-allowed-on-this-computer-p)
-             (not org-auto-scheduler--background-running)
-             (not (minibufferp))
-             (not (and (boundp 'org-clock-current-task) org-clock-current-task)))
-    (setq org-auto-scheduler--background-running t)
-    (org-auto-scheduler--log-info "Starting background auto-scheduler run...")
-    (condition-case err
-        (let ((org-auto-scheduler-silent-mode t))
-          ;; Run scheduler in silent mode
-          (org-auto-scheduler-schedule-tasks))
-      (error
-       (org-auto-scheduler--log-error "Error in background scheduler: %s" err)))
+  (cond
+   ((not org-auto-scheduler-background-enabled)
+    (org-auto-scheduler--log-debug "Background scheduler skipped: not enabled."))
+   ((not (org-auto-scheduler-allowed-on-this-computer-p))
+    (org-auto-scheduler--log-debug "Background scheduler skipped: not allowed on hostname %s." (system-name)))
+   ((or org-auto-scheduler--background-running
+        (and org-auto-scheduler--background-thread
+             (threadp org-auto-scheduler--background-thread)
+             (thread-live-p org-auto-scheduler--background-thread)))
+    (org-auto-scheduler--log-debug "Background scheduler skipped: run already in progress."))
+   ((minibufferp)
+    (org-auto-scheduler--log-debug "Background scheduler skipped: minibuffer active."))
+   ((and org-auto-scheduler-background-pause-on-clock
+         (boundp 'org-clock-current-task)
+         org-clock-current-task)
+    (org-auto-scheduler--log-debug "Background scheduler skipped: task currently clocked in."))
+   (t
+    (if (and org-auto-scheduler-background-async
+             (fboundp 'make-thread))
+        (setq org-auto-scheduler--background-thread
+              (make-thread
+               #'org-auto-scheduler--execute-background-job
+               "org-auto-scheduler-worker"))
+      (org-auto-scheduler--execute-background-job)))))
+
+(defun org-auto-scheduler--execute-background-job ()
+  "Worker function executing a background scheduler run."
+  (setq org-auto-scheduler--background-running t)
+  (let ((is-async (and (fboundp 'current-thread)
+                       (fboundp 'main-thread)
+                       (not (eq (current-thread) (main-thread))))))
+    (org-auto-scheduler--log-info "Starting background auto-scheduler run (async: %s)..."
+                                  (if is-async "yes" "no")))
+  (unwind-protect
+      (condition-case err
+          (let ((org-auto-scheduler-silent-mode t))
+            ;; Run scheduler in silent mode
+            (org-auto-scheduler-schedule-tasks))
+        (error
+         (org-auto-scheduler--log-error "Error in background scheduler: %s" err)))
+    (setq org-auto-scheduler--background-running nil)
     (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
-    (setq org-auto-scheduler--background-running nil)))
+    (org-auto-scheduler--maybe-schedule-idle-repeat)))
+
+(defun org-auto-scheduler--maybe-schedule-idle-repeat ()
+  "Schedule the next background run if Emacs continues to be idle."
+  (when (and org-auto-scheduler-background-enabled
+             (numberp org-auto-scheduler-background-interval)
+             (> org-auto-scheduler-background-interval 0)
+             (current-idle-time))
+    (when org-auto-scheduler--repeat-idle-timer
+      (cancel-timer org-auto-scheduler--repeat-idle-timer)
+      (setq org-auto-scheduler--repeat-idle-timer nil))
+    (setq org-auto-scheduler--repeat-idle-timer
+          (run-with-idle-timer
+           (+ (float-time (current-idle-time)) org-auto-scheduler-background-interval)
+           nil
+           #'org-auto-scheduler-background-run))))
 
 (defun org-auto-scheduler-allowed-on-this-computer-p ()
   "Check if background scheduling is allowed on this computer.
-Returns t if org-auto-scheduler-allowed-hostnames is nil or
-if the current system's hostname is in the list."
-  (or (null org-auto-scheduler-allowed-hostnames)
-      (member (system-name) org-auto-scheduler-allowed-hostnames)))
+Returns t if `org-auto-scheduler-allowed-hostnames' is nil or
+if the current system's hostname (short or FQDN, case-insensitive) is in the list."
+  (if (null org-auto-scheduler-allowed-hostnames)
+      t
+    (let* ((sys (downcase (system-name)))
+           (short (car (split-string sys "\\.")))
+           (allowed (mapcar #'downcase org-auto-scheduler-allowed-hostnames)))
+      (or (member sys allowed)
+          (member short allowed)))))
 
 (defun org-auto-scheduler-toggle-background ()
   "Toggle background auto-scheduling."
@@ -3820,32 +3968,41 @@ if the current system's hostname is in the list."
   (org-auto-scheduler--log-info "Setting up background scheduler. Enabled: %s"
                                 org-auto-scheduler-background-enabled)
 
-  ;; Cancel existing timer if present
+  ;; Cancel existing timers if present
   (when org-auto-scheduler--idle-timer
     (org-auto-scheduler--log-debug "Canceling existing background timer")
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
 
+  (when org-auto-scheduler--repeat-idle-timer
+    (org-auto-scheduler--log-debug "Canceling existing background repeat timer")
+    (cancel-timer org-auto-scheduler--repeat-idle-timer)
+    (setq org-auto-scheduler--repeat-idle-timer nil))
+
   ;; Create new timer if enabled
   (when org-auto-scheduler-background-enabled
-    (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds"
+    (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds, Async: %s"
                                   org-auto-scheduler-idle-time
-                                  org-auto-scheduler-background-interval)
+                                  org-auto-scheduler-background-interval
+                                  org-auto-scheduler-background-async)
     (setq org-auto-scheduler--idle-timer
           (run-with-idle-timer
            org-auto-scheduler-idle-time
-           t  ; REPEAT: t means fire every time Emacs goes idle for idle-time seconds
+           t  ; REPEAT: t means fire each time Emacs becomes idle for idle-time seconds
            #'org-auto-scheduler-background-run))
     (add-hook 'kill-emacs-hook #'org-auto-scheduler-cleanup-background)))
 
-;; Ensure background scheduler is set up when Emacs is running in daemon mode
-(add-hook 'emacs-startup-hook 'org-auto-scheduler-setup-background)
+;; Ensure background scheduler is set up after user config and custom settings load
+(add-hook 'emacs-startup-hook #'org-auto-scheduler-setup-background t)
 
 (defun org-auto-scheduler-cleanup-background ()
   "Clean up background scheduler resources when Emacs is shutting down."
   (when org-auto-scheduler--idle-timer
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
+  (when org-auto-scheduler--repeat-idle-timer
+    (cancel-timer org-auto-scheduler--repeat-idle-timer)
+    (setq org-auto-scheduler--repeat-idle-timer nil))
   (setq org-auto-scheduler--background-running nil))
 
 (defun org-auto-scheduler-historical-insights ()
@@ -4133,11 +4290,23 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (format-time-string "%a %H:%M" time)
     "—"))
 
+(defun org-auto-scheduler--copy-overrides (table)
+  "Create an independent deep copy of review overrides TABLE."
+  (let ((new-table (make-hash-table :test 'equal)))
+    (when (hash-table-p table)
+      (maphash (lambda (k v)
+                 (puthash k (copy-sequence v) new-table))
+               table))
+    new-table))
+
 (defun org-auto-scheduler--review-push-undo ()
-  "Save current entries to undo stack."
+  "Save current entries, overrides, and completed tasks to undo stack."
   (when tabulated-list-entries
-    (push (mapcar (lambda (e) (list (car e) (copy-sequence (cadr e))))
-                  tabulated-list-entries)
+    (push (list :entries (mapcar (lambda (e) (list (car e) (copy-sequence (cadr e))))
+                                 tabulated-list-entries)
+                :all-entries (copy-sequence org-auto-scheduler--review-all-entries)
+                :overrides (org-auto-scheduler--copy-overrides org-auto-scheduler--review-overrides)
+                :completed-tasks (copy-tree org-auto-scheduler-completed-tasks))
           org-auto-scheduler--review-undo-stack)
     (when (> (length org-auto-scheduler--review-undo-stack)
              org-auto-scheduler--review-undo-max)
@@ -4237,20 +4406,16 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (set-keymap-parent org-auto-scheduler-review-mode-map tabulated-list-mode-map))
 
 (let ((map org-auto-scheduler-review-mode-map))
-  ;; Core operations
-  (define-key map (kbd "SPC") #'org-auto-scheduler-review-toggle)
+  ;; Core operations (RET and m toggle; SPC left to scroll/leader)
   (define-key map (kbd "RET") #'org-auto-scheduler-review-toggle)
   (define-key map (kbd "m")   #'org-auto-scheduler-review-toggle)
   (define-key map (kbd "TAB") #'org-auto-scheduler-review-jump)
   (define-key map (kbd "x")   #'org-auto-scheduler-review-execute)
   (define-key map (kbd "C-c C-c") #'org-auto-scheduler-review-execute)
   ;; Reorder
-  (define-key map (kbd "U")   #'org-auto-scheduler-review-move-up)
   (define-key map (kbd "K")   #'org-auto-scheduler-review-move-up)
-  (define-key map (kbd "p")   #'org-auto-scheduler-review-move-up)
-  (define-key map (kbd "D")   #'org-auto-scheduler-review-move-down)
   (define-key map (kbd "J")   #'org-auto-scheduler-review-move-down)
-  (define-key map (kbd "n")   #'org-auto-scheduler-review-move-down)
+  (define-key map (kbd "D")   #'org-auto-scheduler-review-move-down)
   ;; Day shifting
   (define-key map (kbd ">")     #'org-auto-scheduler-review-move-day-forward)
   (define-key map (kbd "<")     #'org-auto-scheduler-review-move-day-backward)
@@ -4259,7 +4424,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "M-<down>") #'org-auto-scheduler-review-move-day-forward)
   (define-key map (kbd "M-<up>")   #'org-auto-scheduler-review-move-day-backward)
   (define-key map (kbd "d")     #'org-auto-scheduler-review-move-to-date)
-  (define-key map (kbd "P")     #'org-auto-scheduler-review-move-before)
+  (define-key map (kbd "O")     #'org-auto-scheduler-review-move-before)
   ;; Recalculate / Refresh
   (define-key map (kbd "r")   #'org-auto-scheduler-review-recalculate)
   (define-key map (kbd "C-c C-r") #'org-auto-scheduler-review-recalculate)
@@ -4271,7 +4436,8 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "C-c C-m") #'org-auto-scheduler-review-restore-and-merge)
   (define-key map (kbd "C")   #'org-auto-scheduler-clear-saved-decisions)
   (define-key map (kbd "C-c C-d") #'org-auto-scheduler-clear-saved-decisions)
-  ;; Undo
+  ;; Undo (U is unified undo everywhere; u also supported)
+  (define-key map (kbd "U")   #'org-auto-scheduler-review-undo)
   (define-key map (kbd "u")   #'org-auto-scheduler-review-undo)
   ;; Filters
   (define-key map (kbd "f t") #'org-auto-scheduler-review-filter-today)
@@ -4288,14 +4454,16 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
   ;; Views
   (define-key map (kbd "T")   #'org-auto-scheduler-review-open-timegrid)
+  (define-key map (kbd "i")   #'org-auto-scheduler-review-toggle-timegrid-layout)
   ;; Toggle fixed agenda events
   (define-key map (kbd "E")   #'org-auto-scheduler-review-toggle-agenda-events)
-  ;; Non-blocking toggle for fixed events
+  ;; Non-blocking toggle for fixed events (B in timegrid; B and b in review)
+  (define-key map (kbd "B")   #'org-auto-scheduler-review-toggle-non-blocking)
   (define-key map (kbd "b")   #'org-auto-scheduler-review-toggle-non-blocking)
   ;; Splittable, Freeset, and Pinned shortcuts
   (define-key map (kbd "s")   #'org-auto-scheduler-review-toggle-splittable)
   (define-key map (kbd "F")   #'org-auto-scheduler-review-toggle-freeset)
-  (define-key map (kbd "i")   #'org-auto-scheduler-review-toggle-freeset)
+  (define-key map (kbd "P")   #'org-auto-scheduler-review-pin-task)
   (define-key map (kbd "p")   #'org-auto-scheduler-review-pin-task)
   ;; Help
   (define-key map (kbd "?")   #'org-auto-scheduler-review-help))
@@ -4308,19 +4476,18 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       ;; Core operations
       (kbd "RET")     #'org-auto-scheduler-review-toggle
       (kbd "TAB")     #'org-auto-scheduler-review-jump
-      (kbd "SPC")     #'org-auto-scheduler-review-toggle
       (kbd "m")       #'org-auto-scheduler-review-toggle
+      (kbd "B")       #'org-auto-scheduler-review-toggle-non-blocking
       (kbd "b")       #'org-auto-scheduler-review-toggle-non-blocking
       (kbd "s")       #'org-auto-scheduler-review-toggle-splittable
       (kbd "F")       #'org-auto-scheduler-review-toggle-freeset
-      (kbd "i")       #'org-auto-scheduler-review-toggle-freeset
+      (kbd "P")       #'org-auto-scheduler-review-pin-task
       (kbd "p")       #'org-auto-scheduler-review-pin-task
       (kbd "x")       #'org-auto-scheduler-review-execute
       (kbd "C-c C-c") #'org-auto-scheduler-review-execute
       ;; Reordering
       (kbd "K")       #'org-auto-scheduler-review-move-up
       (kbd "J")       #'org-auto-scheduler-review-move-down
-      (kbd "U")       #'org-auto-scheduler-review-move-up
       (kbd "D")       #'org-auto-scheduler-review-move-down
       ;; Day shifting
       (kbd ">")        #'org-auto-scheduler-review-move-day-forward
@@ -4337,13 +4504,15 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "S")       #'org-auto-scheduler-review-save-decisions
       (kbd "M")       #'org-auto-scheduler-review-restore-and-merge
       (kbd "C")       #'org-auto-scheduler-clear-saved-decisions
+      (kbd "U")       #'org-auto-scheduler-review-undo
       (kbd "u")       #'org-auto-scheduler-review-undo
       ;; What-if
       (kbd "e")       #'org-auto-scheduler-review-edit-effort
       ;; Views
       (kbd "T")       #'org-auto-scheduler-review-open-timegrid
+      (kbd "i")       #'org-auto-scheduler-review-toggle-timegrid-layout
       ;; Move before another task (keyboard drag-to-position)
-      (kbd "P")       #'org-auto-scheduler-review-move-before
+      (kbd "O")       #'org-auto-scheduler-review-move-before
       ;; Filters
       (kbd "f t")     #'org-auto-scheduler-review-filter-today
       (kbd "f p")     #'org-auto-scheduler-review-filter-project
@@ -5152,12 +5321,12 @@ BLOCKERS-INFO, if non-nil, indicates explicit BLOCKER or DEPENDS_ON dependencies
 
 (defun org-auto-scheduler--get-existing-events-for-date (date-str)
   "Return existing non-AUTOSCH agenda events for DATE-STR (YYYY-MM-DD)."
-  (let* ((date-time (org-auto-scheduler-parse-time-string (concat date-str " 00:00")))
-         (all-items (if date-time
-                        (org-auto-scheduler-get-agenda-items date-time)
-                      (and (boundp 'org-auto-scheduler--agenda-cache)
-                           (hash-table-p org-auto-scheduler--agenda-cache)
-                           (gethash date-str org-auto-scheduler--agenda-cache))))
+  (let* ((all-items (if (and (boundp 'org-auto-scheduler--agenda-cache)
+                             (hash-table-p org-auto-scheduler--agenda-cache))
+                        (gethash date-str org-auto-scheduler--agenda-cache)
+                      (let ((date-time (org-auto-scheduler-parse-time-string (concat date-str " 00:00"))))
+                        (when date-time
+                          (org-auto-scheduler-get-agenda-items date-time)))))
          (filtered '()))
     (dolist (item all-items)
       (let* ((task-id (nth 0 item))
@@ -5745,10 +5914,22 @@ With prefix ARG (C-u p) or empty input, unpins the task."
   (if (null org-auto-scheduler--review-undo-stack)
       (user-error "No further undo information")
     (let ((snapshot (pop org-auto-scheduler--review-undo-stack)))
-      (setq tabulated-list-entries snapshot)
+      (if (and (listp snapshot) (plist-member snapshot :entries))
+          (progn
+            (setq tabulated-list-entries (plist-get snapshot :entries))
+            (when (plist-get snapshot :all-entries)
+              (setq org-auto-scheduler--review-all-entries (plist-get snapshot :all-entries)))
+            (when (plist-get snapshot :overrides)
+              (setq org-auto-scheduler--review-overrides (plist-get snapshot :overrides)))
+            (when (plist-get snapshot :completed-tasks)
+              (setq org-auto-scheduler-completed-tasks (plist-get snapshot :completed-tasks))))
+        ;; Legacy snapshot format (plain entries list)
+        (setq tabulated-list-entries snapshot))
+      (setq org-auto-scheduler--pinned-cache nil)
       (tabulated-list-print t)
       (setq header-line-format
             (org-auto-scheduler--review-header-line tabulated-list-entries))
+      (org-auto-scheduler--timegrid-maybe-refresh)
       (message "Undo!"))))
 
 (defun org-auto-scheduler--apply-current-filter ()
@@ -5900,10 +6081,23 @@ With prefix ARG (C-u p) or empty input, unpins the task."
         (if (and id (string-prefix-p "__event_" id))
             (user-error "Cannot edit effort for fixed agenda event")
           (user-error "Not on a task"))
+      (let* ((task (assoc id org-auto-scheduler-completed-tasks))
+             (status (and task (nth 9 task))))
+        (when (eq status :placeholder)
+          (let ((origin-id (or (cadr (memq :origin-id task))
+                               (plist-get (nthcdr 9 task) :origin-id))))
+            (if (and origin-id (assoc origin-id org-auto-scheduler-completed-tasks))
+                (setq id origin-id
+                      entry (cadr (assoc id tabulated-list-entries)))
+              (user-error "Cannot edit effort of a placeholder chunk; edit the parent task")))))
       (org-auto-scheduler--review-push-undo)
       (puthash id (plist-put (gethash id org-auto-scheduler--review-overrides) :effort new-effort)
                org-auto-scheduler--review-overrides)
-      (aset entry 4 (propertize (format "%dm*" new-effort) 'face 'warning))
+      (when entry
+        (aset entry 4 (propertize (format "%dm*" new-effort) 'face 'warning)))
+      (when-let* ((all-entry (cadr (assoc id org-auto-scheduler--review-all-entries))))
+        (unless (eq all-entry entry)
+          (aset all-entry 4 (propertize (format "%dm*" new-effort) 'face 'warning))))
       (tabulated-list-print t)
       (message "Effort updated to %d min (press 'r' to recalculate schedule)" new-effort))))
 
@@ -6031,7 +6225,9 @@ matching the display used in the review buffer."
       (let* ((ev-id (nth 0 ev))
              (headline (or (nth 5 ev) "Event"))
              (marker (or (nth 7 ev)
-                         (and ev-id (stringp ev-id) (org-id-find ev-id t))))
+                         (and ev-id (stringp ev-id)
+                              (not (string-prefix-p "__event_" ev-id))
+                              (org-id-find ev-id))))
              (non-blocking (org-auto-scheduler-task-non-blocking-p ev-id marker))
              (title (if non-blocking headline (format "🔒 %s" headline))))
         (org-timegrid-event-create
@@ -6041,7 +6237,7 @@ matching the display used in the review buffer."
          :end (org-auto-scheduler--timegrid-minutes end)
          :all-day nil
          :color (if non-blocking "#98c379" "#5c6370")
-         :source (list :marker marker))))))
+         :source (list :marker marker :task-id ev-id :event-id ev-id :event-p t))))))
 
 (defun org-auto-scheduler--timegrid-list (review-buffer start end)
   "Return org-timegrid events for the schedule in REVIEW-BUFFER.
@@ -6051,31 +6247,30 @@ set and visual order are always current) joined with
 events when `org-auto-scheduler-review-show-agenda-events' is enabled.
 START and END are absolute minutes, as required by an
 `org-timegrid-backend' list-function."
-  (unless (and review-buffer (buffer-live-p review-buffer))
-    (user-error "The source review buffer no longer exists"))
-  (let* ((entries (buffer-local-value 'tabulated-list-entries review-buffer))
-         (task-events
-          (delq nil
-                (mapcar
-                 (lambda (row)
-                   (let* ((row-id (car row))
-                          (vec (cadr row))
-                          (checked (and (vectorp vec) (> (length vec) 0) (aref vec 0))))
-                     (unless (or (org-auto-scheduler--review-special-row-p row-id)
-                                 (string= checked "[ ]"))
-                       (let ((task (assoc row-id org-auto-scheduler-completed-tasks)))
-                         (when task
-                           (org-auto-scheduler--timegrid-event-from-task task))))))
-                 entries)))
-         (event-events
-          (when org-auto-scheduler-review-show-agenda-events
+  (when (and review-buffer (buffer-live-p review-buffer))
+    (let* ((entries (buffer-local-value 'tabulated-list-entries review-buffer))
+           (task-events
             (delq nil
-                  (cl-loop for d from (floor start 1440) to (floor (1- end) 1440)
-                           append
-                           (mapcar #'org-auto-scheduler--timegrid-event-from-fixed-event
-                                   (org-auto-scheduler--get-existing-events-for-date
-                                    (org-auto-scheduler--timegrid-date-string d))))))))
-    (append task-events event-events)))
+                  (mapcar
+                   (lambda (row)
+                     (let* ((row-id (car row))
+                            (vec (cadr row))
+                            (checked (and (vectorp vec) (> (length vec) 0) (aref vec 0))))
+                       (unless (or (org-auto-scheduler--review-special-row-p row-id)
+                                   (string= checked "[ ]"))
+                         (let ((task (assoc row-id org-auto-scheduler-completed-tasks)))
+                           (when task
+                             (org-auto-scheduler--timegrid-event-from-task task))))))
+                   entries)))
+           (event-events
+            (when org-auto-scheduler-review-show-agenda-events
+              (delq nil
+                    (cl-loop for d from (floor start 1440) to (floor (1- end) 1440)
+                             append
+                             (mapcar #'org-auto-scheduler--timegrid-event-from-fixed-event
+                                     (org-auto-scheduler--get-existing-events-for-date
+                                      (org-auto-scheduler--timegrid-date-string d))))))))
+      (append task-events event-events))))
 
 (defun org-auto-scheduler--timegrid-visit (event)
   "Visit the Org heading backing EVENT."
@@ -6167,8 +6362,8 @@ happens beyond what the (unchanged) START implies."
 (defun org-auto-scheduler--timegrid-backend (review-buffer)
   "Return a fresh org-timegrid backend previewing REVIEW-BUFFER.
 Supports dragging (moving) task blocks to reorder them -- see
-`org-auto-scheduler--timegrid-update' -- but no create/delete, so
-new-entry gestures and deletion still cleanly no-op with an error."
+`org-auto-scheduler--timegrid-update' -- and delegating undo to REVIEW-BUFFER, but no
+create/delete, so new-entry gestures and deletion still cleanly no-op with an error."
   (org-timegrid-backend-create
    :name "org-auto-scheduler proposed schedule"
    :list-function (lambda (start end)
@@ -6176,14 +6371,23 @@ new-entry gestures and deletion still cleanly no-op with an error."
    :update-function (lambda (event start end &rest args)
                       (apply #'org-auto-scheduler--timegrid-update
                              review-buffer event start end args))
+   :undo-function (lambda (_continue redo)
+                    (unless (and review-buffer (buffer-live-p review-buffer))
+                      (user-error "The source review buffer no longer exists"))
+                    (with-current-buffer review-buffer
+                      (if redo
+                          (user-error "Redo is not supported; use review commands")
+                        (org-auto-scheduler-review-undo))))
    :visit-function #'org-auto-scheduler--timegrid-visit))
 
 (defun org-auto-scheduler--timegrid-maybe-refresh ()
-  "Refresh the live `*Org Time Grid*' buffer, if one is open, in place.
+  "Refresh the live `*Org Time Grid*' buffer, if one is visible, in place.
 Called after table-view edits (toggle, move, recalculate) so the grid
 reflects the latest checkbox/order state without waiting on its own
 periodic timer or a manual `g'."
-  (when (and (bound-and-true-p org-timegrid-buffer-name) (get-buffer org-timegrid-buffer-name))
+  (when (and (bound-and-true-p org-timegrid-buffer-name)
+             (let ((buf (get-buffer org-timegrid-buffer-name)))
+               (and buf (get-buffer-window buf t))))
     (with-current-buffer org-timegrid-buffer-name
       (when (fboundp 'org-timegrid--refresh-data)
         (ignore-errors (org-timegrid--refresh-data))))))
@@ -6279,54 +6483,243 @@ simply still there."
                                             (get-buffer-window existing-grid t))
       (org-auto-scheduler--timegrid-open-fresh review-buffer))))
 
-(defun org-auto-scheduler--timegrid-open-fresh (review-buffer)
+(defun org-auto-scheduler--timegrid-selected-task-id ()
+  "Return the task ID for the currently selected block or block at cursor in the timegrid."
+  (when-let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
+                              (org-timegrid--block-at-cursor))
+                         (and (fboundp 'org-timegrid--selected-id)
+                              (org-timegrid--selected-id)
+                              (fboundp 'org-timegrid--block)
+                              (org-timegrid--block (org-timegrid--selected-id)))))
+              (event (org-timegrid-block-event block))
+              (source (and event (org-timegrid-event-source event))))
+    (plist-get source :task-id)))
+
+(defun org-auto-scheduler--timegrid-jump ()
+  "Jump to the original Org task or agenda event for the selected timegrid block."
+  (interactive)
+  (let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
+                         (org-timegrid--block-at-cursor))
+                    (and (fboundp 'org-timegrid--selected-id)
+                         (org-timegrid--selected-id)
+                         (fboundp 'org-timegrid--block)
+                         (org-timegrid--block (org-timegrid--selected-id)))))
+         (event (and block (org-timegrid-block-event block))))
+    (unless event
+      (user-error "No task selected; press n or click a task block first"))
+    (org-auto-scheduler--timegrid-visit event)))
+
+(defun org-auto-scheduler--review-goto-event (marker &optional event-id)
+  "Move point to the row for MARKER or EVENT-ID in the review buffer."
+  (let ((orig-point (point))
+        (found nil))
+    (goto-char (point-min))
+    (while (and (not (eobp)) (not found))
+      (let* ((row-id (tabulated-list-get-id))
+             (entry (tabulated-list-get-entry)))
+        (when (and row-id (string-prefix-p "__event_" row-id) entry)
+          (let ((m (or (get-text-property 0 'event-marker (aref entry 2))
+                       (get-text-property 0 'event-marker (aref entry 1))))
+                (eid (or (get-text-property 0 'event-id (aref entry 2))
+                         (get-text-property 0 'event-id (aref entry 1)))))
+            (when (or (and marker m (equal marker m))
+                      (and event-id eid (equal event-id eid)))
+              (setq found t)))))
+      (unless found
+        (forward-line 1)))
+    (unless found
+      (goto-char orig-point))))
+
+(defun org-auto-scheduler--timegrid-run-review-command (cmd &optional needs-task)
+  "Execute review command CMD in the linked review buffer.
+When NEEDS-TASK is non-nil, signals a `user-error' if no task is selected or at cursor."
+  (interactive)
+  (unless (and org-auto-scheduler--timegrid-source-buffer
+               (buffer-live-p org-auto-scheduler--timegrid-source-buffer))
+    (user-error "No linked Org Auto Scheduler review buffer"))
+  (let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
+                         (org-timegrid--block-at-cursor))
+                    (and (fboundp 'org-timegrid--selected-id)
+                         (org-timegrid--selected-id)
+                         (fboundp 'org-timegrid--block)
+                         (org-timegrid--block (org-timegrid--selected-id)))))
+         (event (and block (org-timegrid-block-event block)))
+         (source (and event (org-timegrid-event-source event)))
+         (task-id (and source (plist-get source :task-id)))
+         (marker (and source (plist-get source :marker)))
+         (event-p (and source (plist-get source :event-p)))
+         (review-buf org-auto-scheduler--timegrid-source-buffer))
+    (when (and needs-task (not task-id) (not marker))
+      (user-error "No task selected; press n or click a task block first"))
+    (with-current-buffer review-buf
+      (if event-p
+          (org-auto-scheduler--review-goto-event marker task-id)
+        (when task-id
+          (org-auto-scheduler--review-goto-task task-id)))
+      (call-interactively cmd))
+    (org-auto-scheduler--timegrid-maybe-refresh)))
+
+(defun org-auto-scheduler--timegrid-setup-keymap ()
+  "Set up unified Auto-Scheduler shortcuts in the current `*Org Time Grid*' buffer.
+Leaves default `org-timegrid' navigation keys (n, p, b, f, SPC, u) untouched,
+while ensuring Evil motion/normal states do not intercept navigation (e.g. n, b, f, j, .)."
+  (use-local-map (copy-keymap (or (current-local-map) (make-sparse-keymap))))
+  (let ((bindings
+         (list
+          (cons "n"       #'org-timegrid-next-block)
+          (cons "p"       #'org-timegrid-previous-block)
+          (cons "b"       #'org-timegrid-backward-day)
+          (cons "f"       #'org-timegrid-forward-day)
+          (cons "j"       #'org-timegrid-goto-date)
+          (cons "."       #'org-timegrid-goto-today)
+          (cons "g"       #'org-timegrid-refresh)
+          (cons "q"       #'quit-window)
+          (cons "T"       #'org-auto-scheduler-review-close-timegrid)
+          (cons "i"       #'org-auto-scheduler-review-toggle-timegrid-layout)
+          (cons "TAB"     #'org-auto-scheduler--timegrid-jump)
+          (cons "RET"     (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle t)))
+          (cons "m"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle t)))
+          (cons "s"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle-splittable t)))
+          (cons "F"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle-freeset t)))
+          (cons "B"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle-non-blocking t)))
+          (cons "P"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-pin-task t)))
+          (cons "e"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-edit-effort t)))
+          (cons "O"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-before t)))
+          (cons "d"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-to-date t)))
+          (cons "U"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-undo)))
+          (cons "K"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-up t)))
+          (cons "J"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-down t)))
+          (cons "D"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-down t)))
+          (cons ">"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-day-forward t)))
+          (cons "+"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-day-forward t)))
+          (cons "<"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-day-backward t)))
+          (cons "-"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-move-day-backward t)))
+          (cons "r"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-recalculate)))
+          (cons "C-c C-r" (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-recalculate)))
+          (cons "R"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-refresh)))
+          (cons "x"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-execute)))
+          (cons "C-c C-c" (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-execute)))
+          (cons "S"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-save-decisions)))
+          (cons "C-c C-s" (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-save-decisions)))
+          (cons "M"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-restore-and-merge)))
+          (cons "C-c C-m" (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-restore-and-merge)))
+          (cons "C"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-clear-saved-decisions)))
+          (cons "C-c C-d" (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-clear-saved-decisions)))
+          (cons "E"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-toggle-agenda-events)))
+          (cons "?"       (lambda () (interactive) (org-auto-scheduler--timegrid-run-review-command #'org-auto-scheduler-review-help))))))
+    (dolist (b bindings)
+      (local-set-key (kbd (car b)) (cdr b))
+      (when (and (featurep 'evil) (fboundp 'evil-local-set-key))
+        (evil-local-set-key 'motion (kbd (car b)) (cdr b))
+        (evil-local-set-key 'normal (kbd (car b)) (cdr b))))))
+
+(defun org-auto-scheduler--timegrid-apply-layout (review-buffer grid-buffer layout &optional target-day)
+  "Configure windows and displayed days for REVIEW-BUFFER and GRID-BUFFER using LAYOUT.
+LAYOUT may be `side-by-side' (grid on left with
+`org-auto-scheduler-review-timegrid-side-by-side-days' days, review table on right)
+or `horizontal' (grid above with `org-auto-scheduler-review-timegrid-horizontal-days'
+days, review table below).
+TARGET-DAY is an optional calendar absolute day to start/anchor the visible range."
+  (let* ((orig-window (selected-window))
+         (frame (or (and (window-live-p orig-window) (window-frame orig-window))
+                    (selected-frame)))
+         (active-layout (or layout org-auto-scheduler-review-timegrid-layout 'horizontal))
+         (num-days (if (eq active-layout 'side-by-side)
+                       org-auto-scheduler-review-timegrid-side-by-side-days
+                     (or org-auto-scheduler-review-timegrid-horizontal-days 7)))
+         ;; Determine anchor day
+         (anchor-day
+          (or target-day
+              (with-current-buffer grid-buffer
+                (and (boundp 'org-timegrid--state) org-timegrid--state
+                     (fboundp 'org-timegrid--calendar-state-week-start)
+                     (let* ((ws (org-timegrid--calendar-state-week-start org-timegrid--state))
+                            (cursor (and (fboundp 'org-timegrid--cursor) (org-timegrid--cursor))))
+                       (if (and cursor (fboundp 'org-timegrid--cursor-state-day))
+                           (+ ws (org-timegrid--cursor-state-day cursor))
+                         ws))))
+              (with-current-buffer review-buffer
+                (let* ((task-day (org-auto-scheduler--review-get-task-day))
+                       (time (when task-day (org-auto-scheduler-parse-time-string (concat task-day " 12:00")))))
+                  (if time
+                      (calendar-absolute-from-gregorian
+                       (let ((decoded (decode-time time)))
+                         (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded))))
+                    (calendar-absolute-from-gregorian (calendar-current-date)))))))
+         (start-day
+          (if (eq active-layout 'horizontal)
+              (if (fboundp 'org-timegrid-week-start)
+                  (org-timegrid-week-start anchor-day)
+                anchor-day)
+            anchor-day)))
+    ;; Record layout in both buffers
+    (with-current-buffer review-buffer
+      (setq org-auto-scheduler--timegrid-current-layout active-layout))
+    (with-current-buffer grid-buffer
+      (setq org-auto-scheduler--timegrid-current-layout active-layout)
+      (setq-local org-timegrid-days num-days)
+      (when (fboundp 'org-timegrid--load-state)
+        (setq-local org-timegrid--state (org-timegrid--load-state start-day))
+        (when (fboundp 'org-timegrid--refresh)
+          (org-timegrid--refresh t))))
+    ;; Arrange windows deterministically in frame
+    (let ((review-window (get-buffer-window review-buffer frame)))
+      (unless (and review-window (window-live-p review-window))
+        (setq review-window (if (eq (window-buffer orig-window) grid-buffer)
+                                (let ((alt (delq orig-window (window-list frame))))
+                                  (or (car alt) orig-window))
+                              orig-window))
+        (set-window-buffer review-window review-buffer))
+      ;; Remove any other windows showing grid-buffer in this frame
+      (let ((existing-grids (delq review-window (get-buffer-window-list grid-buffer nil frame))))
+        (dolist (w existing-grids)
+          (when (and (window-live-p w) (> (length (window-list frame)) 1))
+            (ignore-errors (delete-window w)))))
+      ;; Now split review-window into review-window and grid-window
+      (let* ((split-side (if (eq active-layout 'side-by-side) 'left 'above))
+             (grid-window (condition-case nil
+                              (split-window review-window nil split-side)
+                            (error
+                             (condition-case nil
+                                 (if (eq split-side 'left)
+                                     (split-window review-window nil 'above)
+                                   (split-window review-window nil 'left))
+                               (error review-window))))))
+        (set-window-buffer grid-window grid-buffer)
+        (set-window-buffer review-window review-buffer)
+        (with-selected-window grid-window
+          (org-auto-scheduler--timegrid-sync-week-range))
+        ;; Preserve focus on whichever buffer initiated the layout change
+        (if (eq (window-buffer orig-window) grid-buffer)
+            (select-window grid-window)
+          (select-window review-window))))))
+
+(defun org-auto-scheduler--timegrid-open-fresh (review-buffer &optional layout)
   "Do the actual work of opening/refreshing the timegrid for REVIEW-BUFFER.
+Uses LAYOUT (or `org-auto-scheduler-review-timegrid-layout') to configure
+window arrangement and the number of displayed days.
 Split out from `org-auto-scheduler-review-open-timegrid' so that
 command can check for the toggle-off case first without duplicating
 this setup.  Callable only after that command's own checks have
 confirmed the integration is enabled and org-timegrid is loaded."
-  (let* ((review-window (selected-window))
+  (unless (and (boundp 'org-auto-scheduler--pinned-cache) (hash-table-p org-auto-scheduler--pinned-cache))
+    (org-auto-scheduler--build-pinned-cache))
+  (let* ((active-layout (or layout org-auto-scheduler-review-timegrid-layout 'horizontal))
          (backend (org-auto-scheduler--timegrid-backend review-buffer))
-         (reference-time (or (cl-some (lambda (tk) (nth 1 tk)) org-auto-scheduler-completed-tasks)
-                             (current-time))))
-    (org-timegrid-open backend
-                       (calendar-absolute-from-gregorian
-                        (let ((decoded (decode-time reference-time)))
-                          (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded)))))
+         (task-day (with-current-buffer review-buffer (org-auto-scheduler--review-get-task-day)))
+         (task-time (when task-day (org-auto-scheduler-parse-time-string (concat task-day " 12:00"))))
+         (reference-time (or task-time
+                             (cl-some (lambda (tk) (nth 1 tk)) org-auto-scheduler-completed-tasks)
+                             (current-time)))
+         (ref-abs-day (calendar-absolute-from-gregorian
+                       (let ((decoded (decode-time reference-time)))
+                         (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded))))))
+    (org-timegrid-open backend ref-abs-day)
     (with-current-buffer org-timegrid-buffer-name
       (setq org-auto-scheduler--timegrid-source-buffer review-buffer)
-      (use-local-map (copy-keymap (current-local-map)))
-      (local-set-key (kbd "T") #'org-auto-scheduler-review-close-timegrid)
-      (when (and (featurep 'evil) (fboundp 'evil-local-set-key))
-        (evil-local-set-key 'motion (kbd "T") #'org-auto-scheduler-review-close-timegrid)
-        (evil-local-set-key 'normal (kbd "T") #'org-auto-scheduler-review-close-timegrid)))
-    ;; `org-timegrid-open' just popped its buffer up via `pop-to-buffer',
-    ;; which -- depending on `display-buffer-alist' and any window-
-    ;; management package (popwin, window-purpose, shackle, ...), or even
-    ;; just because REVIEW-WINDOW was the frame's only window -- can
-    ;; reuse/replace REVIEW-WINDOW itself rather than opening a separate
-    ;; one, leaving what looks like two unrelated, unsplit buffers
-    ;; instead of one linked view.  Make the layout deterministic instead
-    ;; of trusting that guess: first force REVIEW-WINDOW back to
-    ;; REVIEW-BUFFER no matter what `pop-to-buffer' did to it, then place
-    ;; the grid in a *different*, freshly split window -- reusing one
-    ;; `pop-to-buffer' already created elsewhere in this frame if there
-    ;; is one, cleaning up any extra strays, or splitting fresh above
-    ;; REVIEW-WINDOW otherwise.  All via the low-level `set-window-buffer'
-    ;; / `split-window', which no display-buffer logic can redirect.
-    (when (window-live-p review-window)
-      (let* ((frame (window-frame review-window))
-             (grid-buffer (get-buffer org-timegrid-buffer-name)))
-        (set-window-buffer review-window review-buffer)
-        (let* ((existing (delq review-window
-                               (get-buffer-window-list grid-buffer nil frame))))
-          (dolist (w (cdr existing))
-            (when (and (window-live-p w) (> (length (window-list frame)) 1))
-              (ignore-errors (delete-window w))))
-          (let ((grid-window (or (car existing) (split-window review-window nil 'above))))
-            (set-window-buffer grid-window grid-buffer)
-            (select-window grid-window)
-            (org-auto-scheduler--timegrid-sync-week-range)))))))
+      (org-auto-scheduler--timegrid-setup-keymap))
+    (let ((grid-buffer (get-buffer org-timegrid-buffer-name)))
+      (org-auto-scheduler--timegrid-apply-layout review-buffer grid-buffer active-layout ref-abs-day))))
 
 (defun org-auto-scheduler--timegrid-close (review-buffer grid-window)
   "Return focus to REVIEW-BUFFER and close GRID-WINDOW.
@@ -6337,15 +6730,18 @@ with point in the table, so GRID-WINDOW is looked up explicitly).  The
 grid never mutates the review buffer beyond what dragging already
 applied directly, so nothing else needs to be restored -- the table's
 checkboxes, order, and overrides are exactly as they were left."
-  (unless (and review-buffer (buffer-live-p review-buffer))
-    (user-error "The source review buffer no longer exists"))
-  (let ((review-window (get-buffer-window review-buffer (window-frame grid-window))))
-    (if (and review-window (not (eq review-window grid-window)))
-        (progn
-          (select-window review-window)
-          (when (window-live-p grid-window)
-            (ignore-errors (delete-window grid-window))))
-      (switch-to-buffer review-buffer))))
+  (if (and review-buffer (buffer-live-p review-buffer))
+      (let ((review-window (get-buffer-window review-buffer (window-frame grid-window))))
+        (if (and review-window (not (eq review-window grid-window)))
+            (progn
+              (select-window review-window)
+              (when (window-live-p grid-window)
+                (ignore-errors (delete-window grid-window))))
+          (switch-to-buffer review-buffer)))
+    ;; Cleanly close or delete the grid window if the review buffer is dead
+    (if (and (window-live-p grid-window) (> (length (window-list)) 1))
+        (delete-window grid-window)
+      (quit-window t grid-window))))
 
 (defun org-auto-scheduler-review-close-timegrid ()
   "Return focus to the review table and close the timegrid split.
@@ -6355,12 +6751,60 @@ buffer."
   (org-auto-scheduler--timegrid-close org-auto-scheduler--timegrid-source-buffer
                                       (selected-window)))
 
+(defun org-auto-scheduler-review-toggle-timegrid-layout ()
+  "Toggle the timegrid between 3-day side-by-side view and horizontal split.
+In side-by-side view, the timegrid is shown on the left with 3 days
+(`org-auto-scheduler-review-timegrid-side-by-side-days') and the review tableview
+is shown on the right.
+In horizontal split, the timegrid is shown on top with 7 days
+(`org-auto-scheduler-review-timegrid-horizontal-days') and the review tableview
+is shown below.
+Can be invoked from either the review table or the timegrid via `i'."
+  (interactive)
+  (let* ((in-grid (derived-mode-p 'org-timegrid-mode))
+         (in-review (derived-mode-p 'org-auto-scheduler-review-mode))
+         (review-buffer (cond (in-review (current-buffer))
+                              (in-grid org-auto-scheduler--timegrid-source-buffer)
+                              (t (get-buffer "*Org Auto Scheduler Review*"))))
+         (grid-buffer (and (bound-and-true-p org-timegrid-buffer-name)
+                           (get-buffer org-timegrid-buffer-name))))
+    (unless (and review-buffer (buffer-live-p review-buffer))
+      (user-error "No active Org Auto Scheduler review buffer found"))
+    ;; Ensure integration enabled and library available
+    (unless org-auto-scheduler-review-timegrid-integration
+      (if (y-or-n-p "Enable org-timegrid integration (`org-auto-scheduler-review-timegrid-integration')? ")
+          (setq org-auto-scheduler-review-timegrid-integration t)
+        (user-error "Set `org-auto-scheduler-review-timegrid-integration' to non-nil to enable this")))
+    (unless (require 'org-timegrid nil t)
+      (user-error "org-timegrid is not installed: https://github.com/Gleek/org-timegrid"))
+    (let* ((grid-win (and grid-buffer (get-buffer-window grid-buffer t)))
+           (grid-open (and grid-buffer (buffer-live-p grid-buffer) grid-win)))
+      (if (not grid-open)
+          ;; If grid is not open, open it in side-by-side (3-day) layout
+          (org-auto-scheduler--timegrid-open-fresh review-buffer 'side-by-side)
+        ;; If grid is already open, toggle between side-by-side and horizontal
+        (let* ((current-layout
+                (or (buffer-local-value 'org-auto-scheduler--timegrid-current-layout review-buffer)
+                    (buffer-local-value 'org-auto-scheduler--timegrid-current-layout grid-buffer)
+                    (let ((rw (get-buffer-window review-buffer (window-frame grid-win))))
+                      (if (and rw (< (car (window-pixel-edges grid-win)) (car (window-pixel-edges rw))))
+                          'side-by-side
+                        'horizontal))))
+               (target-layout (if (eq current-layout 'side-by-side) 'horizontal 'side-by-side)))
+          (org-auto-scheduler--timegrid-apply-layout review-buffer grid-buffer target-layout)
+          (message "Timegrid layout: %s (%d days)"
+                   (if (eq target-layout 'side-by-side) "Side-by-side (table on right)" "Horizontal split")
+                   (if (eq target-layout 'side-by-side)
+                       org-auto-scheduler-review-timegrid-side-by-side-days
+                     (or org-auto-scheduler-review-timegrid-horizontal-days 7))))))))
+
 ;; Keep any open `*Org Time Grid*' preview in sync with table-view edits
-;; (checkbox toggles, non-blocking toggles, and every reorder/recalculate
+;; (checkbox toggles, non-blocking toggles, and every reorder/recalculate/undo
 ;; path), rather than waiting on its periodic timer or a manual `g'.
 (dolist (cmd '(org-auto-scheduler-review-toggle
                org-auto-scheduler-review-toggle-non-blocking
-               org-auto-scheduler-review-recalculate))
+               org-auto-scheduler-review-recalculate
+               org-auto-scheduler-review-undo))
   (advice-add cmd :after (lambda (&rest _) (org-auto-scheduler--timegrid-maybe-refresh))))
 
 ;; Keep the review table's date scope in sync whenever the linked grid
@@ -6368,36 +6812,58 @@ buffer."
 ;; timer, a manual `g'), not just when we ourselves triggered the redraw.
 (with-eval-after-load 'org-timegrid
   (advice-add 'org-timegrid--refresh :after
-              (lambda (&rest _) (org-auto-scheduler--timegrid-sync-week-range))))
+              (lambda (&rest _) (org-auto-scheduler--timegrid-sync-week-range)))
+  (with-eval-after-load 'evil
+    (dolist (state '(normal motion))
+      (evil-define-key state org-timegrid-mode-map
+        (kbd "n") #'org-timegrid-next-block
+        (kbd "p") #'org-timegrid-previous-block
+        (kbd "b") #'org-timegrid-backward-day
+        (kbd "f") #'org-timegrid-forward-day
+        (kbd "j") #'org-timegrid-goto-date
+        (kbd ".") #'org-timegrid-goto-today
+        (kbd "g") #'org-timegrid-refresh
+        (kbd "i") #'org-auto-scheduler-review-toggle-timegrid-layout
+        (kbd "q") #'quit-window))))
 
 (defun org-auto-scheduler-review-help ()
-  "Show help for the review buffer."
+  "Show help for the review buffer and timegrid."
   (interactive)
   (with-output-to-temp-buffer "*Org Auto Scheduler Review Help*"
     (with-current-buffer standard-output
-      (insert "Org Auto Scheduler Review Mode Keybindings:\n\n")
-      (insert "  SPC, m       Toggle application of task at point (or toggle non-blocking on event)\n")
-      (insert "  b            Toggle non-blocking status of fixed agenda event\n")
-      (insert "  s            Toggle SPLITTABLE status on task at point\n")
-      (insert "  F, i         Toggle FREESET status (off-hours flexible; splits at midnight)\n")
-      (insert "  p            Pin task to prompted time (default: preview time; C-u to unpin)\n")
-      (insert "  TAB, RET     Jump to task or event in Org file\n")
-      (insert "  x, C-c C-c   Apply all checked scheduled times to Org files\n")
-      (insert "  U, p         Move task up (manually reorder / cross days)\n")
-      (insert "  D, n         Move task down (manually reorder / cross days)\n")
-      (insert "  P            Move task to before another task, picked by name (keyboard drag)\n")
+      (insert "Org Auto Scheduler Review & Timegrid Keybindings:\n\n")
+      (insert "  RET, m       Toggle application of task at point/selected ([X] / [ ])\n")
+      (insert "  TAB          Jump to task or event in Org file\n")
+      (insert "  s            Toggle SPLITTABLE status on task at point/selected\n")
+      (insert "  F            Toggle FREESET status (off-hours flexible; splits at midnight)\n")
+      (insert "  B, b         Toggle non-blocking status of fixed agenda event (B in timegrid)\n")
+      (insert "  P, p         Pin task to prompted time (P in timegrid; default: preview time; C-u to unpin)\n")
+      (insert "  e            Edit estimated effort of task at point/selected (What-If)\n")
+      (insert "  O            Move task to before another task, picked by name\n")
+      (insert "  K            Move task up / earlier in order (crosses days)\n")
+      (insert "  J, D         Move task down / later in order (crosses days)\n")
       (insert "  >, +         Move task to next scheduled day\n")
       (insert "  <, -         Move task to previous scheduled day\n")
       (insert "  d            Move task to specific date (org-read-date)\n")
+      (insert "  U, u         Undo last review modification (U everywhere; u in review)\n")
+      (insert "  x, C-c C-c   Apply all checked scheduled times to Org files\n")
       (insert "  r, C-c C-r   Recalculate schedule (auto-compacts; C-u r preserves day sections)\n")
       (insert "  R            Refresh/re-run auto-scheduler from scratch\n")
       (insert "  S, C-c C-s   Save ordering, skipping, and day decisions across sessions\n")
       (insert "  M, C-c C-m   Restore previous review order and merge live changes\n")
       (insert "  C, C-c C-d   Clear saved decisions (all, skipped, order, non-blocking, or task at point)\n")
-      (insert "  u            Undo last toggle, move, filter, or override\n")
-      (insert "  e            Edit estimated effort of task at point (What-If)\n")
       (insert "  E            Toggle showing existing fixed agenda events\n")
-      (insert "  T            Open proposed schedule in org-timegrid (if enabled/installed)\n\n")
+      (insert "  T            Toggle open/close org-timegrid calendar split\n")
+      (insert "  i            Toggle timegrid layout (3-day side-by-side vs horizontal split)\n\n")
+      (insert "Timegrid Native Navigation (in *Org Time Grid*):\n")
+      (insert "  n / p        Select next / previous task block\n")
+      (insert "  b / f        Navigate backward / forward by one day\n")
+      (insert "  M-b / M-f    Navigate backward / forward by one week\n")
+      (insert "  j / .        Jump to date / today\n")
+      (insert "  SPC / C-v    Page down\n")
+      (insert "  u            Undo native timegrid tile edit / scheduler undo\n")
+      (insert "  M-<arrows>   Nudge block 15m earlier/later or day prev/next\n")
+      (insert "  S-<arrows>   Resize block duration / effort\n\n")
       (insert "Filters (prefix with 'f'):\n")
       (insert "  f t          Show only tasks scheduled for today\n")
       (insert "  f p          Filter tasks by project\n")
@@ -7321,6 +7787,10 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
     (cancel-timer org-auto-scheduler--adherence-timer)
     (setq org-auto-scheduler--adherence-timer nil))
   (message "Org Auto Scheduler adherence score disabled in mode line."))
+
+;; Initialize background scheduler if enabled at load time
+(when org-auto-scheduler-background-enabled
+  (org-auto-scheduler-setup-background))
 
 (provide 'org-auto-scheduler)
 
