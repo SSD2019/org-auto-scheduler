@@ -418,7 +418,8 @@ Every core schedule-review shortcut works identically when focused in either the
 - Pressing =U= (or =u= in review) triggers Auto-Scheduler review undo in both views (restoring overrides, table entries, and task schedules; in timegrid, lowercase =u= is reserved for native timegrid tile undo).
 - Pressing =e= prompts to adjust estimated effort for What-If scenario planning (editing a placeholder chunk redirects to the parent task).
 - Pressing =B= in the timegrid (or =B= / =b= in review) toggles non-blocking status on fixed agenda events.
-- Reordering (=K=, =J=, =D=, =>=, =<=, =d=, =O=) and global actions (=r=, =x=, =S=, =M=, =C=, =E=) execute directly on the selected task block and auto-refresh the grid.
+- Reordering (=K=, =J=, =D=, =>=, =<=, =d=, =O=) and timegrid mouse dragging swap rows and update layout instantaneously (<5ms), debouncing schedule recalculation until input pauses for 3 seconds (configurable via =org-auto-scheduler-review-recalculate-delay=; press =r= to recalculate immediately).
+- Global actions (=r=, =x=, =S=, =M=, =C=, =E=) execute directly on the selected task block and auto-refresh the grid.
 - Pressing =i= toggles the timegrid layout between a 3-day side-by-side view (timegrid on the left with 3 days, review tableview on the right) and the default horizontal split (timegrid on top with 7 days, tableview below). The preferred default and number of days can be configured via =org-auto-scheduler-review-timegrid-layout= and =org-auto-scheduler-review-timegrid-side-by-side-days=.
 
 **** Evil / Spacemacs Compatibility
@@ -822,6 +823,8 @@ Backward-compatible aliases:
 | =org-auto-scheduler-review-show-agenda-events=  | =t=                                             | Display existing fixed calendar/agenda events in the review buffer.                            |
 | =org-auto-scheduler-review-compact-schedule=    | =t=                                             | When non-nil, recalculation auto-compacts tasks into earlier available slots across days.       |
 | =org-auto-scheduler-review-dim-future-days=     | =nil=                                           | When non-nil, dims tasks on future days using shadow face (=nil= keeps vibrant colors).         |
+| =org-auto-scheduler-review-auto-recalculate-on-move= | =t=                                             | When non-nil, reordering tasks automatically recalculates schedule times.                       |
+| =org-auto-scheduler-review-recalculate-delay=       | =3.0=                                           | Idle seconds after moving tasks before recalculating (debounces rapid moves and mouse drags).   |
 
 Example configuration:
 

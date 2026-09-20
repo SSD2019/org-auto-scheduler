@@ -407,6 +407,18 @@ before."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-review-recalculate-delay 3.0
+  "Delay in seconds of idle time after moving tasks before auto-recalculating.
+When non-nil and positive, rapid keystrokes (K, J, D, >, <) and mouse drags
+reorder rows instantly and debounce schedule recalculation until input pauses.
+If nil or 0, recalculate immediately on each move."
+  :type '(choice (const :tag "Immediate" nil)
+                 (number :tag "Seconds delay" 3.0))
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--review-recalc-timer nil
+  "Idle timer object for debounced review buffer schedule recalculation.")
+
 (defcustom org-auto-scheduler-review-timegrid-integration nil
   "If non-nil, offer a visual time-grid view of the proposed schedule.
 When enabled, `org-auto-scheduler-review-open-timegrid' (bound to \"T\" in
@@ -983,6 +995,7 @@ When SILENT is non-nil, suppress confirmation message."
   (interactive)
   (unless (eq major-mode 'org-auto-scheduler-review-mode)
     (user-error "Not in an Org Auto Scheduler Review buffer"))
+  (org-auto-scheduler--review-flush-pending-recalculate)
   (let ((order-rank 0)
         (current-sep-date nil)
         (saved-count 0)
@@ -4544,6 +4557,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (setq-local revert-buffer-function #'org-auto-scheduler-review-refresh-revert)
   (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
   (setq-local tabulated-list-printer #'org-auto-scheduler--tabulated-list-printer)
+  (add-hook 'kill-buffer-hook #'org-auto-scheduler--review-cancel-recalc-timer nil t)
   (tabulated-list-init-header))
 
 (defun org-auto-scheduler-review-toggle ()
@@ -4808,12 +4822,44 @@ If TASK-ID is nil, use task at point. Scans backward for the nearest day separat
       (when (eobp)
         (goto-char orig-point)))))
 
+(defun org-auto-scheduler--review-cancel-recalc-timer ()
+  "Cancel any pending debounced schedule recalculation timer."
+  (when (timerp org-auto-scheduler--review-recalc-timer)
+    (cancel-timer org-auto-scheduler--review-recalc-timer)
+    (setq org-auto-scheduler--review-recalc-timer nil)))
+
+(defun org-auto-scheduler--review-flush-pending-recalculate ()
+  "If a debounced recalculation is pending, execute it immediately."
+  (when (timerp org-auto-scheduler--review-recalc-timer)
+    (org-auto-scheduler--review-cancel-recalc-timer)
+    (org-auto-scheduler-review-recalculate)))
+
 (defun org-auto-scheduler--review-maybe-auto-recalculate (task-id)
-  "Recalculate the schedule and re-park point on TASK-ID, per user setting.
-No-op unless `org-auto-scheduler-review-auto-recalculate-on-move' is non-nil."
+  "Recalculate the schedule and re-park point on TASK-ID, per user settings.
+When `org-auto-scheduler-review-auto-recalculate-on-move' is non-nil,
+recalculates either after `org-auto-scheduler-review-recalculate-delay' seconds
+of idle time, or immediately if that delay is nil or non-positive."
   (when org-auto-scheduler-review-auto-recalculate-on-move
-    (org-auto-scheduler-review-recalculate)
-    (org-auto-scheduler--review-goto-task task-id)))
+    (if (and org-auto-scheduler-review-recalculate-delay
+             (> org-auto-scheduler-review-recalculate-delay 0))
+        (progn
+          (org-auto-scheduler--review-cancel-recalc-timer)
+          (message "Task moved. Recalculating in %gs... (press 'r' to recalculate now)"
+                   org-auto-scheduler-review-recalculate-delay)
+          (setq org-auto-scheduler--review-recalc-timer
+                (run-with-idle-timer
+                 org-auto-scheduler-review-recalculate-delay nil
+                 (lambda (buf tid)
+                   (setq org-auto-scheduler--review-recalc-timer nil)
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (org-auto-scheduler-review-recalculate)
+                       (when tid (org-auto-scheduler--review-goto-task tid))
+                       (org-auto-scheduler--timegrid-maybe-refresh))))
+                 (current-buffer) task-id)))
+      (org-auto-scheduler--review-cancel-recalc-timer)
+      (org-auto-scheduler-review-recalculate)
+      (when task-id (org-auto-scheduler--review-goto-task task-id)))))
 
 (defun org-auto-scheduler-review-move-up ()
   "Move the current task up in the review list, crossing day boundaries if needed.
@@ -5513,6 +5559,7 @@ pack continuously and automatically backfill into available earlier day slots.
 With prefix ARG (C-u r), or when `org-auto-scheduler-review-compact-schedule' is nil,
 tasks are constrained to start on or after their current day section."
   (interactive "P")
+  (org-auto-scheduler--review-cancel-recalc-timer)
   (let* ((compact (if arg
                       (not org-auto-scheduler-review-compact-schedule)
                     org-auto-scheduler-review-compact-schedule))
@@ -5828,7 +5875,7 @@ Automatically recalculates dependent times based on visual layout before executi
                    (if org-auto-scheduler-review-auto-recalculate-on-move ""
                      " Press 'r' to recalculate schedule."))
           (if org-auto-scheduler-review-auto-recalculate-on-move
-              (org-auto-scheduler-review-recalculate)
+              (org-auto-scheduler--review-maybe-auto-recalculate task-id)
             (tabulated-list-print t))))))))
 
 (defun org-auto-scheduler-review-toggle-freeset ()
@@ -5861,7 +5908,7 @@ and if it goes beyond midnight, splits to the next day."
                    (if org-auto-scheduler-review-auto-recalculate-on-move ""
                      " Press 'r' to recalculate schedule."))
           (if org-auto-scheduler-review-auto-recalculate-on-move
-              (org-auto-scheduler-review-recalculate)
+              (org-auto-scheduler--review-maybe-auto-recalculate task-id)
             (tabulated-list-print t))))))))
 
 (defalias 'org-auto-scheduler-review-toggle-pinnable 'org-auto-scheduler-review-toggle-freeset)
@@ -5911,6 +5958,7 @@ With prefix ARG (C-u p) or empty input, unpins the task."
 (defun org-auto-scheduler-review-undo ()
   "Undo the last modification in the review buffer."
   (interactive)
+  (org-auto-scheduler--review-cancel-recalc-timer)
   (if (null org-auto-scheduler--review-undo-stack)
       (user-error "No further undo information")
     (let ((snapshot (pop org-auto-scheduler--review-undo-stack)))
@@ -6486,7 +6534,7 @@ simply still there."
 (defun org-auto-scheduler--timegrid-selected-task-id ()
   "Return the task ID for the currently selected block or block at cursor in the timegrid."
   (when-let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
-                              (org-timegrid--block-at-cursor))
+                              (ignore-errors (org-timegrid--block-at-cursor)))
                          (and (fboundp 'org-timegrid--selected-id)
                               (org-timegrid--selected-id)
                               (fboundp 'org-timegrid--block)
@@ -6499,7 +6547,7 @@ simply still there."
   "Jump to the original Org task or agenda event for the selected timegrid block."
   (interactive)
   (let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
-                         (org-timegrid--block-at-cursor))
+                         (ignore-errors (org-timegrid--block-at-cursor)))
                     (and (fboundp 'org-timegrid--selected-id)
                          (org-timegrid--selected-id)
                          (fboundp 'org-timegrid--block)
@@ -6538,7 +6586,7 @@ When NEEDS-TASK is non-nil, signals a `user-error' if no task is selected or at 
                (buffer-live-p org-auto-scheduler--timegrid-source-buffer))
     (user-error "No linked Org Auto Scheduler review buffer"))
   (let* ((block (or (and (fboundp 'org-timegrid--block-at-cursor)
-                         (org-timegrid--block-at-cursor))
+                         (ignore-errors (org-timegrid--block-at-cursor)))
                     (and (fboundp 'org-timegrid--selected-id)
                          (org-timegrid--selected-id)
                          (fboundp 'org-timegrid--block)
@@ -6634,9 +6682,11 @@ TARGET-DAY is an optional calendar absolute day to start/anchor the visible rang
                 (and (boundp 'org-timegrid--state) org-timegrid--state
                      (fboundp 'org-timegrid--calendar-state-week-start)
                      (let* ((ws (org-timegrid--calendar-state-week-start org-timegrid--state))
-                            (cursor (and (fboundp 'org-timegrid--cursor) (org-timegrid--cursor))))
-                       (if (and cursor (fboundp 'org-timegrid--cursor-state-day))
-                           (+ ws (org-timegrid--cursor-state-day cursor))
+                            (cursor (and (fboundp 'org-timegrid--cursor) (org-timegrid--cursor)))
+                            (cday (and cursor (fboundp 'org-timegrid--cursor-state-day)
+                                       (ignore-errors (org-timegrid--cursor-state-day cursor)))))
+                       (if (numberp cday)
+                           (+ ws cday)
                          ws))))
               (with-current-buffer review-buffer
                 (let* ((task-day (org-auto-scheduler--review-get-task-day))
