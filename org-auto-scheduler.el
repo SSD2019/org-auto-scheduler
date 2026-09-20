@@ -372,9 +372,9 @@ rescheduling is triggered by a title marker (such as -r- or -r-all-)."
   :type 'boolean
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all\\|[rRsSfF]+\\)-\\(?:\\s-*)\\)?"
+(defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all[rRsSfFpP\\\\-]*\\|[rRsSfFpP\\\\\\]+\\)-\\(?:\\s-*)\\)?"
   "Regular expression matching title markers for task scheduling modifiers.
-Matches patterns like (-r-), -r-, (-s-), (-f-), (-rsf-), (-sfr-), (-r-all-), etc."
+Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\s-), (-\f-), (-\p-), (-rsf-), (-rp-), (-r\p-), (-r-all-), etc."
   :type 'string
   :group 'org-auto-scheduler)
 
@@ -2357,45 +2357,91 @@ If POM is nil, use the current point."
 
 
 (defun org-auto-scheduler--process-title-markers (marker)
-  "Process title markers (e.g. -r-, -s-, -f-, -rsf-, -r-all-) at MARKER.
-Strips markers from the headline, sets SPLITTABLE/FREESET properties and tags,
-and returns a plist (:reschedule BOOL :reschedule-all BOOL :splittable BOOL :freeset BOOL :title STRING).
+  "Process title markers (e.g. -r-, -s-, -f-, -p-, -\\s-, -\\f-, -\\p-, -rsf-, -r-all-) at MARKER.
+Strips markers from the headline, sets or deletes SPLITTABLE/FREESET/PINNED properties and tags,
+and returns a plist (:reschedule BOOL :reschedule-all BOOL :splittable BOOL :freeset BOOL :pinned BOOL
+:remove-splittable BOOL :remove-freeset BOOL :remove-pinned BOOL :title STRING).
 If no marker is found, returns nil."
   (when (and marker (markerp marker) (marker-buffer marker))
     (org-with-point-at marker
       (let* ((heading (org-get-heading t t t t))
              (regex org-auto-scheduler-title-marker-regex))
         (when (and heading (string-match regex heading))
-          (let* ((match-grp (downcase (match-string 1 heading)))
-                 (is-r-all (string= match-grp "r-all"))
-                 (is-resched (or is-r-all (string-match-p "r" match-grp)))
-                 (is-split (string-match-p "s" match-grp))
-                 (is-freeset (string-match-p "f" match-grp))
-                 (cleaned-title (string-trim (replace-regexp-in-string
-                                              "[ \t]+" " "
-                                              (replace-regexp-in-string regex "" heading)))))
-            ;; Update headline in buffer
-            (org-edit-headline cleaned-title)
-            ;; Update splittable property & tag if -s- was present
-            (when is-split
-              (org-set-property org-auto-scheduler-split-property "t")
-              (let ((tags (org-get-tags nil t)))
-                (cl-pushnew org-auto-scheduler-splittable-tag tags :test #'string=)
-                (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
-            ;; Update freeset property & tag if -f- was present
-            (when is-freeset
-              (org-set-property org-auto-scheduler-freeset-property "t")
-              (let ((tags (org-get-tags nil t)))
-                (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
-                (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
-            (org-auto-scheduler--log-info
-             "Processed title marker '%s' on task '%s' -> flags: resched=%s, split=%s, free=%s"
-             match-grp cleaned-title is-resched is-split is-freeset)
-            (list :reschedule (and is-resched t)
-                  :reschedule-all (and is-r-all t)
-                  :splittable (and is-split t)
-                  :freeset (and is-freeset t)
-                  :title cleaned-title)))))))
+          (let* ((pos 0)
+                 (all-grps '()))
+            (while (string-match regex heading pos)
+              (push (downcase (match-string 1 heading)) all-grps)
+              (setq pos (match-end 0)))
+            (let* ((match-grp (mapconcat #'identity (nreverse all-grps) " "))
+                   (task-id (or (org-id-get) (when (buffer-file-name) (org-id-get-create))))
+                   (is-r-all (string-match-p "r-all" match-grp))
+                   (is-resched (or is-r-all (string-match-p "r" match-grp)))
+                   (is-split-on (string-match-p "\\(?:^\\|[^\\\\]\\)s" match-grp))
+                   (is-split-off (string-match-p "\\\\s" match-grp))
+                   (is-free-on (string-match-p "\\(?:^\\|[^\\\\]\\)f" match-grp))
+                   (is-free-off (string-match-p "\\\\f" match-grp))
+                   (is-pin-on (string-match-p "\\(?:^\\|[^\\\\]\\)p" match-grp))
+                   (is-pin-off (string-match-p "\\\\p" match-grp))
+                   (cleaned-title (string-trim (replace-regexp-in-string
+                                                "[ \t]+" " "
+                                                (replace-regexp-in-string regex "" heading)))))
+              ;; Update headline in buffer
+              (org-edit-headline cleaned-title)
+
+              ;; Update splittable property & tag: -s- enables, -\s- removes
+              (cond
+               (is-split-off
+                (org-delete-property org-auto-scheduler-split-property)
+                (let ((tags (delete org-auto-scheduler-splittable-tag (org-get-tags nil t))))
+                  (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
+               (is-split-on
+                (org-set-property org-auto-scheduler-split-property "t")
+                (let ((tags (org-get-tags nil t)))
+                  (cl-pushnew org-auto-scheduler-splittable-tag tags :test #'string=)
+                  (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))
+
+              ;; Update freeset property & tag: -f- enables, -\f- removes
+              (cond
+               (is-free-off
+                (org-delete-property org-auto-scheduler-freeset-property)
+                (org-delete-property "PINNABLE")
+                (let ((tags (delete org-auto-scheduler-freeset-tag
+                                    (delete "PINNABLE" (org-get-tags nil t)))))
+                  (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
+               (is-free-on
+                (org-set-property org-auto-scheduler-freeset-property "t")
+                (let ((tags (org-get-tags nil t)))
+                  (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
+                  (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))
+
+              ;; Update pinned property & tag: -p- pins to incoming time, -\p- unpins
+              (cond
+               (is-pin-off
+                (org-auto-scheduler-task-set-pinned-time marker task-id nil t))
+               (is-pin-on
+                (let* ((incoming-time (or (org-entry-get nil "SCHEDULED")
+                                          (org-entry-get nil "TIMESTAMP")
+                                          (org-entry-get nil org-auto-scheduler-pinned-time-property))))
+                  (if incoming-time
+                      (org-auto-scheduler-task-set-pinned-time marker task-id incoming-time)
+                    (org-set-property org-auto-scheduler-pinned-property "t")
+                    (let ((tags (org-get-tags nil t)))
+                      (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
+                      (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))))
+
+              (org-auto-scheduler--log-info
+               "Processed title marker '%s' on task '%s' -> flags: resched=%s, split-on=%s, split-off=%s, free-on=%s, free-off=%s, pin-on=%s, pin-off=%s"
+               match-grp cleaned-title is-resched is-split-on is-split-off is-free-on is-free-off is-pin-on is-pin-off)
+
+              (list :reschedule (and is-resched t)
+                    :reschedule-all (and is-r-all t)
+                    :splittable (and is-split-on t)
+                    :freeset (and is-free-on t)
+                    :pinned (and is-pin-on t)
+                    :remove-splittable (and is-split-off t)
+                    :remove-freeset (and is-free-off t)
+                    :remove-pinned (and is-pin-off t)
+                    :title cleaned-title))))))))
 
 (defun org-auto-scheduler--task-scheduled-today-p (marker &optional today-str)
   "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled for TODAY-STR with a specific time.
@@ -2532,7 +2578,20 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                 (when (plist-get m-res :reschedule-all)
                   (setq has-r-all t))
                 (when (plist-get m-res :title)
-                  (setf (nth 6 task-info) (plist-get m-res :title))))
+                  (setf (nth 6 task-info) (plist-get m-res :title)))
+                (when (plist-get m-res :remove-splittable)
+                  (setf (nth 7 task-info) (delete org-auto-scheduler-splittable-tag (nth 7 task-info))))
+                (when (plist-get m-res :remove-freeset)
+                  (setf (nth 7 task-info) (delete org-auto-scheduler-freeset-tag
+                                                 (delete "PINNABLE" (nth 7 task-info)))))
+                (when (plist-get m-res :splittable)
+                  (setf (nth 7 task-info) (cl-pushnew org-auto-scheduler-splittable-tag (nth 7 task-info) :test #'string=)))
+                (when (plist-get m-res :freeset)
+                  (setf (nth 7 task-info) (cl-pushnew org-auto-scheduler-freeset-tag (nth 7 task-info) :test #'string=)))
+                (when (plist-get m-res :remove-pinned)
+                  (setf (nth 7 task-info) (delete org-auto-scheduler-pinned-tag (nth 7 task-info))))
+                (when (plist-get m-res :pinned)
+                  (setf (nth 7 task-info) (cl-pushnew org-auto-scheduler-pinned-tag (nth 7 task-info) :test #'string=))))
               ;; Check if scheduled for today with a time
               (let ((today-times (when preserve-today
                                    (org-auto-scheduler--task-scheduled-today-p marker today-str))))
@@ -2934,7 +2993,7 @@ Returns non-nil if now freeset."
                 (and (derived-mode-p 'org-mode) (point-marker))))
          (tid (or task-id
                   (when (and m (markerp m) (marker-buffer m))
-                    (org-with-point-at m (or (org-id-get) (org-id-get-create)))))))
+                    (org-with-point-at m (or (org-id-get) (when (buffer-file-name (marker-buffer m)) (org-id-get-create))))))))
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "Cannot find task marker"))
     (let* ((currently-freeset (org-auto-scheduler-task-freeset-p m tid))
