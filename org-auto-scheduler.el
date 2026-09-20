@@ -45,6 +45,7 @@
 (require 'calendar)
 (require 'tabulated-list)
 (require 'color)
+(eval-when-compile (require 'evil nil t))
 
 
 
@@ -372,7 +373,7 @@ rescheduling is triggered by a title marker (such as -r- or -r-all-)."
   :type 'boolean
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all[rRsSfFpP\\\\-]*\\|[rRsSfFpP\\\\\\]+\\)-\\(?:\\s-*)\\)?"
+(defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all[rRsSfFpP\\\\-]*\\|[rRsSfFpP\\\\]+\\)-\\(?:\\s-*)\\)?"
   "Regular expression matching title markers for task scheduling modifiers.
 Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\s-), (-\f-), (-\p-), (-rsf-), (-rp-), (-r\p-), (-r-all-), etc."
   :type 'string
@@ -2444,21 +2445,32 @@ If no marker is found, returns nil."
                     :title cleaned-title))))))))
 
 (defun org-auto-scheduler--task-scheduled-today-p (marker &optional today-str)
-  "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled for TODAY-STR with a specific time.
+  "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled or pinned for TODAY-STR with a specific time.
 TODAY-STR defaults to today's date in YYYY-MM-DD format.
-Returns nil if not scheduled, scheduled on another day, or scheduled date-only without a time."
+Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date-only without a time."
   (when (and marker (markerp marker) (marker-buffer marker))
     (org-with-point-at marker
-      (let* ((sched-str (org-entry-get nil "SCHEDULED"))
-             (target-today (or today-str (format-time-string "%Y-%m-%d"))))
-        (when (and sched-str
-                   ;; Must contain HH:MM
-                   (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" sched-str))
-          (let* ((start-time (org-time-string-to-time sched-str))
-                 (start-day (and start-time (format-time-string "%Y-%m-%d" start-time))))
-            (when (and start-day (string= start-day target-today))
-              (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
-                (cons start-time (or end-time (time-add start-time (seconds-to-time 3600))))))))))))
+      (let* ((target-today (or today-str (format-time-string "%Y-%m-%d")))
+             (sched-str (org-entry-get nil "SCHEDULED"))
+             (pinned-time-str (org-entry-get nil org-auto-scheduler-pinned-time-property)))
+        (or
+         ;; Case A: Task pinned to today via PINNED_TIME property
+         (when (and pinned-time-str
+                    (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" pinned-time-str))
+           (let* ((pt (org-auto-scheduler--parse-flexible-time pinned-time-str marker))
+                  (pt-day (and pt (format-time-string "%Y-%m-%d" pt))))
+             (when (and pt-day (string= pt-day target-today))
+               (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                 (cons pt (or end-time (time-add pt (seconds-to-time 3600))))))))
+         ;; Case B: Task scheduled for today with HH:MM
+         (when (and sched-str
+                    ;; Must contain HH:MM
+                    (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" sched-str))
+           (let* ((start-time (org-time-string-to-time sched-str))
+                  (start-day (and start-time (format-time-string "%Y-%m-%d" start-time))))
+             (when (and start-day (string= start-day target-today))
+               (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                 (cons start-time (or end-time (time-add start-time (seconds-to-time 3600)))))))))))))
 
 (defun org-auto-scheduler--task-clocked-p (marker)
   "Return non-nil if the task at MARKER is currently clocked in."
@@ -2727,7 +2739,16 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                      (hd (nth 6 t-info))
                      (tags (nth 7 t-info))
                      (td (nth 14 t-info))
+                     (is-pin (plist-get e :pinned))
                      (sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
+                ;; Ensure pinned tasks have their SCHEDULED line properly synchronized to PINNED_TIME
+                (when (and is-pin
+                           (or (gethash tid marker-data)
+                               (let ((pt (org-auto-scheduler-task-pinned-time m tid)))
+                                 (and pt (not (string-prefix-p (format-time-string "%Y-%m-%d %H:%M" pt)
+                                                               (or sched-str "")))))))
+                  (org-auto-scheduler-schedule-single-task m current-time td)
+                  (setq sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
                 (push (list tid st et (or tags '("AUTOSCH")) t hd sched-str m td)
                       org-auto-scheduler-completed-tasks)
                 (unless org-auto-scheduler--preview-mode
@@ -3680,12 +3701,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                   (and (bound-and-true-p org-auto-scheduler--reordering-p) is-freeset))
               (let* ((origin-id (or task-id (org-with-point-at marker (org-id-get-create))))
                      (eff-id (or task-id origin-id))
-                     (eff-start (or (and pinned-time
-                                         (or (null available-time)
-                                             (string= (format-time-string "%Y-%m-%d" pinned-time)
-                                                      (format-time-string "%Y-%m-%d" available-time)))
-                                         pinned-time)
-                                    available-time))
+                     (eff-start (or pinned-time available-time))
                      (start-date-str (format-time-string "%Y-%m-%d" eff-start))
                      (midnight (org-auto-scheduler--get-day-midnight eff-start))
                      (avail-before-midnight (max 1 (floor (/ (float-time (time-subtract midnight eff-start)) 60))))
