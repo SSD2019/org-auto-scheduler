@@ -31,6 +31,9 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
   - [[#review-keybindings][Review Keybindings]]
 - [[#schedule-adherence-tracking][Schedule Adherence Tracking]]
 - [[#background-scheduling][Background Scheduling]]
+  - [[#safe-schedule-preservation--smart-start-buffer][Safe Schedule Preservation & Smart Start Buffer]]
+  - [[#interactive-title-modifiers][Interactive Title Modifiers (-r-, -s-, -f-, -rsf-, -r-all-)]]
+  - [[#automatic-task-displacement][Automatic Displacement by Newly Added Tasks]]
 - [[#historical-effort-tracking][Historical Effort Tracking]]
 - [[#repeater--habit-integration][Repeater / Habit Integration]]
 - [[#recurring-tasks][Recurring Tasks]]
@@ -54,6 +57,10 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Schedule Adherence Tracking:* Morning snapshots + evening scoring with streaks, category breakdowns, partial credit, and a "Squirrel" penalty for unplanned work.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
+- *Safe Schedule Preservation:* Tasks scheduled for today remain anchored and won't endlessly slide forward on background idle syncs.
+- *Interactive Mobile & CalDAV Title Modifiers:* Use quick title prefixes like =(-r-)=, =(-s-)=, =(-f-)=, =(-rsf-)=, or =(-r-all-)= to reschedule, enable splitting, or mark freeset from any mobile calendar without editing Org property drawers. Markers are automatically processed, applied, and stripped clean from the headline.
+- *Automatic Task Displacement:* Newly added unscheduled =AUTOSCH= tasks automatically take their place among upcoming unpinned tasks based on priority/score, while past (lapsed), current (in-progress), and pinned tasks remain strictly fixed.
+- *Smart Start Buffer:* 0-minute immediate scheduling when actively clocked into a task, and a 5-minute buffer when unclocked.
 - *Historical Effort Learning:* Learns from your actual vs. estimated times per category.
 - *Time & Energy Blocks:* Hard and soft constraints for context-based scheduling.
 - *Repeater / Habit Awareness:* Projects repeater occurrences into the conflict map.
@@ -480,6 +487,7 @@ Display a live, running adherence score directly in your Emacs mode line. It upd
 To disable: =M-x org-auto-scheduler-adherence-mode-line-disable=.
 
 ** Background Scheduling
+<<background-scheduling>>
 
 When enabled, the scheduler runs silently while Emacs is idle, without popping
 up the report buffer.
@@ -490,11 +498,56 @@ up the report buffer.
 (setq org-auto-scheduler-background-interval 300) ; re-run every 5 min of continuous idle
 (setq org-auto-scheduler-background-async t)     ; run in asynchronous background thread (non-blocking)
 
+;; Schedule preservation and buffer settings
+(setq org-auto-scheduler-preserve-today-scheduled t) ; keep today's schedule stable (default t)
+(setq org-auto-scheduler-start-buffer-minutes 5)     ; start 5m ahead when unclocked (0m when clocked)
+
 ;; Restrict to specific machines (optional)
 (setq org-auto-scheduler-allowed-hostnames '("work-laptop" "home-pc"))
 #+end_src
 
 Toggle at runtime with =M-x org-auto-scheduler-toggle-background=.
+
+*** Safe Schedule Preservation & Smart Start Buffer
+<<safe-schedule-preservation--smart-start-buffer>>
+
+In background scheduling, a common frustration is that unclocked tasks constantly slide into =now + buffer= when you step away from your desk, leading to endless shifting across the day.
+
+Org Auto Scheduler solves this with *Safe Preservation* (=org-auto-scheduler-preserve-today-scheduled=, enabled by default):
+- *Stability by Default:* Tasks already scheduled for today remain anchored at their existing times during background runs.
+- *Smart Start Buffer:* When scheduling starts for new or rescheduled tasks:
+  - If you are *currently clocked in* to a task: buffer is *0 minutes* (starts immediately at =now=).
+  - If *not clocked in*: adds *5 minutes* buffer (=org-auto-scheduler-start-buffer-minutes=).
+- *Force Full Replan:* If you ever want to completely wipe and recalculate today's schedule from scratch, call =C-u M-x org-auto-scheduler-schedule-tasks= (or prefix =C-u= with your keybinding).
+
+*** Interactive Title Modifiers (-r-, -s-, -f-, -rsf-, -r-all-)
+<<interactive-title-modifiers>>
+
+When syncing with mobile calendar apps (via =org-caldav=, Google Calendar, or Nextcloud), you often need to reschedule or modify a task directly from your phone without opening Org property drawers.
+
+You can add lightweight modifier markers directly to the task title in any calendar app or Org headline:
+
+| Marker | Flag | Effect |
+|--------+------+--------|
+| =-r-= or =(-r-)= | *Reschedule Cascade* | Reschedules this task and all subsequent tasks today in their previously scheduled relative order. Tasks scheduled before it remain preserved. Pinned tasks stay fixed at their =PINNED_TIME=. |
+| =-s-= or =(-s-)= | *Splittable* | Marks the task as =SPLITTABLE= (sets =:SPLITTABLE: t= and adds =:SPLITTABLE:= tag). |
+| =-f-= or =(-f-)= | *Freeset* | Marks the task as =FREESET= (allows scheduling outside normal workday hours or across midnight). |
+| Combinations | *Multi-Modifier* | Any permutation in any order (e.g. =(-rs-)=, =(-sfr-)=, =(-rf-)=, =-fr-=, =(-fsr-)=). Order does not matter! |
+| =-r-all-= or =(-r-all-)= | *Reschedule All Overdue* | Triggers a cascade reschedule of all overdue tasks today forward into available time slots. |
+
+*Automatic Heading Cleanup:*
+When the scheduler runs, all title markers are parsed, their corresponding properties and tags are updated, and the markers are automatically *stripped clean* from the headline (e.g., =* TODO (-rsf-) Finish quarterly report= becomes =* TODO Finish quarterly report=). Clean headings are saved and synced back to your mobile calendar.
+
+*** Automatic Displacement by Newly Added Tasks
+<<automatic-task-displacement>>
+
+When you add a *newly added task* (an =AUTOSCH= task that is unscheduled or scheduled date-only today without a time):
+- *High-Priority Displacement:* If the new task has a higher priority or score than upcoming tasks, it automatically takes the upcoming slot and moves upcoming unpinned tasks forward.
+- *Strict Protection for Lapsed & Current Work:*
+  - *Lapsed tasks* (tasks that started earlier today in the past) are *never moved automatically*.
+  - *Current tasks* (tasks currently in progress or actively clocked in) are *never moved automatically*.
+  - *Pinned tasks* (tasks with =:PINNED: t= or =:PINNED_TIME:=) are *never moved automatically*.
+- *Zero Churn on Idle Runs:* If no unscheduled tasks exist (and no =-r-= marker is present), upcoming unpinned tasks remain locked in place across background idle syncs.
 
 ** Historical Effort Tracking
 
@@ -798,6 +851,9 @@ Backward-compatible aliases:
 | =org-auto-scheduler-idle-time=                | =300=   | Seconds of Emacs idle before the first background run.                         |
 | =org-auto-scheduler-background-interval=      | =300=   | Seconds between subsequent background runs (while still idle).                 |
 | =org-auto-scheduler-background-pause-on-clock= | =nil=   | When =t=, pause background scheduling while clocked into a task.               |
+| =org-auto-scheduler-preserve-today-scheduled= | =t=     | When non-nil, keep today's scheduled tasks stable during background sync unless triggered by -r- or new tasks. |
+| =org-auto-scheduler-start-buffer-minutes=     | =5=     | Buffer minutes added to current time when starting task scheduling (0 min when clocked in). |
+| =org-auto-scheduler-title-marker-regex=       | ="\\(?:(\\s-*\\)?-\\(r-all\\|[rRsSfF]+\\)-\\(?:\\s-*)\\)?"= | Regular expression for matching title-based modifiers like =(-r-)=, =(-sfr-)=, =(-r-all-)=. |
 | =org-auto-scheduler-allowed-hostnames=        | =nil=   | List of hostnames allowed to run background scheduling. =nil= = any machine.   |
 | =org-auto-scheduler-silent-mode=              | =nil=   | When =t=, suppress report buffer creation and display.                         |
 

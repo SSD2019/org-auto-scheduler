@@ -360,6 +360,24 @@ When nil (default), background scheduling proceeds even if a clock is running."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-start-buffer-minutes 5
+  "Buffer minutes added to current time when starting task scheduling.
+Defaults to 5 minutes. If a task is currently clocked in, 0 minutes is used instead."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-preserve-today-scheduled t
+  "When non-nil, tasks already scheduled for today are preserved unless
+rescheduling is triggered by a title marker (such as -r- or -r-all-)."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all\\|[rRsSfF]+\\)-\\(?:\\s-*)\\)?"
+  "Regular expression matching title markers for task scheduling modifiers.
+Matches patterns like (-r-), -r-, (-s-), (-f-), (-rsf-), (-sfr-), (-r-all-), etc."
+  :type 'string
+  :group 'org-auto-scheduler)
+
 (defvar org-auto-scheduler--idle-timer nil
   "Primary idle timer for background auto-scheduling.")
 
@@ -2338,9 +2356,100 @@ If POM is nil, use the current point."
     (org-time-string-to-time start-time-str)))
 
 
+(defun org-auto-scheduler--process-title-markers (marker)
+  "Process title markers (e.g. -r-, -s-, -f-, -rsf-, -r-all-) at MARKER.
+Strips markers from the headline, sets SPLITTABLE/FREESET properties and tags,
+and returns a plist (:reschedule BOOL :reschedule-all BOOL :splittable BOOL :freeset BOOL :title STRING).
+If no marker is found, returns nil."
+  (when (and marker (markerp marker) (marker-buffer marker))
+    (org-with-point-at marker
+      (let* ((heading (org-get-heading t t t t))
+             (regex org-auto-scheduler-title-marker-regex))
+        (when (and heading (string-match regex heading))
+          (let* ((match-grp (downcase (match-string 1 heading)))
+                 (is-r-all (string= match-grp "r-all"))
+                 (is-resched (or is-r-all (string-match-p "r" match-grp)))
+                 (is-split (string-match-p "s" match-grp))
+                 (is-freeset (string-match-p "f" match-grp))
+                 (cleaned-title (string-trim (replace-regexp-in-string
+                                              "[ \t]+" " "
+                                              (replace-regexp-in-string regex "" heading)))))
+            ;; Update headline in buffer
+            (org-edit-headline cleaned-title)
+            ;; Update splittable property & tag if -s- was present
+            (when is-split
+              (org-set-property org-auto-scheduler-split-property "t")
+              (let ((tags (org-get-tags nil t)))
+                (cl-pushnew org-auto-scheduler-splittable-tag tags :test #'string=)
+                (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
+            ;; Update freeset property & tag if -f- was present
+            (when is-freeset
+              (org-set-property org-auto-scheduler-freeset-property "t")
+              (let ((tags (org-get-tags nil t)))
+                (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
+                (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
+            (org-auto-scheduler--log-info
+             "Processed title marker '%s' on task '%s' -> flags: resched=%s, split=%s, free=%s"
+             match-grp cleaned-title is-resched is-split is-freeset)
+            (list :reschedule (and is-resched t)
+                  :reschedule-all (and is-r-all t)
+                  :splittable (and is-split t)
+                  :freeset (and is-freeset t)
+                  :title cleaned-title)))))))
+
+(defun org-auto-scheduler--task-scheduled-today-p (marker &optional today-str)
+  "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled for TODAY-STR with a specific time.
+TODAY-STR defaults to today's date in YYYY-MM-DD format.
+Returns nil if not scheduled, scheduled on another day, or scheduled date-only without a time."
+  (when (and marker (markerp marker) (marker-buffer marker))
+    (org-with-point-at marker
+      (let* ((sched-str (org-entry-get nil "SCHEDULED"))
+             (target-today (or today-str (format-time-string "%Y-%m-%d"))))
+        (when (and sched-str
+                   ;; Must contain HH:MM
+                   (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" sched-str))
+          (let* ((start-time (org-time-string-to-time sched-str))
+                 (start-day (and start-time (format-time-string "%Y-%m-%d" start-time))))
+            (when (and start-day (string= start-day target-today))
+              (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                (cons start-time (or end-time (time-add start-time (seconds-to-time 3600))))))))))))
+
+(defun org-auto-scheduler--task-clocked-p (marker)
+  "Return non-nil if the task at MARKER is currently clocked in."
+  (and (markerp marker)
+       (marker-buffer marker)
+       (fboundp 'org-clocking-p)
+       (org-clocking-p)
+       (boundp 'org-clock-marker)
+       (markerp org-clock-marker)
+       (equal (marker-buffer org-clock-marker) (marker-buffer marker))
+       (= (marker-position org-clock-marker) (marker-position marker))))
+
+(defun org-auto-scheduler--task-unscheduled-p (task-info)
+  "Return non-nil if TASK-INFO represents an unscheduled task eligible for today.
+A task is unscheduled if it has no SCHEDULED property, or its SCHEDULED property
+is for today or in the past without a specific time (HH:MM)."
+  (let ((sched (nth 8 task-info))
+        (today-str (format-time-string "%Y-%m-%d")))
+    (cond
+     ;; No SCHEDULED property at all -> unscheduled!
+     ((or (null sched) (string-empty-p (string-trim sched)))
+      t)
+     ;; Has HH:MM time -> already scheduled with a specific time!
+     ((string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" sched)
+      nil)
+     ;; Date-only: check if date is today or in the past (overdue date-only)
+     (t
+      (let ((date (and (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched)
+                       (match-string 1 sched))))
+        (or (null date)
+            (not (string> date today-str))))))))
+
 (defun org-auto-scheduler-get-start-time ()
   "Get the starting time for scheduling tasks.
-If current time is after org-auto-scheduler-end-time, return the start time of the next day."
+If current time is after org-auto-scheduler-end-time, return the start time of the next day.
+When clocked into a task, returns current time immediately (0 buffer).
+Otherwise, adds `org-auto-scheduler-start-buffer-minutes' (default 5m) buffer."
   (let* ((now (current-time))
          (decoded-time (decode-time now))
          (current-hour (nth 2 decoded-time))
@@ -2349,24 +2458,37 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                                         (split-string org-auto-scheduler-start-time ":")))
          (end-time-components (mapcar #'string-to-number
                                       (split-string org-auto-scheduler-end-time ":")))
+         (start-hour (car start-time-components))
+         (start-minute (cadr start-time-components))
          (end-hour (car end-time-components))
-         (end-minute (cadr end-time-components)))
-    (if (or (> current-hour end-hour)
-            (and (= current-hour end-hour) (>= current-minute end-minute)))
-        ;; If it's after the end time, start from the configured start time the next day
-        (let* ((tomorrow (time-add now (seconds-to-time (* 24 3600))))
-               (tomorrow-start (apply #'encode-time
-                                      (append (list 0
-                                                    (cadr start-time-components)
-                                                    (car start-time-components))
-                                              (nthcdr 3 (decode-time tomorrow))))))
-          tomorrow-start)
-      ;; Otherwise, start from the current time plus 15 minutes
-      (time-add now (seconds-to-time 900)))))
+         (end-minute (cadr end-time-components))
+         (is-clocked (or (and (fboundp 'org-clocking-p) (org-clocking-p))
+                         (and (boundp 'org-clock-current-task) org-clock-current-task)))
+         (buffer-seconds (if is-clocked 0 (* org-auto-scheduler-start-buffer-minutes 60))))
+    (cond
+     ;; If before configured work start time today, start at start-time today
+     ((or (< current-hour start-hour)
+          (and (= current-hour start-hour) (< current-minute start-minute)))
+      (apply #'encode-time
+             (append (list 0 start-minute start-hour)
+                     (nthcdr 3 decoded-time))))
+     ;; If after configured work end time today, start at start-time tomorrow
+     ((or (> current-hour end-hour)
+          (and (= current-hour end-hour) (>= current-minute end-minute)))
+      (let* ((tomorrow (time-add now (seconds-to-time (* 24 3600))))
+             (tomorrow-start (apply #'encode-time
+                                    (append (list 0 start-minute start-hour)
+                                            (nthcdr 3 (decode-time tomorrow))))))
+        tomorrow-start))
+     ;; Otherwise during workday: start at current time + buffer (0 if clocked, 5m if not)
+     (t
+      (time-add now (seconds-to-time buffer-seconds))))))
 
-(defun org-auto-scheduler-schedule-tasks ()
-  "Schedule all schedulable tasks, grouping them by project."
-  (interactive)
+(defun org-auto-scheduler-schedule-tasks (&optional force-replan)
+  "Schedule all schedulable tasks, grouping them by project.
+When FORCE-REPLAN is non-nil (or with prefix arg `C-u`), re-plan all tasks from
+scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
+  (interactive "P")
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
   (org-auto-scheduler-cleanup-placeholders)
   (org-auto-scheduler-load-review-decisions)
@@ -2389,41 +2511,195 @@ If current time is after org-auto-scheduler-end-time, return the start time of t
                (current-time (org-auto-scheduler-get-start-time))
                (tasks-scheduled 0)
                (total-tasks (length sorted-tasks-info))
-               (previous-project nil))
+               (now (current-time))
+               (today-str (format-time-string "%Y-%m-%d" now))
+               (preserve-today (and org-auto-scheduler-preserve-today-scheduled
+                                    (not force-replan)))
+               ;; Process title markers on all tasks and extract flags
+               (has-r-all nil)
+               (marker-data (make-hash-table :test 'equal)) ; task-id -> plist
+               (today-scheduled '()) ; list of entries for today
+               (tasks-to-schedule '())) ; tasks that need scheduling slots
 
-          (let ((reporter (unless org-auto-scheduler-silent-mode
-                            (make-progress-reporter "Scheduling tasks..." 0 total-tasks))))
-            (dolist (task-info sorted-tasks-info)
-              ;; Cooperative yield if running in a background worker thread
-              (when (and (fboundp 'thread-yield)
-                         (fboundp 'current-thread)
-                         (fboundp 'main-thread)
-                         (not (eq (current-thread) (main-thread))))
-                (thread-yield))
-              (let* ((task-id (nth 5 task-info))
-                     (raw-marker (car task-info))
-                     (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id))
-                     (task-project (nth 2 task-info)))
+          ;; 1. Process title markers and classify tasks
+          (dolist (task-info sorted-tasks-info)
+            (let* ((task-id (nth 5 task-info))
+                   (raw-marker (car task-info))
+                   (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id))
+                   (m-res (org-auto-scheduler--process-title-markers marker)))
+              (when m-res
+                (puthash task-id m-res marker-data)
+                (when (plist-get m-res :reschedule-all)
+                  (setq has-r-all t))
+                (when (plist-get m-res :title)
+                  (setf (nth 6 task-info) (plist-get m-res :title))))
+              ;; Check if scheduled for today with a time
+              (let ((today-times (when preserve-today
+                                   (org-auto-scheduler--task-scheduled-today-p marker today-str))))
+                (if today-times
+                    (let* ((start-t (car today-times))
+                           (end-t (cdr today-times))
+                           (is-pin (org-auto-scheduler-task-pinned-p marker task-id))
+                           (is-clocked (org-auto-scheduler--task-clocked-p marker))
+                           (is-resched (or (and m-res (plist-get m-res :reschedule)) nil))
+                           (is-overdue (time-less-p start-t now))
+                           (is-lapsed-or-current (or is-clocked is-overdue)))
+                      (push (list :task-info task-info
+                                  :marker marker
+                                  :task-id task-id
+                                  :start-time start-t
+                                  :end-time end-t
+                                  :pinned is-pin
+                                  :clocked is-clocked
+                                  :reschedule is-resched
+                                  :overdue is-overdue
+                                  :lapsed-or-current is-lapsed-or-current)
+                            today-scheduled))
+                  (push task-info tasks-to-schedule)))))
+          (setq tasks-to-schedule (nreverse tasks-to-schedule))
 
-                (when (or (not (equal task-project previous-project))
-                          (null task-project))
-                  (setq current-time (org-auto-scheduler-get-start-time))
-                  (setq previous-project task-project)
-                  (org-auto-scheduler--log-debug "Project changed or is null. Resetting current time to %s"
-                                                 (format-time-string "%Y-%m-%d %H:%M" current-time)))
+          ;; 2. Sort today's scheduled tasks chronologically by start-time
+          (setq today-scheduled
+                (sort today-scheduled
+                      (lambda (a b)
+                        (time-less-p (plist-get a :start-time)
+                                     (plist-get b :start-time)))))
 
-                (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
-                  (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
-                  (unless org-auto-scheduler--preview-mode
-                    (let ((scheduled-start
-                           (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
-                             (nth 1 (car org-auto-scheduler-completed-tasks)))))
-                      (org-auto-scheduler-add-to-report task-info scheduled-start))))
-                (setq tasks-scheduled (1+ tasks-scheduled))
-                (when reporter
-                  (progress-reporter-update reporter tasks-scheduled))))
-            (when reporter
-              (progress-reporter-done reporter)))
+          ;; 3. Determine trigger mode:
+          ;;    - has-r-trigger: user added -r- or -r-all- (cascade from trigger point in previous order)
+          ;;    - has-unscheduled: user added new unscheduled AUTOSCH tasks (displace upcoming unpinned tasks automatically)
+          ;;    - neither: preserve all today-scheduled tasks
+          (let* ((has-r-trigger
+                  (cond
+                   (has-r-all
+                    (or (cl-find-if (lambda (e) (plist-get e :lapsed-or-current)) today-scheduled)
+                        (cl-find-if (lambda (e)
+                                      (let ((m (gethash (plist-get e :task-id) marker-data)))
+                                        (and m (plist-get m :reschedule-all))))
+                                    today-scheduled)))
+                   (t
+                    (cl-find-if (lambda (e) (plist-get e :reschedule)) today-scheduled))))
+                 (has-unscheduled
+                  (and preserve-today
+                       (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule)))
+                 (preserved-entries '())
+                 (final-schedule-list '()))
+
+            (cond
+             ;; -------------------------------------------------------------
+             ;; CASE 1: -r- or -r-all- trigger present
+             ;; Cascade rescheduling from trigger entry in previously scheduled order!
+             ;; -------------------------------------------------------------
+             (has-r-trigger
+              (let ((cascade-entries '())
+                    (found-trigger nil)
+                    (unpinned-cascade '()))
+                (dolist (e today-scheduled)
+                  (if found-trigger
+                      (push e cascade-entries)
+                    (if (equal (plist-get e :task-id) (plist-get has-r-trigger :task-id))
+                        (progn
+                          (setq found-trigger t)
+                          (push e cascade-entries))
+                      (push e preserved-entries))))
+                (setq preserved-entries (nreverse preserved-entries))
+                (setq cascade-entries (nreverse cascade-entries))
+
+                ;; Separate pinned tasks in cascade from unpinned cascade tasks
+                (dolist (e cascade-entries)
+                  (if (plist-get e :pinned)
+                      ;; Pinned task: schedule single task at its pinned time
+                      (let* ((t-info (plist-get e :task-info))
+                             (m (plist-get e :marker))
+                             (tid (plist-get e :task-id))
+                             (td (nth 14 t-info)))
+                        (org-auto-scheduler-schedule-single-task m current-time td)
+                        (unless org-auto-scheduler--preview-mode
+                          (let ((scheduled-start (nth 1 (car org-auto-scheduler-completed-tasks))))
+                            (org-auto-scheduler-add-to-report t-info scheduled-start)))
+                        (setq tasks-scheduled (1+ tasks-scheduled)))
+                    ;; Unpinned: keep in unpinned-cascade in previous scheduled order!
+                    (push (plist-get e :task-info) unpinned-cascade)))
+                (setq unpinned-cascade (nreverse unpinned-cascade))
+                (setq final-schedule-list (append unpinned-cascade tasks-to-schedule))))
+
+             ;; -------------------------------------------------------------
+             ;; CASE 2: No -r- trigger, BUT newly added unscheduled tasks exist!
+             ;; Preserved: lapsed-or-current tasks and pinned tasks.
+             ;; Upcoming unpinned tasks + unscheduled tasks are scheduled together
+             ;; according to priority/score (sorted-tasks-info order).
+             ;; -------------------------------------------------------------
+             (has-unscheduled
+              (let ((reschedule-task-ids (make-hash-table :test 'equal)))
+                ;; Identify preserved tasks vs upcoming unpinned tasks
+                (dolist (e today-scheduled)
+                  (if (or (plist-get e :lapsed-or-current)
+                          (plist-get e :pinned))
+                      (push e preserved-entries)
+                    ;; Upcoming unpinned task: mark as eligible for rescheduling
+                    (puthash (plist-get e :task-id) t reschedule-task-ids)))
+                (setq preserved-entries (nreverse preserved-entries))
+
+                ;; Also mark all tasks in tasks-to-schedule as eligible
+                (dolist (ti tasks-to-schedule)
+                  (puthash (nth 5 ti) t reschedule-task-ids))
+
+                ;; Build final-schedule-list from sorted-tasks-info to preserve priority/score order!
+                (dolist (ti sorted-tasks-info)
+                  (when (gethash (nth 5 ti) reschedule-task-ids)
+                    (push ti final-schedule-list)))
+                (setq final-schedule-list (nreverse final-schedule-list))))
+
+             ;; -------------------------------------------------------------
+             ;; CASE 3: Neither -r- trigger nor unscheduled tasks exist.
+             ;; Preserve all today-scheduled tasks!
+             ;; -------------------------------------------------------------
+             (t
+              (setq preserved-entries today-scheduled)
+              (setq final-schedule-list tasks-to-schedule)))
+
+            ;; 4. Register preserved tasks into completed-tasks so they occupy their slots
+            (dolist (e preserved-entries)
+              (let* ((t-info (plist-get e :task-info))
+                     (tid (plist-get e :task-id))
+                     (m (plist-get e :marker))
+                     (st (plist-get e :start-time))
+                     (et (plist-get e :end-time))
+                     (hd (nth 6 t-info))
+                     (tags (nth 7 t-info))
+                     (td (nth 14 t-info))
+                     (sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
+                (push (list tid st et (or tags '("AUTOSCH")) t hd sched-str m td)
+                      org-auto-scheduler-completed-tasks)
+                (unless org-auto-scheduler--preview-mode
+                  (org-auto-scheduler-add-to-report t-info st))
+                (setq tasks-scheduled (1+ tasks-scheduled))))
+
+            ;; 5. Schedule tasks in final-schedule-list
+            (let ((reporter (unless org-auto-scheduler-silent-mode
+                              (make-progress-reporter "Scheduling tasks..." 0 total-tasks))))
+              (dolist (task-info final-schedule-list)
+                ;; Cooperative yield if running in a background worker thread
+                (when (and (fboundp 'thread-yield)
+                           (fboundp 'current-thread)
+                           (fboundp 'main-thread)
+                           (not (eq (current-thread) (main-thread))))
+                  (thread-yield))
+                (let* ((task-id (nth 5 task-info))
+                       (raw-marker (car task-info))
+                       (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id)))
+                  (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
+                    (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
+                    (unless org-auto-scheduler--preview-mode
+                      (let ((scheduled-start
+                             (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
+                               (nth 1 (car org-auto-scheduler-completed-tasks)))))
+                        (org-auto-scheduler-add-to-report task-info scheduled-start))))
+                  (setq tasks-scheduled (1+ tasks-scheduled))
+                  (when reporter
+                    (progress-reporter-update reporter tasks-scheduled))))
+              (when reporter
+                (progress-reporter-done reporter))))
 
           ;; Normalize completed-tasks to chronological order (built via push)
           (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
@@ -2569,9 +2845,9 @@ heading when the current heading does not yet have a planning line."
 If only HH:MM is specified, uses the date from MARKER, review override, or today."
   (let* ((clean (string-trim (if (stringp raw-time) raw-time "") "[<>\s	
 ]+"))
-         (has-date (string-match "\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)" clean))
+         (has-date (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" clean))
          (date-part (when has-date (match-string 1 clean)))
-         (has-time (string-match "\([0-9]\{1,2\}:[0-9]\{2\}\)" clean))
+         (has-time (string-match "\\([0-9]\\{1,2\\}:[0-9]\\{2\\}\\)" clean))
          (time-part (when has-time (match-string 1 clean))))
     (cond
      ((null raw-time) nil)
@@ -2589,7 +2865,7 @@ If only HH:MM is specified, uses the date from MARKER, review override, or today
                                          (and over (plist-get over :pinned-date)))))
                         (or t-date
                             (let ((sched (org-entry-get nil "SCHEDULED")))
-                              (when (and sched (string-match "\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)" sched))
+                              (when (and sched (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched))
                                 (match-string 1 sched)))))))
                   (format-time-string "%Y-%m-%d"))))
         (org-auto-scheduler-parse-time-string (concat base-date " " time-part))))
