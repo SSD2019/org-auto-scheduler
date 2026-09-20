@@ -1,0 +1,53 @@
+#+TITLE: Org Auto Scheduler Demo Tasks
+#+CATEGORY: Demo
+
+* Platform Engineering :PROJECT:
+*** TODO [#A] Architecture RFC: Real-time Event Streaming :AUTOSCH:SPLITTABLE:
+:PROPERTIES:
+:Effort: 3:30
+:MIN_CHUNK: 60
+:ID:       1f8ac710-3ce1-4af4-b02a-1e6958d0c708
+:END:
+*** TODO [#B] Core API Gateway Routing Implementation :AUTOSCH:
+:PROPERTIES:
+:Effort: 1:30
+:BLOCKER: RFC101
+:ID: RFC101
+:END:
+*** TODO [#B] End-to-End Test Suite for Streaming Pipelines :AUTOSCH:
+:PROPERTIES:
+:Effort: 1:00
+:BLOCKER: RFC101
+:ID:       d8cfde78-6c9b-4726-9e07-349cbb5f50f4
+:END:
+
+* Developer Experience :PROJECT:
+*** TODO [#A] Fast CI/CD Build Pipeline Migration :AUTOSCH:
+:PROPERTIES:
+:Effort: 1:15
+:ID:       cb29c001-1a2f-45b1-bab4-f2e3732747b0
+:END:
+*** TODO [#C] Update Developer Onboarding & API Docs :AUTOSCH:
+:PROPERTIES:
+:Effort: 0:45
+:ID:       60fb786b-153e-48a0-b04e-b4632f12a1b1
+:END:
+
+* Operations & Security :PROJECT:
+*** TODO [#A] Security Audit & Incident Post-Mortem Review :AUTOSCH:PINNABLE:
+:PROPERTIES:
+:Effort: 0:45
+:PINNED_TIME: 14:00
+:ID:       e2d67d16-5fd6-44ef-af4f-ac59902249b5
+:END:
+*** TODO [#B] Kubernetes Cluster Node Pool Scaling :AUTOSCH:
+:PROPERTIES:
+:Effort: 1:00
+:ID:       43749b27-4f67-4d0f-936a-689e960dbca0
+:END:
+
+* Fixed Calendar Events
+** Team Daily Standup & Sprint Sync
+<2026-09-20 Sun 10:00-10:30>
+** Cross-Team Tech Architecture Review
+<2026-09-20 Sun 15:30-16:30>

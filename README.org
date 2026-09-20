@@ -8,6 +8,9 @@ Org Auto Scheduler scores tasks by priority, deadline, effort, state, and catego
 Tag it =AUTOSCH=, press a key, and your day is planned.
 #+end_quote
 
+#+CAPTION: Interactive Side-by-Side Timegrid & Review Table View
+[[file:screenshots/timegrid-review-split.png]]
+
 ** Table of Contents
 
 - [[#features-at-a-glance][Features at a Glance]]
@@ -20,6 +23,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#how-sorting-works][How Sorting Works]]
 - [[#review-and-apply-buffer][Review & Apply Buffer]]
   - [[#column-table-view][Column Table View]]
+  - [[#visual-timeline--org-timegrid-integration][Visual Timeline & Org Time Grid Integration]]
   - [[#fixed-agenda-events-and-non-blocking-tasks][Fixed Agenda Events & Non-Blocking Tasks]]
   - [[#persistent-review-decisions-and-state-file][Persistent Review Decisions & State File]]
   - [[#smart-restore--merge][Smart Restore & Merge]]
@@ -292,6 +296,9 @@ via =org-timegrid= (=T=), and save decisions across sessions.
 *** Column Table View
 <<column-table-view>>
 
+#+CAPTION: Org Auto Scheduler Standalone Review Buffer (Table View)
+[[file:screenshots/review-buffer-table.png]]
+
 A structured list grouped by day with day header statistics (e.g. =─── Today (Monday, 2026-09-21) [3h 45m planned] ───=):
 
 | Column      | Description                                                                                          |
@@ -304,6 +311,18 @@ A structured list grouped by day with day header statistics (e.g. =─── Tod
 | =Project=   | Human-readable project name or tag badge for calendar events.                                       |
 | =Score=     | Composite scheduling score (=—= for fixed calendar events).                                          |
 | =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking fixed event).          |
+
+*** Visual Timeline & Org Time Grid Integration
+<<visual-timeline--org-timegrid-integration>>
+
+#+CAPTION: Interactive Side-by-Side Timegrid Layout (visual calendar on left, review table on right with live bi-directional sync)
+[[file:screenshots/timegrid-review-split.png]]
+
+Pressing =T= inside the review buffer toggles the visual timeline integration powered by =org-timegrid=.
+- *Bi-directional Sync:* Changes made in either view (toggling tasks, reordering, pinning) immediately refresh both the calendar tiles and the review table.
+- *Dual Layouts (=i=):* Toggle between a 3-day side-by-side split (calendar on left, review table on right) and a 7-day horizontal split (calendar on top, review table below).
+- *Keyboard Drag & Reorder:* Move tasks earlier or later with =K= and =J=, jump across days with =>= and =<=, or drag before another task with =O=.
+- *Pinned & Splittable Blocks:* Pinned tasks and multi-day placeholder chunks are rendered directly onto the calendar grid alongside your fixed agenda meetings.
 
 *** Fixed Agenda Events and Non-Blocking Tasks
 <<fixed-agenda-events-and-non-blocking-tasks>>
