@@ -6,6 +6,8 @@
 (load-file "org-auto-scheduler.el")
 
 (defvar test-failures 0)
+(setq test-orig-agenda-files (copy-sequence org-agenda-files))
+(setq test-orig-agenda-files (copy-sequence org-agenda-files))
 
 (defun assert-equal (actual expected desc)
   (if (equal actual expected)
@@ -271,6 +273,7 @@ SCHEDULED: <%s %s 15:00-16:00>\n\
 :END:\n"
                     today-str today-dow
                     today-str today-dow
+                    today-str today-dow today-str today-dow
                     today-str today-dow
                     today-str today-dow
                     today-str today-dow)))
@@ -364,9 +367,12 @@ SCHEDULED: <%s %s 15:00-16:00>\n\
   ;; Cleanup temp files
   (delete-directory temp-dir t))
 
+
 ;; ============================================================================
 ;; FINAL REPORT
 ;; ============================================================================
+(setq org-agenda-files test-orig-agenda-files)
+
 (message "\n==============================================")
 (if (= test-failures 0)
     (message "ALL INTEGRATION & UNIT TESTS PASSED!")
@@ -381,8 +387,13 @@ SCHEDULED: <%s %s 15:00-16:00>\n\
 
 (let* ((temp-dir (make-temp-file "org-test-" t))
        (test-org-file (expand-file-name "test-tasks-all.org" temp-dir))
+       (now (current-time))
        (today-str (format-time-string "%Y-%m-%d"))
        (today-dow (format-time-string "%a"))
+       (o1-start (format-time-string "%H:%M" (time-subtract now (seconds-to-time 7200))))
+       (o1-end (format-time-string "%H:%M" (time-subtract now (seconds-to-time 3600))))
+       (o2-start (format-time-string "%H:%M" (time-subtract now (seconds-to-time 3500))))
+       (o2-end (format-time-string "%H:%M" (time-subtract now (seconds-to-time 1800))))
        (org-auto-scheduler-sync-caldav nil)
        (org-auto-scheduler-silent-mode t)
        (org-auto-scheduler-preserve-today-scheduled t)
@@ -393,13 +404,13 @@ SCHEDULED: <%s %s 15:00-16:00>\n\
   (with-temp-file test-org-file
     (insert (format "* Tasks :PROJECT:\n\
 *** TODO Overdue 1 :AUTOSCH:\n\
-SCHEDULED: <%s %s 08:00-09:00>\n\
+SCHEDULED: <%s %s %s-%s>\n\
 :PROPERTIES:\n\
 :Effort: 1:00\n\
 :ID: all-id-1\n\
 :END:\n\
 *** TODO Overdue 2 :AUTOSCH:\n\
-SCHEDULED: <%s %s 09:00-10:00>\n\
+SCHEDULED: <%s %s %s-%s>\n\
 :PROPERTIES:\n\
 :Effort: 1:00\n\
 :ID: all-id-2\n\
@@ -416,8 +427,8 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
 :Effort: 0:30\n\
 :ID: all-id-4\n\
 :END:\n"
-                    today-str today-dow
-                    today-str today-dow
+                    today-str today-dow o1-start o1-end
+                    today-str today-dow o2-start o2-end
                     today-str today-dow
                     today-str today-dow)))
 
@@ -445,11 +456,11 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
                       (re-search-forward ":ID:[ \t]*all-id-4")
                       (org-get-heading t t t t))))
 
-    ;; Overdue 1 must have been rescheduled away from 08:00
-    (assert-true (not (string-match-p "08:00-09:00" o1-sched))
+    ;; Overdue 1 must have been rescheduled away from o1-start
+    (assert-true (not (string-match-p o1-start o1-sched))
                  (format "Test 5: Overdue 1 rescheduled (actual: %s)" o1-sched))
-    ;; Overdue 2 must have been rescheduled away from 09:00
-    (assert-true (not (string-match-p "09:00-10:00" o2-sched))
+    ;; Overdue 2 must have been rescheduled away from o2-start
+    (assert-true (not (string-match-p o2-start o2-sched))
                  (format "Test 5: Overdue 2 rescheduled (actual: %s)" o2-sched))
     ;; Trigger task 4 heading cleaned
     (assert-equal t4-heading "Trigger Task 4" "Test 5: Trigger task 4 heading cleaned"))
@@ -457,19 +468,15 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
   (delete-directory temp-dir t))
 
 ;; ============================================================================
-;; FINAL REPORT
-;; ============================================================================
-
-
-;; ============================================================================
-;; TEST 6: Newly Added (Unscheduled) Task Displaces Upcoming Unpinned Tasks
-;; ============================================================================
 (message "\n--- TEST 6: Newly Added Unscheduled Task Displaces Upcoming Unpinned Tasks ---")
 
 (let* ((temp-dir (make-temp-file "org-test-" t))
        (test-org-file (expand-file-name "test-new-task.org" temp-dir))
+       (now (current-time))
        (today-str (format-time-string "%Y-%m-%d"))
        (today-dow (format-time-string "%a"))
+       (lapsed-start (format-time-string "%H:%M" (time-subtract now (seconds-to-time 3600))))
+       (lapsed-end (format-time-string "%H:%M" (time-subtract now (seconds-to-time 1800))))
        (org-auto-scheduler-sync-caldav nil)
        (org-auto-scheduler-silent-mode t)
        (org-auto-scheduler-preserve-today-scheduled t)
@@ -480,7 +487,7 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
   (with-temp-file test-org-file
     (insert (format "* Tasks :PROJECT:\n\
 *** TODO Lapsed Task 1 :AUTOSCH:\n\
-SCHEDULED: <%s %s 08:00-09:00>\n\
+SCHEDULED: <%s %s %s-%s>\n\
 :PROPERTIES:\n\
 :Effort: 1:00\n\
 :ID: newtest-id-1\n\
@@ -510,7 +517,7 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
 :Effort: 1:00\n\
 :ID: newtest-id-new\n\
 :END:\n"
-                    today-str today-dow
+                    today-str today-dow lapsed-start lapsed-end
                     today-str today-dow
                     today-str today-dow
                     today-str today-dow)))
@@ -540,33 +547,22 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
                      (re-search-forward ":ID:[ \t]*newtest-id-new")
                      (org-entry-get nil "SCHEDULED"))))
 
-    ;; 1. Lapsed Task 1 must remain at 08:00-09:00
-    (assert-equal t1-sched (format "<%s %s 08:00-09:00>" today-str today-dow)
-                  "Test 6: Lapsed Task 1 remains preserved at 08:00-09:00")
-
-    ;; 2. Pinned Task 3 must remain at 22:00-23:00
+    (assert-equal t1-sched (format "<%s %s %s-%s>" today-str today-dow lapsed-start lapsed-end)
+                  "Test 6: Lapsed Task 1 remains preserved at past time")
     (assert-true (and t3-sched (string-match-p "22:00" t3-sched))
                  (format "Test 6: Pinned Task 3 remains pinned at 22:00 (actual: %s)" t3-sched))
-
-    ;; 3. Urgent New Task must be scheduled
     (assert-true (not (null new-sched))
                  "Test 6: Urgent New Task is scheduled")
-
-    ;; 4. Urgent New Task (priority A) scheduled before Upcoming LowPri 2 (priority C)
     (let ((new-time (org-time-string-to-time new-sched))
           (t2-time (org-time-string-to-time t2-sched)))
       (assert-true (time-less-p new-time t2-time)
                    (format "Test 6: Urgent New Task (%s) takes the place before LowPri 2 (%s)"
                            new-sched t2-sched)))
-
-    ;; 5. Upcoming LowPri 2 was moved away from 21:00-22:00
     (assert-true (not (equal t2-sched (format "<%s %s 21:00-22:00>" today-str today-dow)))
                  (format "Test 6: Upcoming LowPri 2 was moved by New Task (actual: %s)" t2-sched)))
 
   (delete-directory temp-dir t))
 
-;; ============================================================================
-;; TEST 7: When NO unscheduled task exists, upcoming unpinned tasks are PRESERVED
 ;; ============================================================================
 (message "\n--- TEST 7: No unscheduled task -> Upcoming unpinned tasks preserved ---")
 
@@ -773,9 +769,120 @@ SCHEDULED: <%s %s 10:00-11:00>
 
   (delete-directory temp-dir t))
 
+
+;; ============================================================================
+;; TEST 9: Consecutive Background Runs on SPLITTABLE Tasks (No Placeholder Churn)
+;; ============================================================================
+(message "\n--- TEST 9: Consecutive Background Runs on SPLITTABLE Tasks ---")
+
+(let* ((temp-dir (make-temp-file "org-split-test-" t))
+       (test-org-file (expand-file-name "test-split.org" temp-dir))
+       (test-log-file (expand-file-name "test-split-log.org" temp-dir))
+       (today-str (format-time-string "%Y-%m-%d"))
+       (today-dow (format-time-string "%a"))
+       (org-auto-scheduler-change-log-file test-log-file)
+       (org-auto-scheduler-change-log-enabled t)
+       (org-auto-scheduler-change-log-background-only nil)
+       (org-auto-scheduler-change-log-record-empty nil)
+       (org-auto-scheduler-silent-mode t)
+       (org-auto-scheduler-sync-caldav nil)
+       (org-auto-scheduler-preserve-today-scheduled t)
+       (org-auto-scheduler-start-time "09:00")
+       (org-auto-scheduler-end-time "12:00")
+       (org-auto-scheduler-split-min-chunk 30)
+       (org-auto-scheduler-task-gap 0))
+
+  (org-auto-scheduler-clear-change-log t)
+
+  ;; Create a splittable task with 5h effort in a 3h workday (splits 3h today, 2h tomorrow)
+  (with-temp-file test-org-file
+    (insert (format "* Tasks :PROJECT:\n\
+*** TODO Big Split Task :SPLITTABLE:AUTOSCH:\n\
+:PROPERTIES:\n\
+:Effort: 5:00\n\
+:ID: split-parent-id\n\
+:SPLITTABLE: t\n\
+:END:\n")))
+
+  (setq org-agenda-files (list test-org-file))
+
+  ;; 9.1 First run: initial scheduling
+  (let ((org-auto-scheduler--current-run-type 'background-sync)
+        (org-auto-scheduler--run-start-time (current-time)))
+    (org-auto-scheduler-schedule-tasks))
+
+  ;; Save the buffer so it is clean on disk
+  (with-current-buffer (find-file-noselect test-org-file)
+    (save-buffer))
+
+  ;; Verify placeholder was created
+  (let* ((buf (find-file-noselect test-org-file))
+         (ph-info (with-current-buffer buf
+                    (save-excursion
+                      (goto-char (point-min))
+                      (when (re-search-forward ":AUTOSCH_PLACEHOLDER:" nil t)
+                        (org-back-to-heading t)
+                        (list :id (org-id-get)
+                              :sched (org-entry-get nil "SCHEDULED")
+                              :effort (org-entry-get nil "Effort")
+                              :headline (org-get-heading t t t t)))))))
+    (assert-true ph-info "Test 9.1: Placeholder subtask was created on first run")
+    (assert-true (plist-get ph-info :id) "Test 9.1: Placeholder has an Org ID")
+    (assert-true (string-match-p "(Remaining)" (plist-get ph-info :headline))
+                 "Test 9.1: Placeholder headline contains (Remaining)")
+
+    (let ((ph-id-run1 (plist-get ph-info :id)))
+
+      ;; 9.2 Second run: background run 5 minutes later (no changes to task)
+      (with-current-buffer buf
+        (set-buffer-modified-p nil))
+      (setq org-auto-scheduler--last-run-changes nil)
+
+      (let ((org-auto-scheduler--current-run-type 'background-sync)
+            (org-auto-scheduler--run-start-time (current-time)))
+        (org-auto-scheduler-schedule-tasks))
+
+      ;; Assertions for second run:
+      ;; a) No tasks changed!
+      (assert-equal (length org-auto-scheduler--last-run-changes) 0
+                    "Test 9.2: Second background run has 0 changed tasks")
+      ;; b) No placeholders cleaned!
+      (assert-equal org-auto-scheduler--session-cleaned-placeholders 0
+                    "Test 9.2: Second background run cleaned 0 placeholders")
+      ;; c) Placeholder ID was preserved!
+      (let ((ph-id-run2 (with-current-buffer buf
+                          (save-excursion
+                            (goto-char (point-min))
+                            (re-search-forward ":AUTOSCH_PLACEHOLDER:" nil t)
+                            (org-back-to-heading t)
+                            (org-id-get)))))
+        (assert-equal ph-id-run1 ph-id-run2
+                      "Test 9.2: Placeholder Org ID preserved across runs without churn"))
+      ;; d) Buffer was not modified!
+      (assert-true (not (buffer-modified-p buf))
+                   "Test 9.2: Agenda buffer was not modified during 0-change run")
+
+      ;; 9.3 Third run: another consecutive run (still 0 changes)
+      (let ((org-auto-scheduler--current-run-type 'background-async)
+            (org-auto-scheduler--run-start-time (current-time)))
+        (org-auto-scheduler-schedule-tasks))
+      (assert-equal (length org-auto-scheduler--last-run-changes) 0
+                    "Test 9.3: Third background run still has 0 changed tasks")
+      (assert-equal org-auto-scheduler--session-cleaned-placeholders 0
+                    "Test 9.3: Third background run cleaned 0 placeholders")
+
+      ;; 9.4 Force replan (C-u): explicitly replan all
+      (org-auto-scheduler-schedule-tasks t)
+      (assert-true (> org-auto-scheduler--session-cleaned-placeholders 0)
+                   "Test 9.4: Force replan (C-u) cleans placeholders for fresh replan")))
+
+  (delete-directory temp-dir t))
+
+(when (boundp 'test-orig-agenda-files) (setq org-agenda-files test-orig-agenda-files))
+
 (message "\n==============================================")
 (if (= test-failures 0)
-    (message "ALL 8 TEST SUITES PASSED PERFECTLY!")
+    (message "ALL 9 TEST SUITES PASSED PERFECTLY!")
   (message "FAILURES DETECTED: %d" test-failures))
 (message "==============================================")
 

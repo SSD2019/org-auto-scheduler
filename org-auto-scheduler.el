@@ -415,6 +415,9 @@ Older entries beyond this limit are pruned to prevent unbounded growth."
 (defvar org-auto-scheduler--last-run-changes nil
   "List of detected changes from the most recent scheduler run.")
 
+(defvar org-auto-scheduler--session-cleaned-placeholders 0
+  "Tracks number of placeholders cleaned during current scheduler run.")
+
 
 (defcustom org-auto-scheduler-start-buffer-minutes 5
   "Buffer minutes added to current time when starting task scheduling.
@@ -1630,9 +1633,13 @@ Hash table with date strings as keys and lists of items as values.")
    (lambda ()
      (let* ((task-name (org-get-heading t t t t))
             (tags (org-get-tags))
+            (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
             (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
        (unless (or (member "AUTOSCH" tags)
                    (member "ARCHIVE" tags)
+                   is-placeholder
                    has-repeater)
          (let ((task-id nil)
                (task-end-time nil))
@@ -1665,10 +1672,14 @@ Hash table with date strings as keys and lists of items as values.")
                    (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
                    (task-id (org-id-get))
                    (tags (org-get-tags))
+                   (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                       (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                       (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-              ;; Exclude AUTOSCH tags, ARCHIVE tags, and repeater tasks (repeaters are handled separately)
+              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, and repeater tasks (repeaters are handled separately)
               (when (and scheduled-time
                          (not (member "AUTOSCH" tags))
+                         (not is-placeholder)
                          (not (member "ARCHIVE" tags))
                          (not has-repeater))
                 (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
@@ -1687,10 +1698,14 @@ Hash table with date strings as keys and lists of items as values.")
                    (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
                    (task-id (org-id-get))
                    (tags (org-get-tags))
+                   (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                       (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                       (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-              ;; Exclude AUTOSCH tags, ARCHIVE tags, and repeater tasks
+              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, and repeater tasks
               (when (and scheduled-time
                          (not (member "AUTOSCH" tags))
+                         (not is-placeholder)
                          (not (member "ARCHIVE" tags))
                          (not has-repeater))
                 (let* ((scheduled-date (format-time-string "%Y-%m-%d" scheduled-time))
@@ -2603,7 +2618,8 @@ When FORCE-REPLAN is non-nil (or with prefix arg `C-u`), re-plan all tasks from
 scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
   (interactive "P")
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
-  (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders)))
+  (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders force-replan)))
+    (setq org-auto-scheduler--session-cleaned-placeholders (or cleaned-placeholders 0))
     (org-auto-scheduler-load-review-decisions)
     (when (and org-auto-scheduler-sync-caldav
                (not org-auto-scheduler--preview-mode)
@@ -2851,7 +2867,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
              :end-time (current-time)
              :tasks-evaluated total-tasks
              :changes org-auto-scheduler--last-run-changes
-             :cleaned-placeholders (or cleaned-placeholders 0)))
+             :cleaned-placeholders (or org-auto-scheduler--session-cleaned-placeholders 0)))
           (unless org-auto-scheduler--preview-mode
             (org-auto-scheduler-display-report))
           (org-auto-scheduler--log-info "Scheduled %d tasks (changes: %d)"
@@ -2887,7 +2903,8 @@ heading when the current heading does not yet have a planning line."
               (is-autosch (member "AUTOSCH" tags))
               (is-valid-state (member state valid-states))
               (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
-                                  (org-entry-get nil "AUTOSCH_PLACEHOLDER")))
+                                  (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                  (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
               (headline (org-get-heading t t t t))
               (not-before (org-entry-get nil "NOT_BEFORE"))
               (recurring (org-entry-get nil "RECURRING"))
@@ -3353,15 +3370,85 @@ Checks:
     items))
 
 
+(defun org-auto-scheduler--find-child-placeholders (parent-marker origin-id)
+  "Find existing placeholder child subtasks under PARENT-MARKER for ORIGIN-ID.
+Returns a list of plists with :marker, :part-num, :org-id, :headline, :scheduled, :effort."
+  (let ((placeholders '()))
+    (when (and parent-marker (markerp parent-marker) (marker-buffer parent-marker))
+      (org-with-point-at parent-marker
+        (let ((parent-level (org-outline-level)))
+          (save-excursion
+            (org-back-to-heading t)
+            (while (and (outline-next-heading)
+                        (> (org-outline-level) parent-level))
+              (let* ((tags (org-get-tags))
+                     (is-ph-tag (member org-auto-scheduler-placeholder-tag tags))
+                     (is-ph-prop (org-entry-get nil "AUTOSCH_PLACEHOLDER"))
+                     (ph-origin (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
+                (when (and (or is-ph-tag is-ph-prop)
+                           (or (null ph-origin) (equal ph-origin origin-id)))
+                  (let* ((hd (org-get-heading t t t t))
+                         (pn-prop (org-entry-get nil "AUTOSCH_PART_NUM"))
+                         (part-num (or (and pn-prop (string-to-number pn-prop))
+                                       (when (string-match "Part \\([0-9]+\\)" hd)
+                                         (string-to-number (match-string 1 hd)))
+                                       1))
+                         (sched (org-entry-get nil "SCHEDULED"))
+                         (effort (org-entry-get nil "Effort"))
+                         (oid (org-id-get))
+                         (m (point-marker)))
+                    (set-marker-insertion-type m t)
+                    (push (list :marker m
+                                :part-num part-num
+                                :org-id oid
+                                :headline hd
+                                :scheduled sched
+                                :effort effort)
+                          placeholders)))))))))
+    (nreverse (sort placeholders (lambda (a b)
+                                   (< (plist-get a :part-num)
+                                      (plist-get b :part-num)))))))
+
+(defun org-auto-scheduler--cleanup-task-placeholders (parent-marker origin-id)
+  "Remove all existing placeholder child subtasks under PARENT-MARKER for ORIGIN-ID.
+Preserves any clocks back to PARENT-MARKER."
+  (let ((phs (org-auto-scheduler--find-child-placeholders parent-marker origin-id)))
+    (dolist (ph phs)
+      (let ((m (plist-get ph :marker)))
+        (when (and m (markerp m) (marker-buffer m))
+          (org-with-point-at m
+            (let ((clocks '()))
+              (save-excursion
+                (let ((end (save-excursion (or (outline-next-heading) (point-max)))))
+                  (when (re-search-forward ":LOGBOOK:" end t)
+                    (let ((lb-start (point))
+                          (lb-end (if (re-search-forward ":END:" end t)
+                                      (match-beginning 0)
+                                    end)))
+                      (goto-char lb-start)
+                      (while (re-search-forward "^[ \t]*CLOCK:.*$" lb-end t)
+                        (push (match-string 0) clocks))))))
+              (org-back-to-heading t)
+              (org-cut-subtree)
+              (setq org-auto-scheduler--session-cleaned-placeholders
+                    (1+ (or org-auto-scheduler--session-cleaned-placeholders 0)))
+              (when (and clocks parent-marker (markerp parent-marker) (marker-buffer parent-marker))
+                (org-with-point-at parent-marker
+                  (org-auto-scheduler--insert-clock-entries (nreverse clocks)))))))))))
+
 (defun org-auto-scheduler--place-split-placeholders (origin-id headline marker topo-depth rem-effort min-chunk tags time-block active-gap search-time start-date-str)
   "Place REM-EFFORT across subsequent slots/days as placeholder subtasks.
+Reuses and updates existing placeholder subtasks in-place when possible to avoid ID and file churn.
 Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
   (let* ((part-num 1)
          (current-date-str (format-time-string "%Y-%m-%d" search-time))
          (days-checked 0)
          (max-attempts (* 10 (max 1 org-auto-scheduler-max-days-to-check)))
          (attempts 0)
-         (last-today-end search-time))
+         (last-today-end search-time)
+         (existing-phs (unless org-auto-scheduler--preview-mode
+                         (org-auto-scheduler--find-child-placeholders marker origin-id)))
+         (handled-part-nums '()))
     (while (and (> rem-effort 0)
                 (< days-checked org-auto-scheduler-max-days-to-check)
                 (< attempts max-attempts))
@@ -3405,15 +3492,46 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
                      (ph-headline (if (and (= part-num 1) (<= (- rem-effort chunk-dur) 0))
                                       (format "%s %s" headline org-auto-scheduler-placeholder-suffix)
                                     (format "%s %s Part %d" headline org-auto-scheduler-placeholder-suffix part-num)))
-                     (ph-entry (list ph-id ph-slot ph-end (list org-auto-scheduler-placeholder-tag) t
-                                     ph-headline ph-sched-str marker topo-depth :placeholder
-                                     (list (format "Remaining: %dm" chunk-dur))
-                                     :origin-id origin-id :remaining-effort chunk-dur)))
+                     (existing-ph (cl-find-if (lambda (p) (= (plist-get p :part-num) part-num))
+                                              existing-phs))
+                     (actual-marker (when existing-ph (plist-get existing-ph :marker))))
+                (push part-num handled-part-nums)
                 (if org-auto-scheduler--preview-mode
-                    (push ph-entry org-auto-scheduler-completed-tasks)
-                  (org-auto-scheduler--create-placeholder-subtask
-                   marker ph-headline ph-slot ph-end chunk-dur origin-id)
-                  (push ph-entry org-auto-scheduler-completed-tasks))
+                    (push (list ph-id ph-slot ph-end (list org-auto-scheduler-placeholder-tag) t
+                                ph-headline ph-sched-str marker topo-depth :placeholder
+                                (list (format "Remaining: %dm" chunk-dur))
+                                :origin-id origin-id :remaining-effort chunk-dur)
+                          org-auto-scheduler-completed-tasks)
+                  ;; Live mode: reuse or create
+                  (if (and actual-marker (markerp actual-marker) (marker-buffer actual-marker))
+                      (let* ((curr-sched (plist-get existing-ph :scheduled))
+                             (curr-effort (plist-get existing-ph :effort))
+                             (needed-effort-str (format "%d:%02d" (/ chunk-dur 60) (% chunk-dur 60)))
+                             (sched-match (org-auto-scheduler--timestamps-equal-p curr-sched ph-sched-str))
+                             (effort-match (equal curr-effort needed-effort-str)))
+                        (unless (and sched-match effort-match)
+                          (org-with-point-at actual-marker
+                            (org-back-to-heading t)
+                            (unless (string= (org-get-heading t t t t) ph-headline)
+                              (org-edit-headline ph-headline))
+                            (org-auto-scheduler--set-scheduled ph-sched-str)
+                            (org-set-property "Effort" needed-effort-str)
+                            (org-set-property "AUTOSCH_PART_NUM" (number-to-string part-num))
+                            (org-set-property "AUTOSCH_PLACEHOLDER" "t")
+                            (org-set-property org-auto-scheduler-scheduled-property "t")))
+                        (push (list ph-id ph-slot ph-end (list org-auto-scheduler-placeholder-tag) t
+                                    ph-headline ph-sched-str actual-marker topo-depth :placeholder
+                                    (list (format "Remaining: %dm" chunk-dur))
+                                    :origin-id origin-id :remaining-effort chunk-dur)
+                              org-auto-scheduler-completed-tasks))
+                    ;; Create new placeholder
+                    (let ((new-marker (org-auto-scheduler--create-placeholder-subtask
+                                       marker ph-headline ph-slot ph-end chunk-dur origin-id part-num)))
+                      (push (list ph-id ph-slot ph-end (list org-auto-scheduler-placeholder-tag) t
+                                  ph-headline ph-sched-str (or new-marker marker) topo-depth :placeholder
+                                  (list (format "Remaining: %dm" chunk-dur))
+                                  :origin-id origin-id :remaining-effort chunk-dur)
+                            org-auto-scheduler-completed-tasks))))
                 (setq rem-effort (- rem-effort chunk-dur))
                 (setq part-num (1+ part-num))
                 (when (string= ph-start-day start-date-str)
@@ -3423,6 +3541,31 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
                   (unless (string= current-date-str new-date-str)
                     (setq days-checked (1+ days-checked))
                     (setq current-date-str new-date-str)))))))))
+    ;; Delete any unneeded leftover placeholders (e.g. effort reduced)
+    (unless org-auto-scheduler--preview-mode
+      (dolist (e-ph existing-phs)
+        (unless (member (plist-get e-ph :part-num) handled-part-nums)
+          (let ((m (plist-get e-ph :marker)))
+            (when (and m (markerp m) (marker-buffer m))
+              (org-with-point-at m
+                (let ((clocks '()))
+                  (save-excursion
+                    (let ((end (save-excursion (or (outline-next-heading) (point-max)))))
+                      (when (re-search-forward ":LOGBOOK:" end t)
+                        (let ((lb-start (point))
+                              (lb-end (if (re-search-forward ":END:" end t)
+                                          (match-beginning 0)
+                                        end)))
+                          (goto-char lb-start)
+                          (while (re-search-forward "^[ 	]*CLOCK:.*$" lb-end t)
+                            (push (match-string 0) clocks))))))
+                  (org-back-to-heading t)
+                  (org-cut-subtree)
+                  (setq org-auto-scheduler--session-cleaned-placeholders
+                        (1+ (or org-auto-scheduler--session-cleaned-placeholders 0)))
+                  (when (and clocks marker (markerp marker) (marker-buffer marker))
+                    (org-with-point-at marker
+                      (org-auto-scheduler--insert-clock-entries (nreverse clocks)))))))))))
     last-today-end))
 
 (defun org-auto-scheduler-get-min-chunk (marker)
@@ -3506,7 +3649,7 @@ attempt to locate the heading via `org-id-find'."
             marker)))
     marker))
 
-(defun org-auto-scheduler--create-placeholder-subtask (parent-marker headline start-time end-time effort parent-id)
+(defun org-auto-scheduler--create-placeholder-subtask (parent-marker headline start-time end-time effort parent-id &optional part-num)
   "Create a placeholder child subtask under PARENT-MARKER for remaining EFFORT.
 START-TIME and END-TIME define the scheduled window."
   (when (and parent-marker (markerp parent-marker) (marker-buffer parent-marker))
@@ -3537,18 +3680,27 @@ START-TIME and END-TIME define the scheduled window."
           (org-set-property org-auto-scheduler-scheduled-property "t")
           (org-set-property "AUTOSCH_ORIGIN_ID" origin-id)
           (org-set-property "AUTOSCH_PLACEHOLDER" "t")
+          (when part-num
+            (org-set-property "AUTOSCH_PART_NUM" (number-to-string part-num)))
           (org-set-property "Effort" (format "%d:%02d" (/ effort 60) (% effort 60)))
           (org-id-get-create)
           (let ((pm (point-marker)))
             (set-marker-insertion-type pm t)
             pm))))))
 
-(defun org-auto-scheduler-cleanup-placeholders ()
-  "Remove all temporary auto-scheduler placeholder tasks across agenda files.
+(defun org-auto-scheduler-cleanup-placeholders (&optional all-placeholders)
+  "Remove temporary auto-scheduler placeholder tasks across agenda files.
+When ALL-PLACEHOLDERS is non-nil (or called interactively), removes ALL placeholders.
+When ALL-PLACEHOLDERS is nil, only removes:
+1. Placeholders with clock entries (clocks transferred to parent task).
+2. Placeholders marked DONE (parent task marked DONE as well).
+3. Orphaned placeholders whose parent task no longer exists, is DONE, or is no longer splittable.
+Active valid placeholders of TODO splittable tasks are preserved to avoid churn.
+
 Safeguards:
-1. If the placeholder contains any clock entries, transfer them to the parent task.
-2. If the placeholder was marked DONE, mark the parent task DONE as well."
-  (interactive)
+1. If any cleaned placeholder contains clock entries, transfer them to the parent task.
+2. If any cleaned placeholder was marked DONE, mark the parent task DONE as well."
+  (interactive (list t))
   (let ((total-deleted 0)
         (total-clocks-preserved 0)
         (files (org-agenda-files t)))
@@ -3585,6 +3737,15 @@ Safeguards:
                                                 (save-excursion
                                                   (when (org-up-heading-safe)
                                                     (point-marker)))))
+                             (parent-exists (and parent-marker (markerp parent-marker) (marker-buffer parent-marker)))
+                             (parent-state (when parent-exists
+                                             (org-with-point-at parent-marker
+                                               (org-get-todo-state))))
+                             (parent-is-done (and parent-state (member parent-state org-done-keywords)))
+                             (parent-is-splittable (when parent-exists
+                                                     (org-with-point-at parent-marker
+                                                       (or (member org-auto-scheduler-splittable-tag (org-get-tags))
+                                                           (org-entry-get nil "SPLITTABLE")))))
                              (clocks '()))
                         ;; Extract CLOCK lines from LOGBOOK if any
                         (save-excursion
@@ -3595,26 +3756,34 @@ Safeguards:
                                                 (match-beginning 0)
                                               end)))
                                 (goto-char lb-start)
-                                (while (re-search-forward "^[ \t]*CLOCK:.*$" lb-end t)
+                                (while (re-search-forward "^[ 	]*CLOCK:.*$" lb-end t)
                                   (push (match-string 0) clocks))))))
-                        ;; Delete the placeholder subtree FIRST
-                        (org-back-to-heading t)
-                        (org-cut-subtree)
-                        (setq modified t)
-                        (setq total-deleted (1+ total-deleted))
-                        ;; Transfer clocks to parent if found
-                        (when (and clocks parent-marker (markerp parent-marker) (marker-buffer parent-marker))
-                          (let ((clock-lines (nreverse clocks)))
-                            (org-with-point-at parent-marker
-                              (org-auto-scheduler--insert-clock-entries clock-lines))
-                            (setq total-clocks-preserved (+ total-clocks-preserved (length clock-lines)))
-                            (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Preserved %d clock entries from placeholder to parent task"
-                                                          (length clock-lines))))
-                        ;; If placeholder was marked DONE, mark parent DONE
-                        (when (and is-done parent-marker (markerp parent-marker) (marker-buffer parent-marker))
-                          (org-with-point-at parent-marker
-                            (org-todo (or (car org-done-keywords) "DONE")))
-                          (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Marked parent task DONE based on completed placeholder"))))))
+                        (let ((should-delete
+                               (or all-placeholders
+                                   (> (length clocks) 0)
+                                   is-done
+                                   (not parent-exists)
+                                   parent-is-done
+                                   (not parent-is-splittable))))
+                          (when should-delete
+                            ;; Delete the placeholder subtree FIRST
+                            (org-back-to-heading t)
+                            (org-cut-subtree)
+                            (setq modified t)
+                            (setq total-deleted (1+ total-deleted))
+                            ;; Transfer clocks to parent if found
+                            (when (and clocks parent-exists)
+                              (let ((clock-lines (nreverse clocks)))
+                                (org-with-point-at parent-marker
+                                  (org-auto-scheduler--insert-clock-entries clock-lines))
+                                (setq total-clocks-preserved (+ total-clocks-preserved (length clock-lines)))
+                                (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Preserved %d clock entries from placeholder to parent task"
+                                                              (length clock-lines))))
+                            ;; If placeholder was marked DONE, mark parent DONE
+                            (when (and is-done parent-exists)
+                              (org-with-point-at parent-marker
+                                (org-todo (or (car org-done-keywords) "DONE")))
+                              (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Marked parent task DONE based on completed placeholder"))))))))
                 (when modified
                   (save-buffer))))))))
     (when (or (> total-deleted 0) (> total-clocks-preserved 0))
@@ -3794,6 +3963,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                 org-auto-scheduler-completed-tasks)
                         (org-auto-scheduler--set-scheduled schedule-string)
                         (org-set-property org-auto-scheduler-scheduled-property "t")
+                        (org-auto-scheduler--cleanup-task-placeholders marker origin-id)
                         (push (list eff-id eff-start end-time '("AUTOSCH") t headline schedule-string nil topo-depth)
                               org-auto-scheduler-completed-tasks))
                       (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled PINNABLE task '%s' from %s to %s (Effort: %dm)"
@@ -3906,6 +4076,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                       (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string marker topo-depth) org-auto-scheduler-completed-tasks)
                     (org-auto-scheduler--set-scheduled schedule-string)
                     (org-set-property org-auto-scheduler-scheduled-property "t")
+                    (org-auto-scheduler--cleanup-task-placeholders marker (or task-id origin-id))
                     (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string nil topo-depth) org-auto-scheduler-completed-tasks))
                   (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled task '%s' from %s to %s (Remaining effort: %d minutes, Gap: %dm)"
                                                 headline
@@ -4510,6 +4681,38 @@ TASKS-INFO is a list of task-info structures from `org-auto-scheduler-sort-tasks
                        :pinned pinned
                        :pinned-time pt)
                  snapshot)))
+    ;; Also capture existing placeholder tasks so their initial schedule is known
+    (dolist (file (org-agenda-files t))
+      (when (and file (file-exists-p file))
+        (with-current-buffer (find-file-noselect file)
+          (save-excursion
+            (goto-char (point-min))
+            (while (re-search-forward (concat ":" (regexp-quote org-auto-scheduler-placeholder-tag) ":\\|:AUTOSCH_PLACEHOLDER:") nil t)
+              (org-back-to-heading t)
+              (let* ((origin-id (org-entry-get nil "AUTOSCH_ORIGIN_ID"))
+                     (hd (org-get-heading t t t t))
+                     (pn-prop (org-entry-get nil "AUTOSCH_PART_NUM"))
+                     (part-num (or (and pn-prop (string-to-number pn-prop))
+                                   (when (string-match "Part \\([0-9]+\\)" hd)
+                                     (string-to-number (match-string 1 hd)))
+                                   1))
+                     (ph-id (and origin-id (format "%s-remaining-%d" origin-id part-num)))
+                     (sched (org-entry-get nil "SCHEDULED"))
+                     (tags (org-get-tags))
+                     (m (point-marker)))
+                (when ph-id
+                  (puthash ph-id
+                           (list :task-id ph-id
+                                 :marker m
+                                 :file file
+                                 :headline hd
+                                 :scheduled sched
+                                 :tags tags
+                                 :is-placeholder t
+                                 :origin-id origin-id
+                                 :part-num part-num)
+                           snapshot)))
+              (outline-next-heading))))))
     snapshot))
 
 (defun org-auto-scheduler--detect-task-changes (initial-snapshot completed-tasks marker-data)
@@ -6469,7 +6672,7 @@ Automatically recalculates dependent times based on visual layout before executi
                        (length violations) (car (reverse violations))))
         (user-error "Application aborted: please fix dependency ordering before applying"))))
   (org-auto-scheduler-create-report-buffer)
-  (org-auto-scheduler-cleanup-placeholders)
+  (org-auto-scheduler-cleanup-placeholders t)
   (let ((applied-count 0))
     (save-excursion
       (goto-char (point-min))
