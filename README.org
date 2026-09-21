@@ -34,6 +34,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
   - [[#safe-schedule-preservation--smart-start-buffer][Safe Schedule Preservation & Smart Start Buffer]]
   - [[#interactive-title-modifiers][Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -rsf-, -r-all-)]]
   - [[#automatic-task-displacement][Automatic Displacement by Newly Added Tasks]]
+  - [[#background-run-change-logging][Background Run Change Logging]]
 - [[#historical-effort-tracking][Historical Effort Tracking]]
 - [[#repeater--habit-integration][Repeater / Habit Integration]]
 - [[#recurring-tasks][Recurring Tasks]]
@@ -553,6 +554,25 @@ When you add a *newly added task* (an =AUTOSCH= task that is unscheduled or sche
   - *Pinned tasks* (tasks with =:PINNED: t= or =:PINNED_TIME:=) are *never moved automatically*.
 - *Zero Churn on Idle Runs:* If no unscheduled tasks exist (and no =-r-= marker is present), upcoming unpinned tasks remain locked in place across background idle syncs.
 
+*** Background Run Change Logging
+<<background-run-change-logging>>
+
+When running silently in the background, you might want to know exactly what the scheduler changed while you were away or working in another buffer.
+
+Org Auto Scheduler includes an automatic *Change Log* that captures every modification made during background runs:
+- *Detailed Delta Tracking:* Records which tasks were rescheduled (from previous → new timestamps), which tasks were newly scheduled, which title markers were processed (e.g. =(-r-)= cascade, =(-p-)= pin, =(-s-)= splittable), and any placeholder subtask cleanups.
+- *Interactive Org Format:* Changes are formatted as structured Org-mode entries with clickable file links (=file:/path/to/todo.org::*Task=) and properties drawers. Press =TAB= to expand/collapse runs, or =RET= on any task link to jump straight to the heading in your notes.
+- *Dual Storage (Buffer + Persistent File):*
+  - Buffer: =*Org Auto Scheduler Changes*= (accessible anytime via =M-x org-auto-scheduler-show-change-log= or pressing =L= in the Review buffer).
+  - Persistent File: =~/.emacs.d/org-auto-scheduler-changes.org= (persists across Emacs sessions).
+- *Noise-Free by Default:* Runs that make zero changes are omitted by default (=org-auto-scheduler-change-log-record-empty= is =nil=) so your log never gets filled with idle clutter.
+- *Echo Notification:* When changes occur, Emacs briefly alerts you in the echo area: =Org Auto Scheduler [background]: 2 task(s) updated. [M-x org-auto-scheduler-show-change-log]=.
+- *Automatic File Saving:* Modified Org agenda files are automatically saved to disk when background changes occur (=org-auto-scheduler-background-save-buffers=, default =t=).
+
+Commands:
+- =M-x org-auto-scheduler-show-change-log= (or =L= / =C-c C-l= in review buffer): View the change log buffer, positioned at the latest run.
+- =M-x org-auto-scheduler-clear-change-log=: Erase the change log buffer and optionally truncate the persistent log file.
+
 ** Historical Effort Tracking
 
 The scheduler learns from your actual clocked time versus your Effort estimates.
@@ -860,6 +880,13 @@ Backward-compatible aliases:
 | =org-auto-scheduler-title-marker-regex=       | ="\\(?:(\\s-*\\)?-\\(r-all\\|[rRsSfF]+\\)-\\(?:\\s-*)\\)?"= | Regular expression for matching title-based modifiers like =(-r-)=, =(-sfr-)=, =(-r-all-)=. |
 | =org-auto-scheduler-allowed-hostnames=        | =nil=   | List of hostnames allowed to run background scheduling. =nil= = any machine.   |
 | =org-auto-scheduler-silent-mode=              | =nil=   | When =t=, suppress report buffer creation and display.                         |
+| =org-auto-scheduler-change-log-enabled=       | =t=     | Log task modifications executed during background runs.                        |
+| =org-auto-scheduler-change-log-file=          | =~/.emacs.d/org-auto-scheduler-changes.org= | Persistent file for background changes log (=nil= for buffer-only). |
+| =org-auto-scheduler-change-log-record-empty=  | =nil=   | When =t=, log runs even when 0 tasks changed (=nil= logs only actual changes). |
+| =org-auto-scheduler-change-log-background-only= | =t=   | When =t=, log background runs only; =nil= also logs manual runs.               |
+| =org-auto-scheduler-change-log-notify=         | =t=     | Display an echo area message when a background run updates tasks.              |
+| =org-auto-scheduler-change-log-max-entries=   | =200=   | Maximum number of run entries retained before older entries are pruned.        |
+| =org-auto-scheduler-background-save-buffers=  | =t=     | Automatically save modified agenda files to disk after background changes.     |
 
 *** CalDAV Sync
 

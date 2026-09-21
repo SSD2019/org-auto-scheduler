@@ -361,6 +361,61 @@ When nil (default), background scheduling proceeds even if a clock is running."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defvar org-auto-scheduler-change-log-buffer-name "*Org Auto Scheduler Changes*"
+  "Name of the buffer for the Org Auto Scheduler change log.")
+
+(defcustom org-auto-scheduler-change-log-enabled t
+  "When non-nil, log changes executed during background runs."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-change-log-file
+  (expand-file-name "org-auto-scheduler-changes.org" user-emacs-directory)
+  "File path for persisting the background change log.
+If nil, changes are only recorded in the `*Org Auto Scheduler Changes*` buffer."
+  :type '(choice (file :tag "Log file")
+                 (const :tag "No file logging (buffer only)" nil))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-change-log-record-empty nil
+  "When non-nil, record a log entry even when a background run makes no changes.
+When nil (default), only runs that modify task schedules, title markers,
+or split tasks will be recorded, keeping the log concise and noise-free."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-change-log-background-only t
+  "When non-nil, only background scheduler runs are recorded to the change log.
+When nil, manual scheduling runs are also recorded."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-change-log-notify t
+  "When non-nil, display a message in the echo area when a background run makes changes."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-change-log-max-entries 200
+  "Maximum number of run entries to retain in the change log buffer and file.
+Older entries beyond this limit are pruned to prevent unbounded growth."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-background-save-buffers t
+  "When non-nil, save modified Org agenda buffers to disk after background changes."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--current-run-type nil
+  "Tracks current scheduler execution mode: \='background-async, \='background-sync, or nil (manual).")
+
+(defvar org-auto-scheduler--run-start-time nil
+  "Start time of the currently running scheduler execution.")
+
+(defvar org-auto-scheduler--last-run-changes nil
+  "List of detected changes from the most recent scheduler run.")
+
+
 (defcustom org-auto-scheduler-start-buffer-minutes 5
   "Buffer minutes added to current time when starting task scheduling.
 Defaults to 5 minutes. If a task is currently clocked in, 0 minutes is used instead."
@@ -2548,24 +2603,25 @@ When FORCE-REPLAN is non-nil (or with prefix arg `C-u`), re-plan all tasks from
 scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
   (interactive "P")
   (org-auto-scheduler--log-info "Starting auto-scheduling process")
-  (org-auto-scheduler-cleanup-placeholders)
-  (org-auto-scheduler-load-review-decisions)
-  (when (and org-auto-scheduler-sync-caldav
-             (not org-auto-scheduler--preview-mode)
-             (require 'org-caldav nil t))
+  (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders)))
+    (org-auto-scheduler-load-review-decisions)
+    (when (and org-auto-scheduler-sync-caldav
+               (not org-auto-scheduler--preview-mode)
+               (require 'org-caldav nil t))
+      (condition-case err
+          (org-caldav-sync)
+        (error (message "CalDAV sync failed (pre-schedule): %s" (error-message-string err)))))
     (condition-case err
-        (org-caldav-sync)
-      (error (message "CalDAV sync failed (pre-schedule): %s" (error-message-string err)))))
-  (condition-case err
-      (progn
-        (org-auto-scheduler-validate-config)              ; Validate config at runtime
-        (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
-        (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
-        (unless org-auto-scheduler--preview-mode
-          (org-auto-scheduler-create-report-buffer))      ; Create the report buffer
-        (let* ((tasks (org-auto-scheduler-get-schedulable-tasks))
-               (_ (org-auto-scheduler--merge-saved-decisions tasks))
-               (sorted-tasks-info (org-auto-scheduler-sort-tasks tasks))
+        (progn
+          (org-auto-scheduler-validate-config)              ; Validate config at runtime
+          (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
+          (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
+          (unless org-auto-scheduler--preview-mode
+            (org-auto-scheduler-create-report-buffer))      ; Create the report buffer
+          (let* ((tasks (org-auto-scheduler-get-schedulable-tasks))
+                 (_ (org-auto-scheduler--merge-saved-decisions tasks))
+                 (sorted-tasks-info (org-auto-scheduler-sort-tasks tasks))
+                 (initial-snapshot (org-auto-scheduler--capture-tasks-snapshot sorted-tasks-info))
                (current-time (org-auto-scheduler-get-start-time))
                (tasks-scheduled 0)
                (total-tasks (length sorted-tasks-info))
@@ -2783,9 +2839,24 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
 
           ;; Normalize completed-tasks to chronological order (built via push)
           (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
+          ;; Detect and record changes
+          (setq org-auto-scheduler--last-run-changes
+                (org-auto-scheduler--detect-task-changes initial-snapshot
+                                                        org-auto-scheduler-completed-tasks
+                                                        marker-data))
+          (when (org-auto-scheduler--should-log-changes-p)
+            (org-auto-scheduler--record-run-changes
+             :run-type (or org-auto-scheduler--current-run-type 'manual)
+             :start-time (or (bound-and-true-p org-auto-scheduler--run-start-time) now)
+             :end-time (current-time)
+             :tasks-evaluated total-tasks
+             :changes org-auto-scheduler--last-run-changes
+             :cleaned-placeholders (or cleaned-placeholders 0)))
           (unless org-auto-scheduler--preview-mode
             (org-auto-scheduler-display-report))
-          (org-auto-scheduler--log-info "Scheduled %d tasks" tasks-scheduled)
+          (org-auto-scheduler--log-info "Scheduled %d tasks (changes: %d)"
+                                        tasks-scheduled
+                                        (length org-auto-scheduler--last-run-changes))
           (when (and org-auto-scheduler-sync-caldav
                      (require 'org-caldav nil t))
             (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV sync")
@@ -2795,8 +2866,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
             (condition-case err
                 (org-caldav-sync)
               (error (message "CalDAV sync failed (post-schedule): %s" (error-message-string err)))))))
-    (error
-     (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))
+      (error
+       (org-auto-scheduler--log-error "Error in scheduling process: %s" err)))))
 
 (defun org-auto-scheduler--set-scheduled (schedule-str)
   "Safely set SCHEDULED planning info on current heading to SCHEDULE-STR.
@@ -4271,21 +4342,44 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
 (defun org-auto-scheduler--execute-background-job ()
   "Worker function executing a background scheduler run."
   (setq org-auto-scheduler--background-running t)
-  (let ((is-async (and (fboundp 'current-thread)
-                       (fboundp 'main-thread)
-                       (not (eq (current-thread) (main-thread))))))
+  (let* ((is-async (and (fboundp 'current-thread)
+                        (fboundp 'main-thread)
+                        (not (eq (current-thread) (main-thread)))))
+         (run-type (if is-async 'background-async 'background-sync))
+         (start-time (current-time)))
     (org-auto-scheduler--log-info "Starting background auto-scheduler run (async: %s)..."
-                                  (if is-async "yes" "no")))
-  (unwind-protect
-      (condition-case err
-          (let ((org-auto-scheduler-silent-mode t))
-            ;; Run scheduler in silent mode
-            (org-auto-scheduler-schedule-tasks))
-        (error
-         (org-auto-scheduler--log-error "Error in background scheduler: %s" err)))
-    (setq org-auto-scheduler--background-running nil)
-    (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
-    (org-auto-scheduler--maybe-schedule-idle-repeat)))
+                                  (if is-async "yes" "no"))
+    (unwind-protect
+        (condition-case err
+            (let ((org-auto-scheduler-silent-mode t)
+                  (org-auto-scheduler--current-run-type run-type)
+                  (org-auto-scheduler--run-start-time start-time))
+              ;; Run scheduler in silent mode
+              (org-auto-scheduler-schedule-tasks)
+              ;; Save agenda buffers if configured and changes were made
+              (when (and org-auto-scheduler-background-save-buffers
+                         org-auto-scheduler--last-run-changes
+                         (> (length org-auto-scheduler--last-run-changes) 0))
+                (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
+                (save-some-buffers t (lambda ()
+                                       (and (buffer-file-name)
+                                            (member (buffer-file-name) (org-agenda-files t))))))
+              ;; Notify user if changes were made
+              (when (and org-auto-scheduler-change-log-notify
+                         org-auto-scheduler--last-run-changes
+                         (> (length org-auto-scheduler--last-run-changes) 0))
+                (message "Org Auto Scheduler [background]: %d task(s) updated. [M-x org-auto-scheduler-show-change-log]"
+                         (length org-auto-scheduler--last-run-changes))))
+          (error
+           (org-auto-scheduler--log-error "Error in background scheduler: %s" err)
+           (when (org-auto-scheduler--should-log-changes-p)
+             (org-auto-scheduler--record-run-error
+              :run-type run-type
+              :start-time start-time
+              :error-message (error-message-string err)))))
+      (setq org-auto-scheduler--background-running nil)
+      (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
+      (org-auto-scheduler--maybe-schedule-idle-repeat))))
 
 (defun org-auto-scheduler--maybe-schedule-idle-repeat ()
   "Schedule the next background run if Emacs continues to be idle."
@@ -4368,6 +4462,347 @@ if the current system's hostname (short or FQDN, case-insensitive) is in the lis
     (cancel-timer org-auto-scheduler--repeat-idle-timer)
     (setq org-auto-scheduler--repeat-idle-timer nil))
   (setq org-auto-scheduler--background-running nil))
+
+
+;;; ============================================================================
+;;; Background Run Change Logging
+;;; ============================================================================
+
+(defun org-auto-scheduler--timestamps-equal-p (str1 str2)
+  "Return non-nil if Org schedule strings STR1 and STR2 represent the same time slot."
+  (cond
+   ((and (null str1) (null str2)) t)
+   ((or (null str1) (null str2)) nil)
+   ((string= (string-trim str1) (string-trim str2)) t)
+   (t
+    (condition-case nil
+        (let ((r1 (org-auto-scheduler-parse-scheduled-time-range str1))
+              (r2 (org-auto-scheduler-parse-scheduled-time-range str2)))
+          (and r1 r2
+               (car r1) (car r2)
+               (time-equal-p (car r1) (car r2))
+               (or (and (null (nth 1 r1)) (null (nth 1 r2)))
+                   (and (nth 1 r1) (nth 1 r2)
+                        (time-equal-p (nth 1 r1) (nth 1 r2))))))
+      (error nil)))))
+
+(defun org-auto-scheduler--capture-tasks-snapshot (tasks-info)
+  "Capture a snapshot of tasks state before scheduling.
+TASKS-INFO is a list of task-info structures from `org-auto-scheduler-sort-tasks'."
+  (let ((snapshot (make-hash-table :test 'equal)))
+    (dolist (ti tasks-info)
+      (let* ((tid (nth 5 ti))
+             (m (nth 0 ti))
+             (buf (and (markerp m) (marker-buffer m)))
+             (file (and buf (buffer-file-name buf)))
+             (sched (nth 8 ti))
+             (hd (nth 6 ti))
+             (tags (nth 7 ti))
+             (pt (and (markerp m) (org-auto-scheduler-task-pinned-time m tid)))
+             (pinned (and (markerp m) (org-auto-scheduler-task-pinned-p m tid))))
+        (puthash tid
+                 (list :task-id tid
+                       :marker m
+                       :file file
+                       :headline hd
+                       :scheduled sched
+                       :tags tags
+                       :pinned pinned
+                       :pinned-time pt)
+                 snapshot)))
+    snapshot))
+
+(defun org-auto-scheduler--detect-task-changes (initial-snapshot completed-tasks marker-data)
+  "Detect task changes by comparing INITIAL-SNAPSHOT with COMPLETED-TASKS and MARKER-DATA.
+Returns a list of change plists."
+  (let ((changes '())
+        (seen-ids (make-hash-table :test 'equal)))
+    (dolist (ct completed-tasks)
+      (let* ((tid (nth 0 ct))
+             (final-sched (nth 6 ct))
+             (final-hd (nth 5 ct))
+             (marker (nth 7 ct))
+             (extra-plist (nthcdr 8 ct))
+             (split-today (plist-get extra-plist :split-today))
+             (init-entry (and tid initial-snapshot (gethash tid initial-snapshot)))
+             (orig-sched (and init-entry (plist-get init-entry :scheduled)))
+             (orig-hd (or (and init-entry (plist-get init-entry :headline)) final-hd))
+             (file (or (and init-entry (plist-get init-entry :file))
+                       (and (markerp marker) (buffer-file-name (marker-buffer marker)))))
+             (m-res (and tid marker-data (gethash tid marker-data)))
+             (sched-changed (not (org-auto-scheduler--timestamps-equal-p orig-sched final-sched)))
+             (sched-change-type
+              (when sched-changed
+                (cond
+                 ((null orig-sched) :newly-scheduled)
+                 ((null final-sched) :unscheduled)
+                 (t :rescheduled))))
+             (marker-actions '()))
+        (when (and tid (not (gethash tid seen-ids)))
+          (puthash tid t seen-ids)
+          ;; Process marker actions if title markers were handled
+          (when m-res
+            (when (plist-get m-res :reschedule-all)
+              (push "Reschedule all trigger (-r-all-)" marker-actions))
+            (when (and (plist-get m-res :reschedule) (not (plist-get m-res :reschedule-all)))
+              (push "Reschedule trigger (-r-)" marker-actions))
+            (when (plist-get m-res :pinned)
+              (let ((pt (and (markerp marker) (org-auto-scheduler-task-pinned-time marker tid))))
+                (push (if pt
+                          (format "Pinned task (-p-) at %s" (format-time-string "%Y-%m-%d %H:%M" pt))
+                        "Pinned task (-p-)")
+                      marker-actions)))
+            (when (plist-get m-res :remove-pinned)
+              (push "Unpinned task (-\p-)" marker-actions))
+            (when (plist-get m-res :splittable)
+              (push "Marked splittable (-s-)" marker-actions))
+            (when (plist-get m-res :remove-splittable)
+              (push "Removed splittable status (-\s-)" marker-actions))
+            (when (plist-get m-res :freeset)
+              (push "Marked freeset (-f-)" marker-actions))
+            (when (plist-get m-res :remove-freeset)
+              (push "Removed freeset status (-\f-)" marker-actions)))
+          ;; If anything changed (schedule, markers, split), record it
+          (when (or sched-changed marker-actions split-today)
+            (push (list :task-id tid
+                        :headline final-hd
+                        :orig-headline orig-hd
+                        :file file
+                        :marker marker
+                        :schedule-changed sched-changed
+                        :schedule-change-type sched-change-type
+                        :orig-scheduled orig-sched
+                        :final-scheduled final-sched
+                        :marker-actions (nreverse marker-actions)
+                        :split-today split-today)
+                  changes)))))
+    (nreverse changes)))
+
+(defun org-auto-scheduler--should-log-changes-p ()
+  "Return non-nil if changes should be logged for the current run."
+  (and org-auto-scheduler-change-log-enabled
+       (or (not org-auto-scheduler-change-log-background-only)
+           (memq org-auto-scheduler--current-run-type '(background-async background-sync)))))
+
+(defun org-auto-scheduler--format-change-log-entry (run-info changes)
+  "Format an Org-mode change log entry for a scheduler run.
+RUN-INFO is a plist with :run-type, :start-time, :end-time, :tasks-evaluated,
+:cleaned-placeholders.
+CHANGES is a list of change plists."
+  (let* ((run-type (plist-get run-info :run-type))
+         (start-time (or (plist-get run-info :start-time) (current-time)))
+         (end-time (or (plist-get run-info :end-time) (current-time)))
+         (duration (float-time (time-subtract end-time start-time)))
+         (tasks-eval (or (plist-get run-info :tasks-evaluated) 0))
+         (cleaned-ph (or (plist-get run-info :cleaned-placeholders) 0))
+         (num-changes (length changes))
+         (time-str (format-time-string "%Y-%m-%d %a %H:%M:%S" start-time))
+         (run-label (cond
+                     ((eq run-type 'background-async) "Background Run (Async)")
+                     ((eq run-type 'background-sync) "Background Run (Sync)")
+                     (t "Manual Run")))
+         (lines '()))
+    (if (= num-changes 0)
+        (push (format "* [%s] %s: No changes (%d task(s) evaluated)"
+                      time-str run-label tasks-eval)
+              lines)
+      (push (format "* [%s] %s (%d task(s) updated)"
+                    time-str run-label num-changes)
+            lines))
+    (push ":PROPERTIES:" lines)
+    (push (format ":RUN_TYPE: %s" (or run-type 'manual)) lines)
+    (push (format ":TASKS_EVALUATED: %d" tasks-eval) lines)
+    (push (format ":TASKS_CHANGED: %d" num-changes) lines)
+    (push (format ":PLACEHOLDERS_CLEANED: %d" cleaned-ph) lines)
+    (push (format ":DURATION: %.2fs" duration) lines)
+    (push ":END:
+" lines)
+
+    (when (> cleaned-ph 0)
+      (push (format "- Cleaned up %d split placeholder subtask(s)
+" cleaned-ph) lines))
+
+    (dolist (ch changes)
+      (let* ((hd (plist-get ch :headline))
+             (orig-hd (plist-get ch :orig-headline))
+             (file (plist-get ch :file))
+             (sched-changed (plist-get ch :schedule-changed))
+             (sched-type (plist-get ch :schedule-change-type))
+             (orig-sched (plist-get ch :orig-scheduled))
+             (final-sched (plist-get ch :final-scheduled))
+             (marker-acts (plist-get ch :marker-actions))
+             (split (plist-get ch :split-today))
+             ;; Build action tag for subheading
+             (action-tag (cond
+                          ((and marker-acts sched-changed) "MARKER & RESCHEDULED")
+                          (marker-acts "MARKER UPDATED")
+                          ((eq sched-type :newly-scheduled) "NEWLY SCHEDULED")
+                          ((eq sched-type :unscheduled) "UNSCHEDULED")
+                          (t "RESCHEDULED")))
+             ;; Format headline with link if file exists
+             (linked-title
+              (if (and file (file-exists-p file))
+                  (format "[[file:%s::*%s][%s]]" file hd hd)
+                hd)))
+        (push (format "** %s: %s" action-tag linked-title) lines)
+        (when (and orig-hd (not (string= orig-hd hd)))
+          (push (format "  - Title: =%s= → =%s=" orig-hd hd) lines))
+        (dolist (ma marker-acts)
+          (push (format "  - Action: %s" ma) lines))
+        (when sched-changed
+          (push (format "  - Schedule: %s → %s"
+                        (or orig-sched "Unscheduled")
+                        (or final-sched "Unscheduled"))
+                lines))
+        (when split
+          (push "  - Split: initial chunk scheduled, remaining effort placed on subsequent days" lines))
+        (when file
+          (push (format "  - File: =%s=" file) lines))
+        (push "" lines)))
+    (mapconcat #'identity (nreverse lines) "
+")))
+
+(defun org-auto-scheduler--prune-change-log-buffer (buf max-entries)
+  "Prune older entries in BUF to keep at most MAX-ENTRIES top-level headings."
+  (when (and (buffer-live-p buf) (numberp max-entries) (> max-entries 0))
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (point-min))
+        (let ((headings '()))
+          (while (re-search-forward "^\\* \\[" nil t)
+            (push (line-beginning-position) headings))
+          (setq headings (nreverse headings))
+          (let ((excess (- (length headings) max-entries)))
+            (when (> excess 0)
+              (let ((cutoff (nth excess headings)))
+                (goto-char (car headings))
+                (delete-region (point) cutoff)))))))))
+
+(defun org-auto-scheduler--prune-change-log-file (file max-entries)
+  "Prune older entries in FILE to keep at most MAX-ENTRIES top-level headings."
+  (when (and file (file-exists-p file) (numberp max-entries) (> max-entries 0))
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents file)
+          (org-auto-scheduler--prune-change-log-buffer (current-buffer) max-entries)
+          (write-region (point-min) (point-max) file nil 'silent))
+      (error nil))))
+
+(defun org-auto-scheduler--append-change-log (entry-text)
+  "Append ENTRY-TEXT to the change log buffer and persistent file."
+  ;; 1. Update buffer
+  (let ((buf (get-buffer-create org-auto-scheduler-change-log-buffer-name)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'org-mode)
+        (org-mode)
+        (insert "#+TITLE: Org Auto Scheduler Changes Log
+#+STARTUP: showeverything
+
+"))
+      (goto-char (point-max))
+      (unless (bolp) (insert "
+"))
+      (insert entry-text "
+")
+      (org-auto-scheduler--prune-change-log-buffer buf org-auto-scheduler-change-log-max-entries)))
+  ;; 2. Update persistent file
+  (when (and org-auto-scheduler-change-log-file
+             (stringp org-auto-scheduler-change-log-file))
+    (condition-case err
+        (let ((file-dir (file-name-directory org-auto-scheduler-change-log-file)))
+          (when (and file-dir (not (file-directory-p file-dir)))
+            (make-directory file-dir t))
+          (let ((need-header (not (file-exists-p org-auto-scheduler-change-log-file))))
+            (with-temp-buffer
+              (when need-header
+                (insert "#+TITLE: Org Auto Scheduler Changes Log
+#+STARTUP: showeverything
+
+"))
+              (insert entry-text "
+")
+              (write-region (point-min) (point-max) org-auto-scheduler-change-log-file t 'silent)))
+          (org-auto-scheduler--prune-change-log-file
+           org-auto-scheduler-change-log-file
+           org-auto-scheduler-change-log-max-entries))
+      (error
+       (org-auto-scheduler--log-warn "Failed to write change log file %s: %s"
+                                     org-auto-scheduler-change-log-file err)))))
+
+(defun org-auto-scheduler--record-run-changes (&rest run-info)
+  "Record changes from a scheduler run.
+RUN-INFO is a plist containing :run-type, :start-time, :end-time,
+:tasks-evaluated, :changes, :cleaned-placeholders."
+  (let* ((changes (plist-get run-info :changes))
+         (has-changes (> (length changes) 0)))
+    (when (or has-changes org-auto-scheduler-change-log-record-empty)
+      (let ((entry-text (org-auto-scheduler--format-change-log-entry run-info changes)))
+        (org-auto-scheduler--append-change-log entry-text)))))
+
+(defun org-auto-scheduler--record-run-error (&rest err-info)
+  "Record an error encountered during a scheduler run.
+ERR-INFO is a plist containing :run-type, :start-time, :error-message."
+  (let* ((run-type (plist-get err-info :run-type))
+         (start-time (or (plist-get err-info :start-time) (current-time)))
+         (err-msg (plist-get err-info :error-message))
+         (now (current-time))
+         (time-str (format-time-string "%Y-%m-%d %a %H:%M:%S" now))
+         (duration (float-time (time-subtract now start-time)))
+         (entry-text (concat
+                      (format "* [%s] %s: ERROR
+"
+                              time-str
+                              (if (eq run-type 'background-async) "Background Run (Async)" "Background Run"))
+                      ":PROPERTIES:
+"
+                      (format ":RUN_TYPE: %s
+" (or run-type 'background))
+                      ":STATUS: error
+"
+                      (format ":DURATION: %.2fs
+" duration)
+                      ":END:
+
+"
+                      (format "- Error: =%s=
+
+" err-msg))))
+    (org-auto-scheduler--append-change-log entry-text)))
+
+(defun org-auto-scheduler-show-change-log ()
+  "Display the Org Auto Scheduler change log buffer."
+  (interactive)
+  (let ((buf (get-buffer-create org-auto-scheduler-change-log-buffer-name)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'org-mode)
+        (org-mode))
+      ;; If buffer is empty and log file exists, load from file
+      (when (and (= (buffer-size) 0)
+                 org-auto-scheduler-change-log-file
+                 (file-exists-p org-auto-scheduler-change-log-file))
+        (insert-file-contents org-auto-scheduler-change-log-file))
+      (goto-char (point-max)))
+    (pop-to-buffer buf)
+    (goto-char (point-max))))
+
+(defun org-auto-scheduler-clear-change-log (&optional clear-file)
+  "Clear the Org Auto Scheduler change log buffer.
+With prefix argument CLEAR-FILE, or when prompted interactively,
+also truncate the persistent change log file."
+  (interactive "P")
+  (let ((buf (get-buffer org-auto-scheduler-change-log-buffer-name)))
+    (when buf
+      (with-current-buffer buf
+        (erase-buffer))))
+  (setq org-auto-scheduler--last-run-changes nil)
+  (when (and (or clear-file (called-interactively-p 'interactive))
+             org-auto-scheduler-change-log-file
+             (file-exists-p org-auto-scheduler-change-log-file))
+    (when (or clear-file (y-or-n-p (format "Also truncate log file %s? " org-auto-scheduler-change-log-file)))
+      (with-temp-file org-auto-scheduler-change-log-file
+        (insert ""))))
+  (message "Org Auto Scheduler change log cleared."))
+
 
 (defun org-auto-scheduler-historical-insights ()
   "Display historical prediction accuracy of effort estimates in a separate buffer."
@@ -4830,7 +5265,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "P")   #'org-auto-scheduler-review-pin-task)
   (define-key map (kbd "p")   #'org-auto-scheduler-review-pin-task)
   ;; Help
-  (define-key map (kbd "?")   #'org-auto-scheduler-review-help))
+  (define-key map (kbd "?")   #'org-auto-scheduler-review-help)
+  ;; Change log
+  (define-key map (kbd "L")   #'org-auto-scheduler-show-change-log)
+  (define-key map (kbd "C-c C-l") #'org-auto-scheduler-show-change-log))
 
 ;; Evil/Spacemacs compatibility: let the full mode map (including the
 ;; "f" filter and "*" bulk-mark prefixes) win over evil state bindings.
@@ -4847,6 +5285,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "F")       #'org-auto-scheduler-review-toggle-freeset
       (kbd "P")       #'org-auto-scheduler-review-pin-task
       (kbd "p")       #'org-auto-scheduler-review-pin-task
+      (kbd "L")       #'org-auto-scheduler-show-change-log
       (kbd "x")       #'org-auto-scheduler-review-execute
       (kbd "C-c C-c") #'org-auto-scheduler-review-execute
       ;; Reordering
