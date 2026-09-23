@@ -431,6 +431,13 @@ rescheduling is triggered by a title marker (such as -r- or -r-all-)."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-preserve-future-scheduled t
+  "When non-nil, tasks already scheduled for future days with a specific time
+are preserved during scheduling runs, unless rescheduling is triggered by a
+title marker (such as -r- or -r-all-) or `force-replan'."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-title-marker-regex "\\(?:(\\s-*\\)?-\\(r-all[rRsSfFpP\\\\-]*\\|[rRsSfFpP\\\\]+\\)-\\(?:\\s-*)\\)?"
   "Regular expression matching title markers for task scheduling modifiers.
 Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\s-), (-\f-), (-\p-), (-rsf-), (-rp-), (-r\p-), (-r-all-), etc."
@@ -1095,9 +1102,7 @@ When SILENT is non-nil, suppress confirmation message."
                                 (gethash row-id org-auto-scheduler--review-overrides)))
                  (target-date (or (plist-get override :target-date)
                                   (plist-get override :pinned-date)
-                                  (and current-sep-date
-                                       (not (string= current-sep-date "Unknown"))
-                                       current-sep-date)))
+                                  (and prev-dec (plist-get prev-dec :target-date))))
                  (freeset (or (plist-get override :freeset) (plist-get override :pinnable)))
                  (pinned (plist-get override :pinned))
                  (pinned-time (plist-get override :pinned-time))
@@ -2514,6 +2519,35 @@ If no marker is found, returns nil."
                     :remove-pinned (and is-pin-off t)
                     :title cleaned-title))))))))
 
+(defun org-auto-scheduler--task-scheduled-time (marker &optional min-date-str)
+  "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled or pinned with a specific time.
+When MIN-DATE-STR (YYYY-MM-DD) is provided, only matches tasks on or after MIN-DATE-STR.
+Returns nil if not scheduled/pinned, scheduled in the past before MIN-DATE-STR,
+or scheduled date-only without a time."
+  (when (and marker (markerp marker) (marker-buffer marker))
+    (org-with-point-at marker
+      (let* ((target-min (or min-date-str (format-time-string "%Y-%m-%d")))
+             (sched-str (org-entry-get nil "SCHEDULED"))
+             (pinned-time-str (org-entry-get nil org-auto-scheduler-pinned-time-property)))
+        (or
+         ;; Case A: Task pinned via PINNED_TIME property
+         (when (and pinned-time-str
+                    (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" pinned-time-str))
+           (let* ((pt (org-auto-scheduler--parse-flexible-time pinned-time-str marker))
+                  (pt-day (and pt (format-time-string "%Y-%m-%d" pt))))
+             (when (and pt-day (not (string< pt-day target-min)))
+               (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                 (cons pt (or end-time (time-add pt (seconds-to-time 3600))))))))
+         ;; Case B: Task scheduled with HH:MM
+         (when (and sched-str
+                    ;; Must contain HH:MM
+                    (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" sched-str))
+           (let* ((start-time (org-time-string-to-time sched-str))
+                  (start-day (and start-time (format-time-string "%Y-%m-%d" start-time))))
+             (when (and start-day (not (string< start-day target-min)))
+               (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
+                 (cons start-time (or end-time (time-add start-time (seconds-to-time 3600)))))))))))))
+
 (defun org-auto-scheduler--task-scheduled-today-p (marker &optional today-str)
   "Return a cons (START-TIME . END-TIME) if task at MARKER is scheduled or pinned for TODAY-STR with a specific time.
 TODAY-STR defaults to today's date in YYYY-MM-DD format.
@@ -2676,17 +2710,20 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                   (setf (nth 7 task-info) (delete org-auto-scheduler-pinned-tag (nth 7 task-info))))
                 (when (plist-get m-res :pinned)
                   (setf (nth 7 task-info) (cl-pushnew org-auto-scheduler-pinned-tag (nth 7 task-info) :test #'string=))))
-              ;; Check if scheduled for today with a time
-              (let ((today-times (when preserve-today
-                                   (org-auto-scheduler--task-scheduled-today-p marker today-str))))
-                (if today-times
-                    (let* ((start-t (car today-times))
-                           (end-t (cdr today-times))
+              ;; Check if scheduled for today or future with a time
+              (let ((sched-times (when preserve-today
+                                   (if org-auto-scheduler-preserve-future-scheduled
+                                       (org-auto-scheduler--task-scheduled-time marker today-str)
+                                     (org-auto-scheduler--task-scheduled-today-p marker today-str)))))
+                (if sched-times
+                    (let* ((start-t (car sched-times))
+                           (end-t (cdr sched-times))
                            (is-pin (org-auto-scheduler-task-pinned-p marker task-id))
                            (is-clocked (org-auto-scheduler--task-clocked-p marker))
                            (is-resched (or (and m-res (plist-get m-res :reschedule)) nil))
                            (is-overdue (time-less-p start-t now))
-                           (is-lapsed-or-current (or is-clocked is-overdue)))
+                           (is-lapsed-or-current (or is-clocked is-overdue))
+                           (is-today (string= (format-time-string "%Y-%m-%d" start-t) today-str)))
                       (push (list :task-info task-info
                                   :marker marker
                                   :task-id task-id
@@ -2696,7 +2733,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                   :clocked is-clocked
                                   :reschedule is-resched
                                   :overdue is-overdue
-                                  :lapsed-or-current is-lapsed-or-current)
+                                  :lapsed-or-current is-lapsed-or-current
+                                  :is-today is-today)
                             today-scheduled))
                   (push task-info tasks-to-schedule)))))
           (setq tasks-to-schedule (nreverse tasks-to-schedule))
@@ -2777,9 +2815,11 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                 ;; Identify preserved tasks vs upcoming unpinned tasks
                 (dolist (e today-scheduled)
                   (if (or (plist-get e :lapsed-or-current)
-                          (plist-get e :pinned))
+                          (plist-get e :pinned)
+                          (and org-auto-scheduler-preserve-future-scheduled
+                               (not (plist-get e :is-today))))
                       (push e preserved-entries)
-                    ;; Upcoming unpinned task: mark as eligible for rescheduling
+                    ;; Upcoming unpinned task for today: mark as eligible for rescheduling
                     (puthash (plist-get e :task-id) t reschedule-task-ids)))
                 (setq preserved-entries (nreverse preserved-entries))
 
@@ -4490,6 +4530,8 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
     (org-auto-scheduler--log-debug "Background scheduler skipped: not enabled."))
    ((not (org-auto-scheduler-allowed-on-this-computer-p))
     (org-auto-scheduler--log-debug "Background scheduler skipped: not allowed on hostname %s." (system-name)))
+   ((get-buffer "*Org Auto Scheduler Review*")
+    (org-auto-scheduler--log-debug "Background scheduler skipped: review buffer is active."))
    ((or org-auto-scheduler--background-running
         (and org-auto-scheduler--background-thread
              (threadp org-auto-scheduler--background-thread)
@@ -6089,7 +6131,7 @@ Recalculates the schedule immediately afterward unless
                        (format "Move task to date (current: %s): " current-day)))
              (date-input (org-read-date is-pinnable nil nil prompt))
              (final-ans (or (bound-and-true-p org-read-date-final-answer) date-input))
-             (has-time (string-match-p "[0-9]\{2\}:[0-9]\{2\}" final-ans))
+             (has-time (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" final-ans))
              (target-day (if (and date-input (>= (length date-input) 10))
                              (substring date-input 0 10)
                            date-input))
