@@ -2952,6 +2952,8 @@ heading when the current heading does not yet have a planning line."
               (file (buffer-file-name)))
          ;; Check if the task is not in an archived state and not a placeholder
          (when (and is-autosch is-valid-state (not (member "ARCHIVE" tags)) (not is-placeholder))
+           (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
+                                          headline state (or not-before "Not set") (or recurring "Not set") file)
            (if recurring
                (progn
                  (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
@@ -2960,9 +2962,7 @@ heading when the current heading does not yet have a planning line."
              (org-auto-scheduler--log-debug "Adding non-recurring task: %s from file %s" headline file)
              (let ((m (point-marker)))
                (set-marker-insertion-type m t)
-               (push m tasks))))
-         (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
-                                        headline state (or not-before "Not set") (or recurring "Not set") file)))
+               (push m tasks))))))
      nil
      'agenda)
     (org-auto-scheduler--log-info "Found %d schedulable tasks across the agenda" (length tasks))
