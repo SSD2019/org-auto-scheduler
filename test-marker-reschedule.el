@@ -1016,11 +1016,60 @@ SCHEDULED: <%s %s 10:00-11:00>
 
   (delete-directory temp-dir t))
 
+;; ============================================================================
+;; TEST 12: Review Buffer Lifecycle and Background Scheduler Non-Blocking
+;; ============================================================================
+(message "\n--- TEST 12: Review Buffer Lifecycle and Background Non-Blocking ---")
+
+(let* ((temp-dir (make-temp-file "org-review-test-" t))
+       (test-org-file (expand-file-name "test-review.org" temp-dir))
+       (now (current-time))
+       (today-str (format-time-string "%Y-%m-%d" now))
+       (today-dow (format-time-string "%a" now))
+       (org-auto-scheduler-background-enabled t)
+       (org-auto-scheduler-allowed-hostnames nil)
+       (org-auto-scheduler-sync-caldav nil)
+       (org-auto-scheduler-silent-mode t)
+       (org-auto-scheduler-background-async nil))
+
+  (with-temp-file test-org-file
+    (insert (format "* Tasks\n*** TODO Review Task 1 :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: rev-1\n:END:\n")))
+
+  (setq org-agenda-files (list test-org-file))
+
+  ;; 12.1: Test org-auto-scheduler-review-save-decisions without prev-dec void error
+  (let ((rev-buf (get-buffer-create "*Org Auto Scheduler Review*")))
+    (with-current-buffer rev-buf
+      (org-auto-scheduler-review-mode)
+      (setq tabulated-list-entries
+            (list (list "rev-1" (vector "[X]" "Review Task 1" "01:00" "09:00" "10:00" today-str "" "" ""))))
+      ;; Should not throw void-variable prev-dec
+      (let ((err-thrown nil))
+        (condition-case err
+            (org-auto-scheduler-review-save-decisions t)
+          (error (setq err-thrown err)))
+        (assert-true (null err-thrown) "Test 12.1: review-save-decisions succeeds without prev-dec error")))
+
+    ;; 12.2: Test review-quit kills the buffer
+    (with-current-buffer rev-buf
+      (org-auto-scheduler-review-quit))
+    (assert-true (null (get-buffer "*Org Auto Scheduler Review*"))
+                 "Test 12.2: org-auto-scheduler-review-quit kills review buffer")
+
+    ;; 12.3: Test background scheduler runs when review buffer has no window or is killed
+    (let ((bg-ran nil))
+      (cl-letf (((symbol-function 'org-auto-scheduler--execute-background-job)
+                 (lambda () (setq bg-ran t))))
+        (org-auto-scheduler-background-run)
+        (assert-true bg-ran "Test 12.3: background-run executes when review buffer is not visible"))))
+
+  (delete-directory temp-dir t))
+
 (when (boundp 'test-orig-agenda-files) (setq org-agenda-files test-orig-agenda-files))
 
 (message "\n==============================================")
 (if (= test-failures 0)
-    (message "ALL 11 TEST SUITES PASSED PERFECTLY!")
+    (message "ALL 12 TEST SUITES PASSED PERFECTLY!")
   (message "FAILURES DETECTED: %d" test-failures))
 (message "==============================================")
 

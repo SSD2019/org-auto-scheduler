@@ -1100,6 +1100,7 @@ When SILENT is non-nil, suppress confirmation message."
                  (headline (and task-data (nth 5 task-data)))
                  (override (and (bound-and-true-p org-auto-scheduler--review-overrides)
                                 (gethash row-id org-auto-scheduler--review-overrides)))
+                 (prev-dec (cdr (assoc row-id org-auto-scheduler--saved-review-decisions)))
                  (target-date (or (plist-get override :target-date)
                                   (plist-get override :pinned-date)
                                   (and prev-dec (plist-get prev-dec :target-date))))
@@ -4539,7 +4540,9 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
     (org-auto-scheduler--log-debug "Background scheduler skipped: not enabled."))
    ((not (org-auto-scheduler-allowed-on-this-computer-p))
     (org-auto-scheduler--log-debug "Background scheduler skipped: not allowed on hostname %s." (system-name)))
-   ((get-buffer "*Org Auto Scheduler Review*")
+   ((or (get-buffer-window "*Org Auto Scheduler Review*" t)
+        (and (boundp 'org-timegrid-buffer-name)
+             (get-buffer-window org-timegrid-buffer-name t)))
     (org-auto-scheduler--log-debug "Background scheduler skipped: review buffer is active."))
    ((or org-auto-scheduler--background-running
         (and org-auto-scheduler--background-thread
@@ -5450,6 +5453,14 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 ;;; Interactive Review Mode
 
 
+(defun org-auto-scheduler-review-quit ()
+  "Quit the Org Auto Scheduler review buffer and kill it."
+  (interactive)
+  (let ((win (get-buffer-window (current-buffer) t)))
+    (if win
+        (quit-window t win)
+      (kill-buffer (current-buffer)))))
+
 (defvar org-auto-scheduler-review-mode-map nil
   "Keymap for `org-auto-scheduler-review-mode'.")
 
@@ -5522,7 +5533,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "?")   #'org-auto-scheduler-review-help)
   ;; Change log
   (define-key map (kbd "L")   #'org-auto-scheduler-show-change-log)
-  (define-key map (kbd "C-c C-l") #'org-auto-scheduler-show-change-log))
+  (define-key map (kbd "C-c C-l") #'org-auto-scheduler-show-change-log)
+  ;; Quit
+  (define-key map (kbd "q")     #'org-auto-scheduler-review-quit)
+  (define-key map (kbd "C-c C-k") #'org-auto-scheduler-review-quit))
 
 ;; Evil/Spacemacs compatibility: let the full mode map (including the
 ;; "f" filter and "*" bulk-mark prefixes) win over evil state bindings.
@@ -5542,6 +5556,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "L")       #'org-auto-scheduler-show-change-log
       (kbd "x")       #'org-auto-scheduler-review-execute
       (kbd "C-c C-c") #'org-auto-scheduler-review-execute
+      (kbd "q")       #'org-auto-scheduler-review-quit
       ;; Reordering
       (kbd "K")       #'org-auto-scheduler-review-move-up
       (kbd "J")       #'org-auto-scheduler-review-move-down
@@ -6785,11 +6800,16 @@ Automatically recalculates dependent times based on visual layout before executi
     (save-some-buffers t (lambda ()
                            (and (buffer-file-name)
                                 (member (buffer-file-name) (org-agenda-files t)))))
-    (when org-auto-scheduler-review-auto-save-decisions
-      (org-auto-scheduler-review-save-decisions t))
-    (org-auto-scheduler-display-report)
-    (message "Applied %d tasks from the auto-scheduler review!" applied-count)
-    (kill-buffer (current-buffer))
+    (unwind-protect
+        (progn
+          (when org-auto-scheduler-review-auto-save-decisions
+            (condition-case err
+                (org-auto-scheduler-review-save-decisions t)
+              (error
+               (org-auto-scheduler--log-error "Failed to auto-save review decisions: %s" err))))
+          (org-auto-scheduler-display-report)
+          (message "Applied %d tasks from the auto-scheduler review!" applied-count))
+      (kill-buffer (current-buffer)))
     (when (and org-auto-scheduler-sync-caldav
                (require 'org-caldav nil t))
       (condition-case err
