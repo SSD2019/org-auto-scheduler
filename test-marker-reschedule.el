@@ -1061,7 +1061,47 @@ SCHEDULED: <%s %s 10:00-11:00>
       (cl-letf (((symbol-function 'org-auto-scheduler--execute-background-job)
                  (lambda () (setq bg-ran t))))
         (org-auto-scheduler-background-run)
-        (assert-true bg-ran "Test 12.3: background-run executes when review buffer is not visible"))))
+        (assert-true bg-ran "Test 12.3: background-run executes when review buffer is not visible")))
+
+    ;; 12.4: Test pause-on-review = t skips background run when review window is visible
+    (let ((rev-buf (get-buffer-create "*Org Auto Scheduler Review*")))
+      (unwind-protect
+          (progn
+            (set-window-buffer (selected-window) rev-buf)
+            (let ((org-auto-scheduler-background-pause-on-review t)
+                  (bg-ran nil))
+              (cl-letf (((symbol-function 'org-auto-scheduler--execute-background-job)
+                         (lambda () (setq bg-ran t))))
+                (org-auto-scheduler-background-run)
+                (assert-true (null bg-ran) "Test 12.4: pause-on-review t skips background run when review buffer is visible")))
+
+            ;; 12.5: Test pause-on-review = nil allows background run even when review window is visible
+            (let ((org-auto-scheduler-background-pause-on-review nil)
+                  (bg-ran nil))
+              (cl-letf (((symbol-function 'org-auto-scheduler--execute-background-job)
+                         (lambda () (setq bg-ran t))))
+                (org-auto-scheduler-background-run)
+                (assert-true bg-ran "Test 12.5: pause-on-review nil allows background run when review buffer is visible")))
+
+            ;; 12.6: Test active operation mutex skips background run even if pause-on-review is nil
+            (let ((org-auto-scheduler-background-pause-on-review nil)
+                  (bg-ran nil))
+              (org-auto-scheduler--with-active-operation 'review-apply
+                (cl-letf (((symbol-function 'org-auto-scheduler--execute-background-job)
+                           (lambda () (setq bg-ran t))))
+                  (org-auto-scheduler-background-run)
+                  (assert-true (null bg-ran) "Test 12.6: active-operation skips background run during review-apply"))))
+
+            ;; 12.7: Test uncommitted review overrides are not leaked to background run when pause-on-review is nil
+            (with-current-buffer rev-buf
+              (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
+              (puthash "rev-1" '(:effort 120 :target-date "2099-01-01") org-auto-scheduler--review-overrides)
+              (let ((org-auto-scheduler-background-pause-on-review nil)
+                    (org-auto-scheduler--background-running t))
+                (let ((ov (org-auto-scheduler--get-review-overrides)))
+                  (assert-true (null ov) "Test 12.7: uncommitted review overrides not leaked to background run")))))
+        (when (get-buffer "*Org Auto Scheduler Review*")
+          (kill-buffer rev-buf)))))
 
   (delete-directory temp-dir t))
 

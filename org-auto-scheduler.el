@@ -361,6 +361,16 @@ When nil (default), background scheduling proceeds even if a clock is running."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-background-pause-on-review nil
+  "When non-nil, pause background auto-scheduling while the review buffer is active.
+The review buffer is considered active when `*Org Auto Scheduler Review*' or
+`*Org Time Grid*' is visible in any window.
+When nil (default), background scheduling is not paused merely because the review buffer
+is visible (though it will still pause during active scheduling, review preparation,
+review application, or CalDAV synchronization to prevent race conditions)."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
 (defvar org-auto-scheduler-change-log-buffer-name "*Org Auto Scheduler Changes*"
   "Name of the buffer for the Org Auto Scheduler change log.")
 
@@ -455,6 +465,21 @@ Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\s-), (-\f-), (-\p-), (
 
 (defvar org-auto-scheduler--background-thread nil
   "Thread object running the background scheduler asynchronously.")
+
+(defvar org-auto-scheduler--active-operation nil
+  "Tracks whether an active scheduler operation (e.g. manual scheduling,
+review preparation, review application, or sync) is currently in progress.")
+
+(defmacro org-auto-scheduler--with-active-operation (op-name &rest body)
+  "Execute BODY with `org-auto-scheduler--active-operation' bound to OP-NAME."
+  (declare (indent 1) (debug t))
+  (let ((prev-op (make-symbol "prev-op")))
+    `(let ((,prev-op org-auto-scheduler--active-operation))
+       (unwind-protect
+           (progn
+             (setq org-auto-scheduler--active-operation ,op-name)
+             ,@body)
+         (setq org-auto-scheduler--active-operation ,prev-op)))))
 
 (defcustom org-auto-scheduler-sync-caldav t
   "When non-nil, automatically sync with CalDAV before and after scheduling tasks."
@@ -683,15 +708,18 @@ Prunes snapshots older than 30 days to prevent excessive file growth."
 
 (defun org-auto-scheduler--get-review-overrides ()
   "Return the review overrides hash-table from current buffer or review buffer."
-  (or (and (boundp 'org-auto-scheduler--review-overrides)
-           (hash-table-p org-auto-scheduler--review-overrides)
-           (> (hash-table-count org-auto-scheduler--review-overrides) 0)
-           org-auto-scheduler--review-overrides)
-      (let ((buf (get-buffer "*Org Auto Scheduler Review*")))
-        (when (and buf (buffer-live-p buf))
-          (buffer-local-value 'org-auto-scheduler--review-overrides buf)))
-      (and (boundp 'org-auto-scheduler--review-overrides)
-           org-auto-scheduler--review-overrides)))
+  (unless (and (bound-and-true-p org-auto-scheduler--background-running)
+               (boundp 'org-auto-scheduler-background-pause-on-review)
+               (not org-auto-scheduler-background-pause-on-review))
+    (or (and (boundp 'org-auto-scheduler--review-overrides)
+             (hash-table-p org-auto-scheduler--review-overrides)
+             (> (hash-table-count org-auto-scheduler--review-overrides) 0)
+             org-auto-scheduler--review-overrides)
+        (let ((buf (get-buffer "*Org Auto Scheduler Review*")))
+          (when (and buf (buffer-live-p buf))
+            (buffer-local-value 'org-auto-scheduler--review-overrides buf)))
+        (and (boundp 'org-auto-scheduler--review-overrides)
+             org-auto-scheduler--review-overrides))))
 
 (defun org-auto-scheduler--get-review-override (task-id)
   "Return the review override plist for TASK-ID, if any."
@@ -2661,7 +2689,16 @@ Otherwise, adds `org-auto-scheduler-start-buffer-minutes' (default 5m) buffer."
 When FORCE-REPLAN is non-nil (or with prefix arg `C-u`), re-plan all tasks from
 scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
   (interactive "P")
-  (org-auto-scheduler--log-info "Starting auto-scheduling process")
+  (when (and org-auto-scheduler--background-running
+             org-auto-scheduler--background-thread
+             (threadp org-auto-scheduler--background-thread)
+             (thread-live-p org-auto-scheduler--background-thread)
+             (fboundp 'current-thread)
+             (not (eq (current-thread) org-auto-scheduler--background-thread)))
+    (org-auto-scheduler--log-info "Waiting for background scheduler thread to complete...")
+    (thread-join org-auto-scheduler--background-thread))
+  (org-auto-scheduler--with-active-operation (or org-auto-scheduler--current-run-type 'scheduling)
+    (org-auto-scheduler--log-info "Starting auto-scheduling process")
   (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders force-replan)))
     (setq org-auto-scheduler--session-cleaned-placeholders (or cleaned-placeholders 0))
     (org-auto-scheduler-load-review-decisions)
@@ -2933,7 +2970,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                 (org-caldav-sync)
               (error (message "CalDAV sync failed (post-schedule): %s" (error-message-string err)))))))
       (error
-       (org-auto-scheduler--log-error "Error in scheduling process: %s" err)))))
+       (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))))
 
 (defun org-auto-scheduler--set-scheduled (schedule-str)
   "Safely set SCHEDULED planning info on current heading to SCHEDULE-STR.
@@ -4540,15 +4577,18 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
     (org-auto-scheduler--log-debug "Background scheduler skipped: not enabled."))
    ((not (org-auto-scheduler-allowed-on-this-computer-p))
     (org-auto-scheduler--log-debug "Background scheduler skipped: not allowed on hostname %s." (system-name)))
-   ((or (get-buffer-window "*Org Auto Scheduler Review*" t)
-        (and (boundp 'org-timegrid-buffer-name)
-             (get-buffer-window org-timegrid-buffer-name t)))
+   ((and org-auto-scheduler-background-pause-on-review
+         (or (get-buffer-window "*Org Auto Scheduler Review*" t)
+             (and (boundp 'org-timegrid-buffer-name)
+                  (get-buffer-window org-timegrid-buffer-name t))))
     (org-auto-scheduler--log-debug "Background scheduler skipped: review buffer is active."))
    ((or org-auto-scheduler--background-running
         (and org-auto-scheduler--background-thread
              (threadp org-auto-scheduler--background-thread)
-             (thread-live-p org-auto-scheduler--background-thread)))
-    (org-auto-scheduler--log-debug "Background scheduler skipped: run already in progress."))
+             (thread-live-p org-auto-scheduler--background-thread))
+        (bound-and-true-p org-auto-scheduler--active-operation))
+    (org-auto-scheduler--log-debug "Background scheduler skipped: operation '%s' or run already in progress."
+                                  (or (bound-and-true-p org-auto-scheduler--active-operation) "background")))
    ((minibufferp)
     (org-auto-scheduler--log-debug "Background scheduler skipped: minibuffer active."))
    ((and org-auto-scheduler-background-pause-on-clock
@@ -6715,7 +6755,8 @@ tasks are constrained to start on or after their current day section."
   "Apply the scheduled times for all checked tasks in the review buffer.
 Automatically recalculates dependent times based on visual layout before execution."
   (interactive)
-  (org-auto-scheduler-review-recalculate)
+  (org-auto-scheduler--with-active-operation 'review-apply
+    (org-auto-scheduler-review-recalculate)
   ;; Check for explicit blocker violations among checked tasks
   (let ((violations '()))
     (save-excursion
@@ -6814,12 +6855,13 @@ Automatically recalculates dependent times based on visual layout before executi
                (require 'org-caldav nil t))
       (condition-case err
           (org-caldav-sync)
-        (error (message "CalDAV sync failed (review apply): %s" (error-message-string err)))))))
+        (error (message "CalDAV sync failed (review apply): %s" (error-message-string err))))))))
 
 (defun org-auto-scheduler-review-and-apply ()
   "Calculate an auto-schedule in preview mode and display it for interactive review."
   (interactive)
-  (org-auto-scheduler-load-review-decisions)
+  (org-auto-scheduler--with-active-operation 'review-prepare
+    (org-auto-scheduler-load-review-decisions)
   (message "Calculating proposed schedule...")
   (let ((org-auto-scheduler--preview-mode t))
     (org-auto-scheduler-schedule-tasks))
@@ -6847,7 +6889,7 @@ Automatically recalculates dependent times based on visual layout before executi
       (tabulated-list-print t)
       (setq header-line-format
             (org-auto-scheduler--review-header-line tabulated-list-entries)))
-    (switch-to-buffer buf)))
+    (switch-to-buffer buf))))
 
 (defun org-auto-scheduler--review-reposition-task-chronologically (task-id pinned-time)
   "Reposition TASK-ID in `tabulated-list-entries' so it appears chronologically at PINNED-TIME."
