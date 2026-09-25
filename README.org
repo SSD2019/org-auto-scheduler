@@ -39,7 +39,11 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#repeater--habit-integration][Repeater / Habit Integration]]
 - [[#recurring-tasks][Recurring Tasks]]
 - [[#splittable-tasks--multi-day-placeholders][Splittable Tasks & Multi-Day Placeholders]]
-- [[#agenda-bump][Agenda Bump]]
+- [[#dynamic-real-time-adaptation--execution][Dynamic Real-Time Adaptation & Execution]]
+  - [[#collision-aware-smart-bump-engine][Collision-Aware Smart Bump Engine]]
+  - [[#early-done-gap-pull][Early-Done Gap Pull (Auto-Filling Freed Slots)]]
+  - [[#overrun-modeline-indicator--quick-extend-command][Overrun Modeline Indicator & Quick Extend Command]]
+  - [[#pomodoro-workrest-interval-weaving][Pomodoro Work/Rest Interval Weaving]]
 - [[#protected-daily-catch-up--slack-window][Protected Daily Catch-Up / Slack Window]]
 - [[#customization-reference][Customization Reference]]
   - [[#review-buffer-and-state-file-settings][Review Buffer & State-File Settings]]
@@ -71,7 +75,10 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Time & Energy Blocks:* Hard and soft constraints for context-based scheduling.
 - *Repeater / Habit Awareness:* Projects repeater occurrences into the conflict map.
 - *Recurring Task Generation:* Automatic sub-task creation for daily/weekly/monthly patterns.
-- *Agenda Bump:* Cascade-push today's schedule when a task runs overtime.
+- *Smart Bump Engine:* Push the current task and downstream agenda items forward by $N$ minutes, jumping cleanly over fixed meetings and rolling over at workday end.
+- *Early-Done Gap Pull:* Marking a task =DONE= early auto-pulls or prompts to pull upcoming tasks forward to close empty schedule gaps.
+- *Overrun Modeline & Extend:* Non-intrusive =[Overrun +Xm ⚠️]= mode line indicator when clocked tasks exceed schedule, paired with quick extend command (=C-c a e=).
+- *Task-Scoped Pomodoro Work & Break Intervals:* Explicit Pomodoro pacing (=:POMODORO: <work>:<break>=) splits demanding tasks into focused work intervals and weaves restful break gaps without creating fake dummy tasks. Non-Pomodoro tasks remain unaffected.
 
 ** Installation
 
@@ -199,7 +206,10 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-historical-insights=            | Show per-category effort-estimate accuracy multipliers.                                    |
 | =org-auto-scheduler-show-repeater-projections=      | Display projected repeater/habit occurrences.                                              |
 | =org-auto-scheduler-clear-repeater-cache=           | Invalidate the repeater-projections cache.                                                 |
-| =org-auto-scheduler-bump-agenda=                    | Push the agenda item at point and all subsequent AUTOSCH tasks forward by N minutes.       |
+| =org-auto-scheduler-bump-agenda=                    | Push the agenda item at point and subsequent AUTOSCH tasks forward with collision-aware repacking. |
+| =org-auto-scheduler-extend-current-task= ⭐          | Extend current task effort (default 15m) and repack downstream tasks (=C-c a e=).          |
+| =org-auto-scheduler-overrun-mode-line-enable=       | Enable subtle overrun indicator in the Emacs mode line.                                    |
+| =org-auto-scheduler-overrun-mode-line-disable=      | Disable overrun indicator in the mode line.                                                |
 | =org-auto-scheduler-cleanup-placeholders=           | Clean up temporary placeholder subtasks and migrate any clock lines to parent tasks.       |
 | =org-auto-scheduler-validate-config=                | Verify configuration consistency.                                                          |
 | =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
@@ -765,11 +775,70 @@ A task marked as =PINNED= is anchored to an exact designated time (=YYYY-MM-DD H
 - *Unpinning:* To unpin, press =C-u P= (or =C-u p=) or submit an empty string at the prompt. Displays the =📌 = badge in the review table.
 - *Properties & Tags:* Saved as property =:PINNED_TIME: YYYY-MM-DD HH:MM= and =:PINNED: t= (or tag =:pinned:=).
 
-** Agenda Bump
+** Dynamic Real-Time Adaptation & Execution
+<<dynamic-real-time-adaptation--execution>>
 
-While in the Org Agenda buffer, use =M-x org-auto-scheduler-bump-agenda= (prompted
-for minutes) to push the task at point *and every subsequent AUTOSCH task
-scheduled today* forward by that many minutes. Useful when a task runs over time.
+Org Auto Scheduler provides real-time, non-disruptive execution assistance that adapts gracefully when your workday drifts, tasks finish early, or focus sessions run long.
+
+*** Collision-Aware Smart Bump Engine
+<<collision-aware-smart-bump-engine>>
+
+Use =M-x org-auto-scheduler-bump-agenda= (or press =b= from the dispatch menu =C-c a d=) to push the task at point and all subsequent tasks forward by $N$ minutes.
+
+- *Meeting Jump:* Unlike naive time-shifting which risks pushing tasks directly into fixed calendar events, the smart bump engine detects conflicts with upcoming meetings and jumps over them cleanly.
+- *Catch-Up Window Respect:* The bumped tasks respect protected slack blocks and break intervals.
+- *End-of-Day Rollover:* Tasks that would exceed =org-auto-scheduler-end-time= gracefully roll over to the next available working day without cluttering your evening.
+
+*** Early-Done Gap Pull (Auto-Filling Freed Slots)
+<<early-done-gap-pull>>
+
+When you finish a task early and mark it =DONE= (or =DROPPED=):
+- *Threshold:* If the task was completed at least =org-auto-scheduler-early-done-threshold-minutes= (default 15 minutes) before its scheduled end, the scheduler can pull upcoming tasks forward to close the gap.
+- *Non-Intrusive Behavior:* Triggers strictly when explicitly marking a task =DONE= or =DROPPED= (never on early clock-outs or interruptions).
+- *Action Options (=org-auto-scheduler-early-done-action=):*
+  - ='prompt= (default): Asks in the minibuffer: =[p]ull upcoming tasks forward, [r]est / take a break, [k]eep schedule=.
+  - ='pull=: Automatically truncates the completed task and pulls upcoming tasks forward.
+  - ='keep=: Preserves the original schedule without prompting.
+
+*** Overrun Modeline Indicator & Quick Extend Command
+<<overrun-modeline-indicator--quick-extend-command>>
+
+When a task takes longer than expected, modal popup alerts are distracting. Org Auto Scheduler uses a subtle mode-line indicator and quick extend command:
+- *Mode-line Display:* While clocked into a task whose elapsed clocked time exceeds its scheduled end, the mode line displays a subtle indicator: =[Overrun +15m ⚠️]= in amber/warning face.
+- *Quick Extend (=C-c a e= / =M-x org-auto-scheduler-extend-current-task=):*
+  - Automatically targets the active clocked task (or task at point in Agenda/Org).
+  - Prompts for minutes to add (default: 15 min).
+  - Increments the task's =:Effort:= property and adjusts its scheduled end time.
+  - Automatically repacks and cascades downstream tasks forward to preserve collision-free scheduling.
+
+*** Task-Scoped Pomodoro Scheduling (:POMODORO: Work:Break)
+<<pomodoro-workrest-interval-weaving>>
+
+Long uninterrupted blocks of deep work lead to cognitive fatigue, yet global Pomodoro timers can be disruptive for ordinary short tasks. Org Auto Scheduler supports task-scoped Pomodoro intervals that apply *only* to tasks explicitly marked with the =:POMODORO:= property:
+
+- *Task Property Syntax:*
+  #+begin_src org
+  * TODO Write Deep Architecture Spec :AUTOSCH:
+    :PROPERTIES:
+    :Effort: 2:00
+    :POMODORO: 25:5
+    :END:
+  #+end_src
+  - The format is =<work_minutes>:<break_minutes>= (e.g. =25:5=, =50:10=, or =25 : 5=).
+  - If break minutes are omitted (e.g. =:POMODORO: 25=), the break defaults to =org-auto-scheduler-pomodoro-break-minutes=.
+
+- *Execution & Splitting Behavior:*
+  - *Large Effort Tasks (> Work Duration):* Automatically split into focused =work=-minute chunks separated by =break=-minute gaps. Subsequent intervals are managed as clean placeholder subtasks (e.g. =Headline (Pomodoro 2/N)=) with Org IDs preserved across runs.
+  - *Small Effort Tasks (<= Work Duration):* Scheduled in a single contiguous block, followed by the specified =break=-minute rest interval before downstream tasks begin.
+  - *Non-Pomodoro Tasks:* Tasks without the =:POMODORO:= property are *never* split by Pomodoro logic and follow your standard =org-auto-scheduler-task-gap=.
+
+- *Configuration:*
+  #+begin_src emacs-lisp
+  (setq org-auto-scheduler-pomodoro-enabled t)            ;; Enable task-scoped Pomodoro scheduling
+  (setq org-auto-scheduler-pomodoro-property "POMODORO")  ;; Org property name (supports inheritance)
+  (setq org-auto-scheduler-pomodoro-work-minutes 25)      ;; Default work duration when omitted
+  (setq org-auto-scheduler-pomodoro-break-minutes 5)      ;; Default break duration when omitted
+  #+end_src
 
 ** Protected Daily Catch-Up / Slack Window
 <<protected-daily-catchup--slack-window>>
@@ -974,6 +1043,18 @@ Backward-compatible aliases:
 | Variable                            | Default | Description                                                     |
 |-------------------------------------+---------+-----------------------------------------------------------------|
 | =org-auto-scheduler-sync-caldav=    | =t=     | Sync via =org-caldav= before and after applying a full schedule.|
+
+*** Real-Time Adaptation Settings
+
+| Variable                                         | Default     | Description                                                                                     |
+|--------------------------------------------------+-------------+-------------------------------------------------------------------------------------------------|
+| =org-auto-scheduler-early-done-action=           | ='prompt=   | Action on early =DONE=: ='prompt= (ask), ='pull= (auto-pull), or ='keep= (preserve schedule).    |
+| =org-auto-scheduler-early-done-threshold-minutes=| =15=        | Minimum early minutes before triggering gap pull.                                              |
+| =org-auto-scheduler-overrun-mode-line-enabled=    | =t=         | Show =[Overrun +Xm ⚠️]= indicator in Emacs mode line when active clock overruns scheduled time. |
+| =org-auto-scheduler-pomodoro-enabled=            | =t=         | Enable task-scoped Pomodoro interval scheduling for tasks with =:POMODORO:=.                    |
+| =org-auto-scheduler-pomodoro-property=           | ="POMODORO"=| Org headline property specifying task Pomodoro work:break intervals.                          |
+| =org-auto-scheduler-pomodoro-work-minutes=       | =25=        | Default continuous work duration in minutes if break or work is omitted.                     |
+| =org-auto-scheduler-pomodoro-break-minutes=      | =5=         | Default duration in minutes of rest breaks if omitted in task property.                       |
 
 *** Review Buffer & State-File Settings
 <<review-buffer-and-state-file-settings>>
