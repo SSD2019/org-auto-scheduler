@@ -32,7 +32,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#schedule-adherence-tracking][Schedule Adherence Tracking]]
 - [[#background-scheduling][Background Scheduling]]
   - [[#safe-schedule-preservation--smart-start-buffer][Safe Schedule Preservation & Smart Start Buffer]]
-  - [[#interactive-title-modifiers][Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -rsf-, -r-all-)]]
+  - [[#interactive-title-modifiers][Interactive Title Modifiers (-r-, -s-, -f-, -p-, -x-, -kill-, -e<dur>-, -+1d-, -#A-, -#B-, -#C-, -i-, -\i-)]]
   - [[#automatic-task-displacement][Automatic Displacement by Newly Added Tasks]]
   - [[#background-run-change-logging][Background Run Change Logging]]
 - [[#historical-effort-tracking][Historical Effort Tracking]]
@@ -40,6 +40,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#recurring-tasks][Recurring Tasks]]
 - [[#splittable-tasks--multi-day-placeholders][Splittable Tasks & Multi-Day Placeholders]]
 - [[#agenda-bump][Agenda Bump]]
+- [[#protected-daily-catch-up--slack-window][Protected Daily Catch-Up / Slack Window]]
 - [[#customization-reference][Customization Reference]]
   - [[#review-buffer-and-state-file-settings][Review Buffer & State-File Settings]]
   - [[#splittable-task-settings][Splittable Task Settings]]
@@ -59,8 +60,12 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
 - *Safe Schedule Preservation:* Tasks scheduled for today remain anchored and won't endlessly slide forward on background idle syncs.
-- *Interactive Mobile & CalDAV Title Modifiers:* Use quick title prefixes like =(-r-)=, =(-s-)=, =(-\s-)=, =(-f-)=, =(-\f-)=, =(-p-)=, =(-\p-)=, =(-rsf-)=, =(-rp-)=, =(-r\p-)=, =(-r\s-)=, or =(-r-all-)= to reschedule, pin/unpin to incoming time, toggle splitting, or toggle freeset from any mobile calendar without editing Org property drawers. Markers are automatically processed, applied, and stripped clean from the headline.
+- *Interactive Mobile & CalDAV Title Modifiers:* Use quick title prefixes like =(-r-)=, =(-s-)=, =(-\s-)=, =(-f-)=, =(-\f-)=, =(-p-)=, =(-\p-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-#A-)=, =(-#B-)=, =(-#C-)=, =(-i-)=, =(-\i-)=, or =(-r-all-)= to reschedule, set priority, make independent of siblings, pin/unpin, toggle splitting, or adjust effort from any mobile calendar without editing Org property drawers. Markers are automatically processed, applied, and stripped clean from the headline.
 - *Automatic Task Displacement:* Newly added unscheduled =AUTOSCH= tasks automatically take their place among upcoming unpinned tasks based on priority/score, while past (lapsed), current (in-progress), and pinned tasks remain strictly fixed.
+- *Critical Path Method (CPM) & Float Analysis:* Computes forward/backward passes ($LS - ES$) on task dependency DAGs to identify bottlenecks, applying a score boost (=⚡=) to critical path tasks.
+- *Soft Project Batching:* Heuristically clusters tasks from the currently active project within a score tolerance (default 15%) to eliminate jarring context switching.
+- *Smart Non-Blocking Title Regexp:* Automatically treats calendar events matching patterns like Lunch, Gym, Commute, OOO as non-blocking free time, with explicit =:NON_BLOCKING: nil= overrides.
+- *Protected Daily Catch-Up / Slack Window:* Configurable daily slack window (e.g. 16:00–17:00) that standard tasks skip over, while allowing lightweight =:FREESET: t= tasks to schedule into it.
 - *Smart Start Buffer:* 0-minute immediate scheduling when actively clocked into a task, and a 5-minute buffer when unclocked.
 - *Historical Effort Learning:* Learns from your actual vs. estimated times per category.
 - *Time & Energy Blocks:* Hard and soft constraints for context-based scheduling.
@@ -235,10 +240,35 @@ These properties go inside the task's =:PROPERTIES:= drawer.
 | =INHERITED_PRIORITY=      | Integer                                         | Adds a flat bonus to the task's priority score. Inherited from parent headings.    |
 | =PROJECT_PRIORITY=        | Integer                                         | Explicit priority for the whole project (set on the =:PROJECT:= heading).          |
 | =PROJECT_INTERLEAVE=      | =t= / =yes= / =nil= / =no=                     | Override interleaving policy for this project. Unset = use global default.         |
+| =ORDERED=                 | =t= / =yes= / =nil= / =no=                      | Sibling ordering policy on parent headings. When =nil= or =no=, subtasks are scheduled concurrently by score. |
+| =PARALLEL=                | =t= / =yes= / =nil= / =no=                      | Set on parent to schedule subtasks concurrently in parallel, or on an individual task to decouple it from siblings. |
+| =INDEPENDENT=             | =t= / =yes=                                     | Decouples this task from sibling outline sequencing chains, allowing it to schedule as soon as its score permits. |
+| =PROJECT_ORDERED=         | =t= / =yes= / =nil= / =no=                      | Project-wide default for whether subtasks under headings are sequential (=t=) or parallel (=nil=). |
+| =PROJECT_PARALLEL=        | =t= / =yes= / =nil= / =no=                      | Project-wide default to allow subtasks across the project to be scheduled concurrently in parallel (=t=). |
 
 *** Example
 
 #+begin_src org
+* Project Alpha :PROJECT:
+  :PROPERTIES:
+  :ID: proj-alpha-root
+  :END:
+
+** Architecture & Design
+   :PROPERTIES:
+   :ORDERED: nil    ; Siblings under this heading are scheduled concurrently by score, not outline order
+   :END:
+
+*** TODO [#A] High-Impact Core Architecture :AUTOSCH:
+    :PROPERTIES:
+    :Effort: 2:00
+    :END:
+
+*** TODO [#C] Background Research Docs :AUTOSCH:
+    :PROPERTIES:
+    :Effort: 1:00
+    :END:
+
 * TODO Deploy feature :AUTOSCH:
   :PROPERTIES:
   :NOT_BEFORE: <2026-04-01 Wed 10:00>
@@ -274,18 +304,27 @@ score = (effort × effort_weight)
 
 ** How Sorting Works
 
-Tasks are sorted with a *topological sort (Kahn's algorithm)* that respects:
+Tasks are sorted with an advanced DAG topological sort (Kahn's algorithm) augmented with *Critical Path Method (CPM) Float Analysis* and *Soft Project Batching*:
 
 1. Explicit =BLOCKER= / =DEPENDS_ON= edges — a task comes after its blockers.
 2. Implicit sibling ordering — tasks with the same parent inside the same project
-   keep their textual order.
+   keep their textual outline order by default (=org-auto-scheduler-siblings-sequential=).
+   Siblings can be scheduled concurrently in parallel (prioritized by score instead
+   of outline position) by setting =:ORDERED: nil= or =:PARALLEL: t= on the parent heading,
+   =:PROJECT_ORDERED: nil= on the project root, or =:INDEPENDENT: t= on a specific task.
 3. Project-level priority (=PROJECT_PRIORITY= property).
-4. Per-project interleaving:
+4. *Critical Path & Float Time Analysis (CPM):*
+   When =org-auto-scheduler-critical-path-enabled= is =t= (default), the scheduler performs a forward pass to compute Early Start (=ES=) and a backward DAG pass from project endpoints to compute Late Start (=LS=). The difference ($LS - ES$) gives the *Total Float* in hours. Tasks with zero or near-zero float ($\le$ =org-auto-scheduler-critical-path-max-float-hours=, default 0.5 hours) are critical bottlenecks whose delay would postpone the entire project chain. These tasks:
+   - Receive a substantial score boost (=org-auto-scheduler-critical-path-boost=, default =+50.0=) to schedule before non-critical tasks.
+   - Are marked with a =⚡= symbol in the scheduling reports and review buffer.
+5. *Project Batching / Context-Switch Affinity:*
+   When multiple unblocked tasks are available across different projects, the scheduler prefers tasks matching the currently active project if their score is within =org-auto-scheduler-project-batching-tolerance= (default =0.15= / 15%) of the top-scoring task. This prevents rapid ping-pong context switching between unrelated projects while still respecting significant priority differences and deadlines.
+6. Per-project interleaving:
    - When interleaving is *on* (default), tasks from different projects are
-     merged by individual score.
+     merged by score and project batching tolerance.
    - When interleaving is *off*, projects are scheduled as contiguous blocks,
      ordered by each project's *maximum task score*.
-5. Individual score as the final tiebreaker.
+7. Individual score as the final tiebreaker.
 
 Circular dependencies are detected; cyclic tasks are appended at the end with
 a depth marker of 99 as a warning signal.
@@ -339,6 +378,15 @@ By default, existing scheduled tasks or timestamps in your agenda files that do 
 - You can toggle showing or hiding these events in the review buffer by pressing =E=.
 - *Blocking Events (=🔒=):* By default, fixed events block auto-scheduler slots. No tasks will be placed during their scheduled window.
 - *Non-Blocking Events:* Many calendar events (such as all-hands meetings, webinars, optional office hours, or background listening sessions) do not require exclusive focus. Marking an event as *non-blocking* tells the scheduler that this time slot remains available for scheduling work.
+
+**** Smart Auto-Detection via Title Regexp:
+Calendar entries with titles matching =org-auto-scheduler-auto-non-blocking-regexp= are automatically treated as non-blocking without requiring any manual tagging or properties:
+#+begin_src emacs-lisp
+;; Default regexp matches common personal and tentative calendar blocks:
+(setq org-auto-scheduler-auto-non-blocking-regexp
+      "\\b\\(?:Lunch\\|Dinner\\|Gym\\|Workout\\|Tentative\\|OOO\\|Out of Office\\|Commute\\|Travel\\|Break\\)\\b")
+#+end_src
+- *Explicit Override (=:NON_BLOCKING: nil=):* If you have a calendar meeting that matches the regexp but *must* be treated as strictly blocking (e.g. an important "Working Lunch" or "Client Dinner"), simply add =:NON_BLOCKING: nil= (or =no=, =false=, =0=) to the heading's property drawer. Explicit property values always override title heuristics.
 
 **** How to Toggle Non-Blocking Status:
 - *In the Review Buffer:* Move point to the fixed event row and press =b= (or =SPC= / =m=). The lock icon =🔒= is removed and =[NB]= is appended to the project tag.
@@ -521,7 +569,7 @@ Org Auto Scheduler solves this with *Safe Preservation* (=org-auto-scheduler-pre
   - If *not clocked in*: adds *5 minutes* buffer (=org-auto-scheduler-start-buffer-minutes=).
 - *Force Full Replan:* If you ever want to completely wipe and recalculate today's schedule from scratch, call =C-u M-x org-auto-scheduler-schedule-tasks= (or prefix =C-u= with your keybinding).
 
-*** Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -rsf-, -r-all-)
+*** Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -x-, -kill-, -e<dur>-, -+1d-, -#A-, -#B-, -#C-, -i-, -\i-)
 <<interactive-title-modifiers>>
 
 When syncing with mobile calendar apps (via =org-caldav=, Google Calendar, or Nextcloud), you often need to reschedule or modify a task directly from your phone without opening Org property drawers.
@@ -537,7 +585,17 @@ You can add lightweight modifier markers directly to the task title in any calen
 | =-\f-= or =(-\f-)= | *Remove Freeset* | Unsets the =FREESET= behavior (deletes =:FREESET:= and =:PINNABLE:= properties and removes tags). |
 | =-p-= or =(-p-)= | *Pin Task* | Pins the task to the incoming/updated scheduled time (sets =:PINNED: t=, records =:PINNED_TIME:=, adds =:PINNED:= tag), locking it from being moved. |
 | =-\p-= or =(-\p-)= | *Unpin Task* | Unpins the task (deletes =:PINNED:= and =:PINNED_TIME:= properties, removes =:PINNED:= tag), allowing the scheduler to freely reschedule it. |
-| Combinations | *Multi-Modifier* | Any permutation in any order (e.g. =(-rs-)=, =(-rp-)=, =(-r\p-)=, =(-sfr-)=, =(-\s\f-)=, =(-p\s-)=, =-fr-=). Order does not matter! |
+| =-x-= or =(-x-)= or =(-done-)= | *Mark DONE* | Immediately completes the task (sets TODO state to =DONE=, removes =AUTOSCH_SCHEDULED= and scheduled timestamp), freeing subsequent time slots. |
+| =-kill-=, =(-kill-)=, =(-drop-)=, =(-c-)= | *Cancel / Drop Task* | Cancels the task with the configured kill state (default =DROPPED=, customizable via =org-auto-scheduler-kill-todo-state=), removing its schedule. |
+| =-e<dur>-= (e.g. =(-e30m-)=, =(-e1h-)=, =(-e1:30-)=) | *Update Effort* | Updates the task's =:Effort:= property in place (e.g. =00:30=, =01:00=, =01:30=) and reschedules with the new duration. |
+| =-+1d-= or =(-+1d-)= or =(-defer-)= | *Defer to Tomorrow* | Postpones the task to tomorrow (removes today's scheduled timestamp and sets =:NOT_BEFORE:= to tomorrow morning). |
+| =-#A-=, =(-#A-)=, =(-#a-)=, =(-pri-a-)=, =(-!a-)= | *Set Priority A* | Sets Org task priority to =A= (=org-priority ?A=) and triggers a reschedule. |
+| =-#B-=, =(-#B-)=, =(-#b-)=, =(-pri-b-)=, =(-!b-)= | *Set Priority B* | Sets Org task priority to =B= (=org-priority ?B=) and triggers a reschedule. |
+| =-#C-=, =(-#C-)=, =(-#c-)=, =(-pri-c-)=, =(-!c-)= | *Set Priority C* | Sets Org task priority to =C= (=org-priority ?C=) and triggers a reschedule. |
+| =-\#-=, =(-\!-)=, =(-pri-none-)= | *Clear Priority* | Removes the priority cookie from the task heading. |
+| =-i-= or =(-i-)= or =(-indep-)= | *Independent of Siblings* | Decouples the task from sequential outline sibling chains (sets =:INDEPENDENT: t= property and =:INDEPENDENT:= tag), allowing it to schedule as soon as its score permits. Triggers a reschedule. |
+| =-\i-= or =(-\i-)= or =(-\indep-)= | *Remove Independent* | Restores outline sibling sequencing (removes =:INDEPENDENT:= and =:PARALLEL:= properties and tags). |
+| Combinations | *Multi-Modifier* | Any permutation in any order (e.g. =(-#A-i-)=, =(-i#a-)=, =(-rs-)=, =(-rp-)=, =(-r\p-)=, =(-rx-)=, =(-r-kill-)=, =(-re45m-)=, =(-sfr-)=, =(-\s\f-)=, =(-p\s-)=, =-fr-=). Order does not matter! |
 | =-r-all-= or =(-r-all-)= | *Reschedule All Overdue* | Triggers a cascade reschedule of all overdue tasks today forward into available time slots. |
 
 *Automatic Heading Cleanup:*
@@ -713,6 +771,18 @@ While in the Org Agenda buffer, use =M-x org-auto-scheduler-bump-agenda= (prompt
 for minutes) to push the task at point *and every subsequent AUTOSCH task
 scheduled today* forward by that many minutes. Useful when a task runs over time.
 
+** Protected Daily Catch-Up / Slack Window
+<<protected-daily-catchup--slack-window>>
+
+To protect against afternoon schedule compression, unplanned meetings, and task overruns, Org Auto Scheduler provides a configurable protected daily slack window via =org-auto-scheduler-daily-catchup-block=.
+
+- *Configuration:* Set to a cons cell representing daily start and end times, or =nil= to disable:
+  #+begin_src emacs-lisp
+  (setq org-auto-scheduler-daily-catchup-block '("16:00" . "17:00"))
+  #+end_src
+- *Protected Slack Buffer:* Standard autoscheduled tasks treat this time window as strictly unavailable, automatically jumping over it to subsequent open slots or rolling over to the next morning.
+- *Flexible Task Exception (=:FREESET: t=):* Tasks marked with =:FREESET: t= (or tagged =:FREESET:=) are allowed to schedule into this catch-up window. This makes the block perfect for lightweight end-of-day email triage, inbox zero, or daily planning tasks.
+
 ** Customization Reference
 
 Access all options via =M-x customize-group RET org-auto-scheduler=.
@@ -726,6 +796,7 @@ Access all options via =M-x customize-group RET org-auto-scheduler=.
 | =org-auto-scheduler-excluded-days=   | ='()=      | Day-of-week integers to skip (0 = Sun … 6 = Sat).                          |
 | =org-auto-scheduler-time-interval=   | =15=       | Slot granularity in minutes (for collision scanning).                       |
 | =org-auto-scheduler-task-gap=        | =5=        | Minimum gap in minutes between consecutive tasks.                           |
+| =org-auto-scheduler-daily-catchup-block= | =nil=   | Daily protected catch-up slack window (e.g. '("16:00" . "17:00")) skipped by regular tasks. |
 | =org-auto-scheduler-max-days-to-check= | =14=     | How many days ahead to search for a free slot.                              |
 | =org-auto-scheduler-default-task-duration= | =60= | Fallback duration (minutes) when a task has no =Effort= property.           |
 
@@ -797,9 +868,17 @@ Same format as time blocks, but these are preferences, not hard constraints.
 
 | Variable                                  | Default                | Description                                                             |
 |-------------------------------------------+------------------------+-------------------------------------------------------------------------|
+| =org-auto-scheduler-siblings-sequential=  | =t=                    | When =t= (default), subtasks under the same parent schedule sequentially in outline order unless marked parallel. |
+| =org-auto-scheduler-ordered-property=     | ="ORDERED"=            | Heading property for sequence ordering (matches Org's built-in =:ORDERED:= property). |
+| =org-auto-scheduler-parallel-property=    | ="PARALLEL"=           | Property name on parent headings or tasks to enable parallel / concurrent scheduling. |
+| =org-auto-scheduler-independent-property= | ="INDEPENDENT"=        | Property name to mark an individual task as independent from its siblings. |
 | =org-auto-scheduler-interleave-projects=   | =t=                    | When =t=, tasks from different projects interleave by score.            |
 | =org-auto-scheduler-project-interleave-property= | ="PROJECT_INTERLEAVE"= | Property name on =:PROJECT:= headings to override the global default.  |
 | =org-auto-scheduler-project-priority-property=   | ="PROJECT_PRIORITY"=  | Property name for an explicit numeric project priority.                 |
+| =org-auto-scheduler-project-batching-tolerance=  | =0.15=                 | Score tolerance (15%) within which tasks from the active project are batched together. |
+| =org-auto-scheduler-critical-path-enabled=       | =t=                    | When non-nil, perform forward/backward DAG float analysis for critical paths. |
+| =org-auto-scheduler-critical-path-boost=         | =50.0=                 | Score boost added to critical path tasks (zero or low float).           |
+| =org-auto-scheduler-critical-path-max-float-hours= | =0.5=               | Max total float in hours for a task to be classified on the critical path. |
 
 *** Dependency Properties
 
@@ -877,7 +956,8 @@ Backward-compatible aliases:
 | =org-auto-scheduler-background-pause-on-clock= | =nil=   | When =t=, pause background scheduling while clocked into a task.               |
 | =org-auto-scheduler-preserve-today-scheduled= | =t=     | When non-nil, keep today's scheduled tasks stable during background sync unless triggered by -r- or new tasks. |
 | =org-auto-scheduler-start-buffer-minutes=     | =5=     | Buffer minutes added to current time when starting task scheduling (0 min when clocked in). |
-| =org-auto-scheduler-title-marker-regex=       | ="\\(?:(\\s-*\\)?-\\(r-all\\|[rRsSfF]+\\)-\\(?:\\s-*)\\)?"= | Regular expression for matching title-based modifiers like =(-r-)=, =(-sfr-)=, =(-r-all-)=. |
+| =org-auto-scheduler-title-marker-regex=       | Tokenized expression | Regular expression matching title modifiers like =(-r-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-sfr-)=. |
+| =org-auto-scheduler-kill-todo-state=          | ="DROPPED"= | TODO state applied when a task contains the =(-kill-)=, =(-c-)=, or =(-drop-)= title marker. |
 | =org-auto-scheduler-allowed-hostnames=        | =nil=   | List of hostnames allowed to run background scheduling. =nil= = any machine.   |
 | =org-auto-scheduler-silent-mode=              | =nil=   | When =t=, suppress report buffer creation and display.                         |
 | =org-auto-scheduler-change-log-enabled=       | =t=     | Log task modifications executed during background runs.                        |
@@ -908,6 +988,7 @@ Backward-compatible aliases:
 | =org-auto-scheduler-target-date-property=       | ="AUTOSCH_TARGET_DATE"=                         | Org property name for task target date overrides when using Org properties backend.            |
 | =org-auto-scheduler-non-blocking-property=      | ="AUTOSCH_NON_BLOCKING"=                        | Headline property name for non-blocking calendar tasks (="t"=, ="yes"=, ="true"=, ="1"=).        |
 | =org-auto-scheduler-non-blocking-backend=       | ='both=                                         | Storage backend for non-blocking status: ='both=, ='state-file=, or ='org-properties=.          |
+| =org-auto-scheduler-auto-non-blocking-regexp=   | Tokenized regex                                 | Regexp matching calendar event titles auto-detected as non-blocking free time.   |
 | =org-auto-scheduler-review-show-agenda-events=  | =t=                                             | Display existing fixed calendar/agenda events in the review buffer.                            |
 | =org-auto-scheduler-review-compact-schedule=    | =t=                                             | When non-nil, recalculation auto-compacts tasks into earlier available slots across days.       |
 | =org-auto-scheduler-review-dim-future-days=     | =nil=                                           | When non-nil, dims tasks on future days using shadow face (=nil= keeps vibrant colors).         |
