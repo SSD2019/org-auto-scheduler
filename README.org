@@ -565,7 +565,7 @@ Org Auto Scheduler includes an automatic *Change Log* that captures every modifi
 - *Dual Storage (Buffer + Persistent File):*
   - Buffer: =*Org Auto Scheduler Changes*= (accessible anytime via =M-x org-auto-scheduler-show-change-log= or pressing =L= in the Review buffer).
   - Persistent File: =~/.emacs.d/org-auto-scheduler-changes.org= (persists across Emacs sessions).
-- *Noise-Free by Default:* Runs that make zero changes are omitted by default (=org-auto-scheduler-change-log-record-empty= is =nil=) so your log never gets filled with idle clutter.
+- *Noise-Free & Collated:* Runs that make zero changes are omitted by default (=org-auto-scheduler-change-log-record-empty= is =nil=). When enabled (=t=), consecutive background runs with no changes are cleanly collated into the same node with timestamped bullet points (=org-auto-scheduler-change-log-collate-empty=, default =t=), preventing log bloat while preserving execution heartbeats.
 - *Echo Notification:* When changes occur, Emacs briefly alerts you in the echo area: =Org Auto Scheduler [background]: 2 task(s) updated. [M-x org-auto-scheduler-show-change-log]=.
 - *Automatic File Saving:* Modified Org agenda files are automatically saved to disk when background changes occur (=org-auto-scheduler-background-save-buffers=, default =t=).
 
@@ -883,6 +883,7 @@ Backward-compatible aliases:
 | =org-auto-scheduler-change-log-enabled=       | =t=     | Log task modifications executed during background runs.                        |
 | =org-auto-scheduler-change-log-file=          | =~/.emacs.d/org-auto-scheduler-changes.org= | Persistent file for background changes log (=nil= for buffer-only). |
 | =org-auto-scheduler-change-log-record-empty=  | =nil=   | When =t=, log runs even when 0 tasks changed (=nil= logs only actual changes). |
+| =org-auto-scheduler-change-log-collate-empty= | =t=     | When =t=, collate consecutive 0-change background runs into the same node with timestamped bullets. |
 | =org-auto-scheduler-change-log-background-only= | =t=   | When =t=, log background runs only; =nil= also logs manual runs.               |
 | =org-auto-scheduler-change-log-notify=         | =t=     | Display an echo area message when a background run updates tasks.              |
 | =org-auto-scheduler-change-log-max-entries=   | =200=   | Maximum number of run entries retained before older entries are pruned.        |

@@ -394,6 +394,13 @@ or split tasks will be recorded, keeping the log concise and noise-free."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-change-log-collate-empty t
+  "When non-nil, collate consecutive background runs with no changes into a single node.
+Each 0-change run is appended as a timestamped bullet point under the existing
+node instead of creating a new top-level heading every run."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-change-log-background-only t
   "When non-nil, only background scheduler runs are recorded to the change log.
 When nil, manual scheduling runs are also recorded."
@@ -4985,6 +4992,183 @@ CHANGES is a list of change plists."
           (write-region (point-min) (point-max) file nil 'silent))
       (error nil))))
 
+(defconst org-auto-scheduler--change-log-no-changes-re
+  (rx bol "* ["
+      (group (= 4 digit) "-" (= 2 digit) "-" (= 2 digit))
+      (zero-or-more (not (any "]"))) "]"
+      (one-or-more (any " \t"))
+      "Background Run"
+      (zero-or-more (not (any ":")))
+      ": No changes")
+  "Regular expression matching top-level background run headings with no changes.")
+
+(defconst org-auto-scheduler--change-log-header-runs-re
+  (rx bol "* "
+      (group "[" (= 4 digit) "-" (= 2 digit) "-" (= 2 digit)
+             (zero-or-more (not (any "]"))) "]"
+             (one-or-more (any " \t"))
+             "Background Run"
+             (zero-or-more (not (any ":")))
+             ": No changes")
+      (opt (one-or-more (any " \t")) "(" (one-or-more (not (any ")"))) ")")
+      eol)
+  "Regular expression matching background run heading to update run count suffix.")
+
+(defconst org-auto-scheduler--change-log-time-re
+  (rx "[" (= 4 digit) "-" (= 2 digit) "-" (= 2 digit)
+      (zero-or-more (not (any "]")))
+      (one-or-more (any " \t"))
+      (group (= 2 digit) ":" (= 2 digit) ":" (= 2 digit))
+      "]")
+  "Regular expression matching time component inside an inactive Org timestamp.")
+
+(defun org-auto-scheduler--collate-or-append-no-changes-in-buffer (buf run-info)
+  "In buffer BUF, collate RUN-INFO into the last 'No changes' heading or create a new one."
+  (with-current-buffer buf
+    (unless (derived-mode-p 'org-mode)
+      (org-mode))
+    (when (= (buffer-size) 0)
+      (insert "#+TITLE: Org Auto Scheduler Changes Log\n#+STARTUP: showeverything\n\n"))
+    (let* ((run-type (plist-get run-info :run-type))
+           (start-time (or (plist-get run-info :start-time) (current-time)))
+           (end-time (or (plist-get run-info :end-time) (current-time)))
+           (duration (float-time (time-subtract end-time start-time)))
+           (tasks-eval (or (plist-get run-info :tasks-evaluated) 0))
+           (cleaned-ph (or (plist-get run-info :cleaned-placeholders) 0))
+           (time-str (format-time-string "%Y-%m-%d %a %H:%M:%S" start-time))
+           (target-date (format-time-string "%Y-%m-%d" start-time))
+           (time-bullet (format-time-string "%H:%M:%S" start-time))
+           (run-label (cond
+                       ((eq run-type 'background-async) "Background Run (Async)")
+                       ((eq run-type 'background-sync) "Background Run (Sync)")
+                       (t "Background Run")))
+           (bullet-text (if (> cleaned-ph 0)
+                            (format "- [%s] No changes (%d task(s) evaluated, %d placeholder(s) cleaned, %.2fs)"
+                                    time-bullet tasks-eval cleaned-ph duration)
+                          (format "- [%s] No changes (%d task(s) evaluated, %.2fs)"
+                                  time-bullet tasks-eval duration)))
+           (collated-heading-pos nil))
+      (when org-auto-scheduler-change-log-collate-empty
+        (save-excursion
+          (goto-char (point-max))
+          (when (re-search-backward "^\\* " nil t)
+            (let ((hpos (point)))
+              (when (looking-at org-auto-scheduler--change-log-no-changes-re)
+                (let ((hdate (match-string 1)))
+                  (when (string= hdate target-date)
+                    (setq collated-heading-pos hpos))))))))
+
+      (if collated-heading-pos
+          (save-excursion
+            (goto-char collated-heading-pos)
+            (let* ((heading-line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+                   (next-heading (save-excursion
+                                   (forward-line 1)
+                                   (if (re-search-forward "^\\* " nil t)
+                                       (match-beginning 0)
+                                     (point-max))))
+                   (has-bullets (save-excursion
+                                  (re-search-forward "^- \\[" next-heading t))))
+              ;; If existing node had no bullet points (legacy format), add bullet for the first run
+              (unless has-bullets
+                (let ((first-time
+                       (when (string-match org-auto-scheduler--change-log-time-re heading-line)
+                         (match-string 1 heading-line)))
+                      (first-tasks
+                       (or (org-entry-get (point) "TASKS_EVALUATED")
+                           (number-to-string tasks-eval)))
+                      (first-dur
+                       (or (org-entry-get (point) "DURATION")
+                           "0.00s")))
+                  (when first-time
+                    (goto-char collated-heading-pos)
+                    (if (re-search-forward "^:END:" next-heading t)
+                        (forward-line 1)
+                      (forward-line 1))
+                    (unless (bolp) (insert "\n"))
+                    (insert (format "\n- [%s] No changes (%s task(s) evaluated, %s)\n"
+                                    first-time first-tasks first-dur)))))
+
+              ;; Count existing bullets
+              (goto-char collated-heading-pos)
+              (setq next-heading (save-excursion
+                                   (forward-line 1)
+                                   (if (re-search-forward "^\\* " nil t)
+                                       (match-beginning 0)
+                                     (point-max))))
+              (let ((bullet-count 0))
+                (save-excursion
+                  (while (re-search-forward "^- \\[" next-heading t)
+                    (setq bullet-count (1+ bullet-count))))
+                (let ((total-runs (1+ bullet-count)))
+                  (goto-char collated-heading-pos)
+                  (when (looking-at org-auto-scheduler--change-log-header-runs-re)
+                    (replace-match (format "* \\1 (%d runs)" total-runs)))
+                  (org-entry-put (point) "LAST_RUN" time-str)
+                  (org-entry-put (point) "TOTAL_RUNS" (number-to-string total-runs))))
+
+              ;; Insert bullet at the end of this node (before next heading or point-max)
+              (goto-char collated-heading-pos)
+              (forward-line 1)
+              (let ((entry-end (if (re-search-forward "^\\* " nil t)
+                                   (match-beginning 0)
+                                 (point-max))))
+                (goto-char entry-end)
+                (skip-chars-backward "\n\r \t")
+                (forward-line 1)
+                (insert bullet-text "\n"))))
+
+        ;; New node
+        (let ((entry-lines
+               (list (format "* [%s] %s: No changes" time-str run-label)
+                     ":PROPERTIES:"
+                     (format ":RUN_TYPE: %s" (or run-type 'background))
+                     (format ":TASKS_EVALUATED: %d" tasks-eval)
+                     ":TASKS_CHANGED: 0"
+                     (format ":PLACEHOLDERS_CLEANED: %d" cleaned-ph)
+                     (format ":DURATION: %.2fs" duration)
+                     (format ":LAST_RUN: %s" time-str)
+                     ":TOTAL_RUNS: 1"
+                     ":END:\n"
+                     bullet-text)))
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (insert (mapconcat #'identity entry-lines "\n") "\n"))))))
+
+(defun org-auto-scheduler--collate-empty-change-log (run-info)
+  "Collate empty background RUN-INFO into change log buffer and persistent file."
+  ;; 1. Update buffer
+  (let ((buf (get-buffer-create org-auto-scheduler-change-log-buffer-name)))
+    (with-current-buffer buf
+      (when (and (= (buffer-size) 0)
+                 org-auto-scheduler-change-log-file
+                 (file-exists-p org-auto-scheduler-change-log-file))
+        (insert-file-contents org-auto-scheduler-change-log-file))
+      (org-auto-scheduler--collate-or-append-no-changes-in-buffer buf run-info)
+      (org-auto-scheduler--prune-change-log-buffer buf org-auto-scheduler-change-log-max-entries)))
+  ;; 2. Update persistent file
+  (when (and org-auto-scheduler-change-log-file
+             (stringp org-auto-scheduler-change-log-file))
+    (condition-case err
+        (let ((file-dir (file-name-directory org-auto-scheduler-change-log-file)))
+          (when (and file-dir (not (file-directory-p file-dir)))
+            (make-directory file-dir t))
+          (let ((visiting-buf (find-buffer-visiting org-auto-scheduler-change-log-file)))
+            (if (and visiting-buf (buffer-live-p visiting-buf))
+                (with-current-buffer visiting-buf
+                  (org-auto-scheduler--collate-or-append-no-changes-in-buffer visiting-buf run-info)
+                  (org-auto-scheduler--prune-change-log-buffer visiting-buf org-auto-scheduler-change-log-max-entries)
+                  (save-buffer))
+              (with-temp-buffer
+                (when (file-exists-p org-auto-scheduler-change-log-file)
+                  (insert-file-contents org-auto-scheduler-change-log-file))
+                (org-auto-scheduler--collate-or-append-no-changes-in-buffer (current-buffer) run-info)
+                (org-auto-scheduler--prune-change-log-buffer (current-buffer) org-auto-scheduler-change-log-max-entries)
+                (write-region (point-min) (point-max) org-auto-scheduler-change-log-file nil 'silent)))))
+      (error
+       (org-auto-scheduler--log-warn "Failed to write change log file %s: %s"
+                                     org-auto-scheduler-change-log-file err)))))
+
 (defun org-auto-scheduler--append-change-log (entry-text)
   "Append ENTRY-TEXT to the change log buffer and persistent file."
   ;; 1. Update buffer
@@ -4992,15 +5176,14 @@ CHANGES is a list of change plists."
     (with-current-buffer buf
       (unless (derived-mode-p 'org-mode)
         (org-mode)
-        (insert "#+TITLE: Org Auto Scheduler Changes Log
-#+STARTUP: showeverything
-
-"))
+        (insert "#+TITLE: Org Auto Scheduler Changes Log\n#+STARTUP: showeverything\n\n"))
+      (when (and (= (buffer-size) 0)
+                 org-auto-scheduler-change-log-file
+                 (file-exists-p org-auto-scheduler-change-log-file))
+        (insert-file-contents org-auto-scheduler-change-log-file))
       (goto-char (point-max))
-      (unless (bolp) (insert "
-"))
-      (insert entry-text "
-")
+      (unless (bolp) (insert "\n"))
+      (insert entry-text "\n")
       (org-auto-scheduler--prune-change-log-buffer buf org-auto-scheduler-change-log-max-entries)))
   ;; 2. Update persistent file
   (when (and org-auto-scheduler-change-log-file
@@ -5012,12 +5195,8 @@ CHANGES is a list of change plists."
           (let ((need-header (not (file-exists-p org-auto-scheduler-change-log-file))))
             (with-temp-buffer
               (when need-header
-                (insert "#+TITLE: Org Auto Scheduler Changes Log
-#+STARTUP: showeverything
-
-"))
-              (insert entry-text "
-")
+                (insert "#+TITLE: Org Auto Scheduler Changes Log\n#+STARTUP: showeverything\n\n"))
+              (insert entry-text "\n")
               (write-region (point-min) (point-max) org-auto-scheduler-change-log-file t 'silent)))
           (org-auto-scheduler--prune-change-log-file
            org-auto-scheduler-change-log-file
@@ -5031,10 +5210,16 @@ CHANGES is a list of change plists."
 RUN-INFO is a plist containing :run-type, :start-time, :end-time,
 :tasks-evaluated, :changes, :cleaned-placeholders."
   (let* ((changes (plist-get run-info :changes))
-         (has-changes (> (length changes) 0)))
+         (has-changes (> (length changes) 0))
+         (run-type (plist-get run-info :run-type))
+         (is-background (memq run-type '(background-async background-sync background))))
     (when (or has-changes org-auto-scheduler-change-log-record-empty)
-      (let ((entry-text (org-auto-scheduler--format-change-log-entry run-info changes)))
-        (org-auto-scheduler--append-change-log entry-text)))))
+      (if (and (not has-changes)
+               is-background
+               org-auto-scheduler-change-log-collate-empty)
+          (org-auto-scheduler--collate-empty-change-log run-info)
+        (let ((entry-text (org-auto-scheduler--format-change-log-entry run-info changes)))
+          (org-auto-scheduler--append-change-log entry-text))))))
 
 (defun org-auto-scheduler--record-run-error (&rest err-info)
   "Record an error encountered during a scheduler run.
