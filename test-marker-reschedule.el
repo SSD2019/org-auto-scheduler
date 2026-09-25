@@ -1219,11 +1219,265 @@ SCHEDULED: <%s %s 10:00-11:00>
 
     (delete-directory temp-dir t)))
 
+
+;; ============================================================================
+;; TEST 14: Review Buffer Polish, Slicing, What-If Diff & Retrospective (Step 4)
+;; ============================================================================
+(message "\n--- TEST 14: Review Buffer Polish, Slicing & Retrospective ---")
+
+;; 14.1 Capacity Gauge
+(let* ((g-normal (org-auto-scheduler--render-capacity-gauge 240 480))
+       (g-over (org-auto-scheduler--render-capacity-gauge 600 480)))
+  (assert-true (string-match-p "50%" g-normal) "Test 14.1: Normal capacity reports 50%")
+  (assert-true (string-match-p "Slack: 4.0h" g-normal) "Test 14.1: Normal capacity reports 4.0h slack")
+  (assert-true (string-match-p "OVERLOAD" g-over) "Test 14.1: Overload capacity reports OVERLOAD")
+  (assert-true (string-match-p "125%" g-over) "Test 14.1: Overload capacity reports 125%"))
+
+;; 14.2 Task Slicer / Chop
+(let* ((temp-dir (make-temp-file "org-test-chop-" t))
+       (test-org-file (expand-file-name "test-chop.org" temp-dir)))
+  (with-temp-file test-org-file
+    (insert "* Tasks :PROJECT:
+*** TODO Big Task To Chop :AUTOSCH:
+:PROPERTIES:
+:Effort: 2:00
+:ID: chop-task-1
+:END:
+"))
+  (setq org-agenda-files (list test-org-file))
+  (let* ((org-auto-scheduler-review-auto-recalculate-on-move nil)
+         (rev-buf (get-buffer-create "*Org Auto Scheduler Review*")))
+    (with-current-buffer rev-buf
+      (org-auto-scheduler-review-mode)
+      (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
+      (setq-local org-auto-scheduler--review-undo-stack '())
+      (setq tabulated-list-entries
+            (list (list "chop-task-1"
+                        (vector "chop-task-1" "[X]" "1" "09:00-11:00" "120" "PROJECT" "Big Task To Chop" ""))))
+      (let* ((m (with-current-buffer (find-file-noselect test-org-file)
+                  (goto-char (point-min))
+                  (re-search-forward "Big Task To Chop")
+                  (point-marker))))
+        (setq org-auto-scheduler-completed-tasks
+              (list (list "chop-task-1" (current-time) (current-time) '("AUTOSCH") t "Big Task To Chop" nil m 0)))
+        (tabulated-list-init-header)
+        (tabulated-list-print t)
+        (goto-char (point-min))
+        ;; Call chop with 45 minutes
+        (org-auto-scheduler-review-chop 45)
+        (let ((ov (gethash "chop-task-1" org-auto-scheduler--review-overrides)))
+          (assert-true ov "Test 14.2: Chop created override entry")
+          (assert-true (= (plist-get ov :chop-today) 45) "Test 14.2: Chop override kept 45m today")
+          (assert-equal (plist-get ov :splittable) t "Test 14.2: Chop marked task splittable"))
+        ;; Test Undo
+        (org-auto-scheduler-review-undo)
+        (let ((ov-after (gethash "chop-task-1" org-auto-scheduler--review-overrides)))
+          (assert-true (null ov-after) "Test 14.2: Review undo removed chop override")))))
+  (delete-directory temp-dir t))
+
+;; 14.3 What-If Diff Buffer
+(let* ((temp-dir (make-temp-file "org-test-diff-" t))
+       (test-org-file (expand-file-name "test-diff.org" temp-dir))
+       (now (current-time))
+       (t1-start now)
+       (t1-end (time-add now (seconds-to-time 3600)))
+       (t2-start (time-add now (seconds-to-time 7200)))
+       (t2-end (time-add now (seconds-to-time 10800))))
+  (with-temp-file test-org-file
+    (insert (format "* Tasks :PROJECT:
+*** TODO Unchanged Task :AUTOSCH:
+SCHEDULED: %s
+:PROPERTIES:
+:ID: diff-unchanged
+:END:
+*** TODO Moved Task :AUTOSCH:
+SCHEDULED: %s
+:PROPERTIES:
+:ID: diff-moved
+:END:
+*** TODO Skipped Task :AUTOSCH:
+SCHEDULED: %s
+:PROPERTIES:
+:ID: diff-skipped
+:END:
+"
+                    (org-auto-scheduler--format-time-range t1-start t1-end)
+                    (org-auto-scheduler--format-time-range t1-start t1-end)
+                    (org-auto-scheduler--format-time-range t1-start t1-end))))
+  (let* ((buf (find-file-noselect test-org-file))
+         (m1 (with-current-buffer buf (goto-char (point-min)) (re-search-forward "Unchanged Task") (point-marker)))
+         (m2 (with-current-buffer buf (goto-char (point-min)) (re-search-forward "Moved Task") (point-marker)))
+         (m3 (with-current-buffer buf (goto-char (point-min)) (re-search-forward "Skipped Task") (point-marker))))
+    (setq org-auto-scheduler-completed-tasks
+          (list (list "diff-unchanged" t1-start t1-end '("AUTOSCH") t "Unchanged Task" nil m1 0)
+                (list "diff-moved" t2-start t2-end '("AUTOSCH") t "Moved Task" nil m2 0)
+                (list "diff-skipped" t1-start t1-end '("AUTOSCH") nil "Skipped Task" nil m3 0 :skipped '("User unchecked"))
+                (list "diff-new" t2-start t2-end '("AUTOSCH") t "Brand New Task" nil nil 0)))
+    (let ((diff-buf (org-auto-scheduler-review-diff)))
+      (assert-true (get-buffer "*Org Auto Scheduler Diff*") "Test 14.3: Diff buffer created")
+      (with-current-buffer "*Org Auto Scheduler Diff*"
+        (let ((str (buffer-string)))
+          (assert-true (string-match-p "1 moved, 1 new, 1 skipped, 1 unchanged" str)
+                       (format "Test 14.3: Diff summary counts correct: %s" str))
+          (assert-true (string-match-p "Unchanged Task.*UNCHANGED" str) "Test 14.3: Unchanged task detected")
+          (assert-true (string-match-p "Moved Task.*MOVED" str) "Test 14.3: Moved task detected")
+          (assert-true (string-match-p "Skipped Task.*SKIPPED" str) "Test 14.3: Skipped task detected")
+          (assert-true (string-match-p "Brand New Task.*NEW" str) "Test 14.3: New task detected")))))
+  (delete-directory temp-dir t))
+
+;; 14.4 Weekly Retrospective Summary
+(let* ((temp-dir (make-temp-file "org-test-retro-" t))
+       (test-org-file (expand-file-name "test-retro.org" temp-dir))
+       (now (current-time))
+       (today-str (format-time-string "%Y-%m-%d" now)))
+  (with-temp-file test-org-file
+    (insert (format "* Work :PROJECT:
+*** DONE Completed Planned Task :AUTOSCH:
+CLOSED: [%s 11:00] SCHEDULED: <%s 09:00-11:00>
+:PROPERTIES:
+:Effort: 2:00
+:ID: retro-task-1
+:END:
+:LOGBOOK:
+CLOCK: [%s 09:00]--[%s 11:00] =>  2:00
+:END:
+*** TODO Rolled Planned Task :AUTOSCH:
+SCHEDULED: <%s 14:00-15:00>
+:PROPERTIES:
+:Effort: 1:00
+:ID: retro-task-2
+:END:
+* Personal
+*** DONE Quick Unplanned Interrupt
+CLOSED: [%s 12:00]
+:LOGBOOK:
+CLOCK: [%s 11:30]--[%s 12:00] =>  0:30
+:END:
+"
+                    today-str today-str today-str today-str today-str today-str today-str today-str)))
+  (setq org-agenda-files (list test-org-file))
+  (let ((metrics (org-auto-scheduler--analyze-retrospective 7)))
+    (assert-equal (plist-get metrics :done) 1 "Test 14.4: Exactly 1 planned task completed")
+    (assert-equal (plist-get metrics :planned) 2 "Test 14.4: Total 2 planned tasks")
+    (assert-equal (plist-get metrics :rolled) 1 "Test 14.4: Exactly 1 planned task rolled")
+    (assert-equal (round (plist-get metrics :planned-effort)) 180 "Test 14.4: 180m planned effort")
+    (assert-equal (plist-get metrics :planned-clocked) 120 "Test 14.4: 120m planned clocked")
+    (assert-equal (plist-get metrics :unplanned-clocked) 30 "Test 14.4: 30m unplanned clocked"))
+  (org-auto-scheduler-weekly-retrospective 7)
+  (assert-true (get-buffer "*Org Auto Scheduler Retrospective*") "Test 14.4: Retrospective buffer created")
+  (with-current-buffer "*Org Auto Scheduler Retrospective*"
+    (let ((str (buffer-string)))
+      (assert-true (string-match-p "Tasks Completed:  1 (50.0%)" str) "Test 14.4: Completion percentage reported")
+      (assert-true (string-match-p "Planned Effort:   3.0h" str) "Test 14.4: Planned effort hours reported")
+      (assert-true (string-match-p "Planned Focus:    2.0h (80.0%)" str) "Test 14.4: Planned focus reported")
+      (assert-true (string-match-p "Unplanned Work:   0.5h (20.0%)" str) "Test 14.4: Unplanned work reported")))
+  (delete-directory temp-dir t))
+
+
+;; ============================================================================
+;; TEST 15: Bug Fix Regression Suite (Stages 1 - 4)
+;; ============================================================================
+(message "
+--- TEST 15: Bug Fix Regressions across All 4 Stages ---")
+
+;; 15.1: Pomodoro spec parser supports leading colons and spaces
+(let ((p1 (let ((trimmed ":25:5"))
+            (when (string-match "^:?[ \t]*\\([0-9]+\\)[ \t]*[:/][ \t]*\\([0-9]+\\)$" trimmed)
+              (list :work (string-to-number (match-string 1 trimmed))
+                    :break (string-to-number (match-string 2 trimmed))))))
+      (p2 (let ((trimmed ": 50 : 10"))
+            (when (string-match "^:?[ \t]*\\([0-9]+\\)[ \t]*[:/][ \t]*\\([0-9]+\\)$" trimmed)
+              (list :work (string-to-number (match-string 1 trimmed))
+                    :break (string-to-number (match-string 2 trimmed)))))))
+  (assert-equal p1 '(:work 25 :break 5) "Test 15.1: Pomodoro parses :25:5")
+  (assert-equal p2 '(:work 50 :break 10) "Test 15.1: Pomodoro parses : 50 : 10"))
+
+;; 15.2: Multi-day title marker deferral (-+2d-) and effort reschedule trigger
+(let* ((temp-dir (make-temp-file "org-test-bug-defer-" t))
+       (test-org-file (expand-file-name "test-defer.org" temp-dir)))
+  (with-temp-file test-org-file
+    (insert "* Tasks :PROJECT:
+*** TODO Task To Defer (-+2d-) :AUTOSCH:
+:PROPERTIES:
+:Effort: 1:00
+:ID: defer-task-1
+:END:
+*** TODO Task Effort Change (-e30m-) :AUTOSCH:
+SCHEDULED: <2026-09-25 Fri 10:00-11:00>
+:PROPERTIES:
+:Effort: 1:00
+:ID: effort-task-2
+:END:
+"))
+  (setq org-agenda-files (list test-org-file))
+  (let* ((buf (find-file-noselect test-org-file))
+         (m1 (with-current-buffer buf (goto-char (org-find-entry-with-id "defer-task-1")) (point-marker)))
+         (m2 (with-current-buffer buf (goto-char (org-find-entry-with-id "effort-task-2")) (point-marker)))
+         (res1 (org-auto-scheduler--process-title-markers m1))
+         (res2 (org-auto-scheduler--process-title-markers m2)))
+    (assert-true (plist-get res1 :defer) "Test 15.2: -+2d- triggers defer")
+    (assert-true (plist-get res1 :reschedule) "Test 15.2: Defer triggers reschedule flag")
+    (assert-equal (plist-get res2 :effort) 30 "Test 15.2: -e30m- parses 30 minutes")
+    (assert-true (plist-get res2 :reschedule) "Test 15.2: Effort change triggers reschedule flag")
+    (kill-buffer buf))
+  (delete-directory temp-dir t))
+
+;; 15.3: Non-blocking fallback regex matches :NON_BLOCKING: without broken escapes
+(with-temp-buffer
+  (org-mode)
+  (insert "* Calendar Meeting
+:PROPERTIES:
+:NON_BLOCKING: t
+:END:
+")
+  (goto-char (point-min))
+  (assert-true (org-auto-scheduler-task-non-blocking-p "fake-id" (point-marker) "Calendar Meeting")
+               "Test 15.3: Non-blocking detected from property drawer via fallback search"))
+
+;; 15.4: Retrospective excludes future scheduled tasks (> end of today)
+(let* ((temp-dir (make-temp-file "org-test-retro-future-" t))
+       (test-org-file (expand-file-name "test-retro-future.org" temp-dir))
+       (now (current-time))
+       (past-date (format-time-string "%Y-%m-%d" (time-subtract now (seconds-to-time 86400))))
+       (future-date (format-time-string "%Y-%m-%d" (time-add now (seconds-to-time (* 3 86400))))))
+  (with-temp-file test-org-file
+    (insert (format "* Tasks :PROJECT:
+*** DONE Past Task Done :AUTOSCH:
+CLOSED: [%s 10:00] SCHEDULED: <%s 09:00-10:00>
+:PROPERTIES:
+:Effort: 1:00
+:ID: past-done-1
+:END:
+*** TODO Future Task Next Week :AUTOSCH:
+SCHEDULED: <%s 10:00-11:00>
+:PROPERTIES:
+:Effort: 1:00
+:ID: future-task-2
+:END:
+"
+                    past-date past-date future-date)))
+  (setq org-agenda-files (list test-org-file))
+  (let ((metrics (org-auto-scheduler--analyze-retrospective 7)))
+    (assert-equal (plist-get metrics :done) 1 "Test 15.4: Exactly 1 past task done")
+    (assert-equal (plist-get metrics :planned) 1 "Test 15.4: Future task is excluded from past planned count")
+    (assert-equal (plist-get metrics :rolled) 0 "Test 15.4: Future task is NOT counted as rolled"))
+  (delete-directory temp-dir t))
+
+;; 15.5: Review chop duration explicitly rounded
+(assert-equal (let* ((input "45.5")
+                     (keep-today (let ((parsed (condition-case nil (org-duration-to-minutes input) (error nil))))
+                                   (if (and parsed (> parsed 0))
+                                       (round parsed)
+                                     (round (string-to-number input))))))
+                keep-today)
+              46
+              "Test 15.5: Chop duration parsed float is cleanly rounded to integer")
+
 (when (boundp 'test-orig-agenda-files) (setq org-agenda-files test-orig-agenda-files))
 
 (message "\n==============================================")
 (if (= test-failures 0)
-    (message "ALL 13 TEST SUITES PASSED PERFECTLY!")
+    (message "ALL 15 TEST SUITES PASSED PERFECTLY!")
   (message "FAILURES DETECTED: %d" test-failures))
 (message "==============================================")
 

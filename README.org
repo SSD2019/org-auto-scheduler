@@ -23,13 +23,17 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - [[#how-sorting-works][How Sorting Works]]
 - [[#review-and-apply-buffer][Review & Apply Buffer]]
   - [[#column-table-view][Column Table View]]
+  - [[#visual-daily-capacity-gauge][Visual Daily Capacity Gauge]]
   - [[#visual-timeline--org-timegrid-integration][Visual Timeline & Org Time Grid Integration]]
   - [[#fixed-agenda-events-and-non-blocking-tasks][Fixed Agenda Events & Non-Blocking Tasks]]
+  - [[#in-buffer-task-slicer-chop][In-Buffer Task Slicer ("Chop")]]
+  - [[#visual-what-if-diff-buffer][Visual What-If Diff Buffer]]
   - [[#persistent-review-decisions-and-state-file][Persistent Review Decisions & State File]]
   - [[#smart-restore--merge][Smart Restore & Merge]]
   - [[#multi-instance-and-file-synchronization][Multi-Instance & File Synchronization]]
   - [[#review-keybindings][Review Keybindings]]
 - [[#schedule-adherence-tracking][Schedule Adherence Tracking]]
+  - [[#weekly-retrospective-summary][Weekly Retrospective Summary]]
 - [[#background-scheduling][Background Scheduling]]
   - [[#safe-schedule-preservation--smart-start-buffer][Safe Schedule Preservation & Smart Start Buffer]]
   - [[#interactive-title-modifiers][Interactive Title Modifiers (-r-, -s-, -f-, -p-, -x-, -kill-, -e<dur>-, -+1d-, -#A-, -#B-, -#C-, -i-, -\i-)]]
@@ -369,6 +373,19 @@ A structured list grouped by day with day header statistics (e.g. =─── Tod
 | =Score=     | Composite scheduling score (=—= for fixed calendar events).                                          |
 | =Status=    | Status indicator: =✓= (success), =⚠= (warning), =✗= (failed), =🔒= (blocking fixed event).          |
 
+*** Visual Daily Capacity Gauge
+<<visual-daily-capacity-gauge>>
+
+The review buffer header line renders a real-time Unicode capacity bar dynamically calculating your total scheduled workload against your configured workday duration:
+#+begin_example
+Load: [██████░░░░] 4.8h/8.0h (60%) │ Slack: 3.2h │ 6 tasks (4.8h)
+#+end_example
+- *Dynamic Visual Feedback:* Re-computed on the fly whenever tasks are reordered, chopped, deferred, or skipped.
+- *Color-Coded Thresholds:*
+  - =success= (Green): Normal capacity (<= 85%).
+  - =warning= (Yellow/Orange): Near capacity (> 85% and <= 100%).
+  - =error= (Red bold): Overload (> 100%), rendering =Load: [██████████] 9.5h/8.0h (119% OVERLOAD +1.5h)=.
+
 *** Visual Timeline & Org Time Grid Integration
 <<visual-timeline--org-timegrid-integration>>
 
@@ -405,6 +422,28 @@ Calendar entries with titles matching =org-auto-scheduler-auto-non-blocking-rege
 - *Universal Command:* Call =M-x org-auto-scheduler-toggle-non-blocking= from any buffer (Org file headline, Agenda, Review, or Calendar).
 
 Non-blocking states are automatically stored according to =org-auto-scheduler-non-blocking-backend= (by default in both the review state file and the =AUTOSCH_NON_BLOCKING= Org headline property).
+
+*** In-Buffer Task Slicer ("Chop")
+<<in-buffer-task-slicer-chop>>
+
+When a large task cannot fit into today's remaining hours, you can slice it directly in the review buffer:
+- *Keybinding:* Press =c= (or =C-c c=) on any task in the review table.
+- *Interactive Prompt:* Prompts for minutes to keep today (e.g. =Keep today for 'Big Task' (current 120m, default 60m): =).
+- *Automatic Deferral:* Automatically keeps your chosen duration for today, marks the task splittable, and defers remaining effort to subsequent days via clean placeholder subtasks.
+- *Full Undo Support:* Press =u= or =U= anytime to revert the chop and restore the task's original full duration.
+
+*** Visual What-If Diff Buffer
+<<visual-what-if-diff-buffer>>
+
+Before committing changes to your Org files with =x=, inspect a complete What-If diff of your proposed schedule compared against current disk state:
+- *Keybinding:* Press =D= (or =C-c C-v=) in the review buffer.
+- *Comprehensive Change Detection:* Displays categorized diff sections:
+  - =- Task Name <original> + Task Name <proposed> (MOVED)=: Tasks moved to new time slots or days.
+  - =+ Task Name <proposed> (NEWLY SCHEDULED)=: Unscheduled tasks assigned a slot.
+  - =+ Task Name (SPLIT/PLACEHOLDER CHUNK)=: Temporary split or Pomodoro chunks.
+  - =- Task Name (SKIPPED / UNCHECKED)=: Tasks toggled off in the review buffer.
+  - =  Task Name (UNCHANGED)=: Preserved tasks.
+- *Direct Navigation:* Press =RET= or =TAB= on any diff entry to jump directly to that task in the review buffer. Press =q= to dismiss.
 
 *** Persistent Review Decisions and State File
 <<persistent-review-decisions-and-state-file>>
@@ -463,7 +502,9 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | *Edit Effort (What-If)*               | =e=                           | =e=                  | Edit effort in minutes (redirects chunks to parent)     |
 | *Undo Review Action*                  | =U=, =u=                      | =U=                  | Restore overrides, entries, and tasks; refresh grid     |
 | *Move Up / Earlier*                   | =K=                           | =K=                  | Move earlier in scheduling order (crosses days)         |
-| *Move Down / Later*                   | =J=, =D=                      | =J=, =D=             | Move later in scheduling order (crosses days)           |
+| *Move Down / Later*                   | =J=                           | =J=                  | Move later in scheduling order (crosses days)           |
+| *Chop / Slice Task*                   | =c=, =C-c c=                  |                      | Keep chosen duration today, defer rest to subsequent days |
+| *What-If Diff Buffer*                 | =D=, =C-c C-v=                |                      | Inspect diff of proposed changes against disk state      |
 | *Shift Day Next / Prev*               | =>=, =+= / =<=, =-=           | =>=, =+= / =<=, =-=  | Move task across scheduled days                         |
 | *Recalculate Schedule*                | =r=, =C-c C-r=                | =r=, =C-c C-r=       | Recalculate and compact schedule                        |
 | *Refresh Scheduler*                   | =R=                           | =R=                  | Re-run auto-scheduler from scratch                      |
@@ -509,8 +550,20 @@ All review and timegrid unified keybindings (including navigation keys =n=, =p=,
 *Note:* Pressing =x= always recalculates times from the current visual order before writing to Org files, so you never need to manually press =r= before applying.
 
 ** Schedule Adherence Tracking
+<<schedule-adherence-tracking>>
 
 Track how well you stick to your daily schedule and earn a daily adherence score.
+
+*** Weekly Retrospective Summary
+<<weekly-retrospective-summary>>
+
+Reflect on your planned vs. actual execution over the past week:
+- *Access:* Press =W= in the dispatch menu (=M-x org-auto-scheduler-dispatch= or =C-c a W=).
+- *Comprehensive Metrics:*
+  - *Execution & Completion:* Total tasks scheduled vs. completed, completion percentage, and rolled tasks.
+  - *Estimation Accuracy:* Planned effort vs. actual clocked hours, accuracy ratio, and estimation drift trends.
+  - *Focus vs. Unplanned ("Squirrel" Factor):* Planned focus time vs. unplanned interruptive tasks with percentage split.
+  - *Project & Category Breakdown:* Formatted ASCII breakdown table detailing completed count, clocked hours, and completion percentage per project.
 
 *** Daily Workflow
 
