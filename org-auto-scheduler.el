@@ -10793,10 +10793,14 @@ Returns a plist with task details or nil if no active task found."
   (let* ((marker
           (cond
            ((and override-marker (markerp override-marker) (marker-buffer override-marker))
-            override-marker)
+            (org-with-point-at override-marker
+              (org-back-to-heading t)
+              (point-marker)))
            ((and (fboundp 'org-clock-is-active) (org-clock-is-active)
                  (boundp 'org-clock-marker) (markerp org-clock-marker) (marker-buffer org-clock-marker))
-            org-clock-marker)
+            (org-with-point-at org-clock-marker
+              (org-back-to-heading t)
+              (point-marker)))
            (t
             (let* ((today-tasks (ignore-errors (org-auto-scheduler-get-today-scheduled-tasks)))
                    (now (current-time))
@@ -10810,10 +10814,13 @@ Returns a plist with task details or nil if no active task found."
                         (setq current-task tk)
                       (unless earliest-pending
                         (setq earliest-pending tk))))))
-              (plist-get (or current-task earliest-pending) :marker))))))
+              (let ((m (plist-get (or current-task earliest-pending) :marker)))
+                (when (and m (markerp m) (marker-buffer m))
+                  (org-with-point-at m
+                    (org-back-to-heading t)
+                    (point-marker)))))))))
     (when (and marker (markerp marker) (marker-buffer marker))
       (org-with-point-at marker
-        (ignore-errors (org-back-to-heading t))
         (let* ((title (or (org-get-heading t t t t) "Untitled Task"))
                (state (org-get-todo-state))
                (category (or (org-entry-get nil "CATEGORY")
@@ -11145,46 +11152,78 @@ Returns a plist with task details or nil if no active task found."
     (org-auto-scheduler-focus-refresh)
     (message "Note saved.")))
 
+(defun org-auto-scheduler-focus-next-checklist ()
+  "Move point to the next checklist item in the Focus HUD."
+  (interactive)
+  (let ((pos (next-single-property-change (point) 'focus-check-pos)))
+    (if pos
+        (goto-char pos)
+      (goto-char (point-min))
+      (let ((p2 (next-single-property-change (point) 'focus-check-pos)))
+        (when p2 (goto-char p2))))))
+
+(defun org-auto-scheduler-focus-prev-checklist ()
+  "Move point to the previous checklist item in the Focus HUD."
+  (interactive)
+  (let ((pos (previous-single-property-change (point) 'focus-check-pos)))
+    (if pos
+        (goto-char pos)
+      (goto-char (point-max))
+      (let ((p2 (previous-single-property-change (point) 'focus-check-pos)))
+        (when p2 (goto-char p2))))))
+
 (defun org-auto-scheduler-focus-add-subtask (title &optional effort)
   "Add a child subtask with TITLE and optional EFFORT under the current task."
-  (interactive "sSubtask title: \nsEffort (e.g. 20m, optional): ")
+  (interactive "sSubtask title: 
+sEffort (e.g. 20m, optional): ")
   (let ((m org-auto-scheduler-focus--target-marker))
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "No active task in Focus HUD"))
     (when (string-empty-p (string-trim title))
       (user-error "Subtask title cannot be empty"))
     (org-with-point-at m
+      (org-back-to-heading t)
       (let* ((parent-level (or (org-current-level) 1))
              (child-level (1+ parent-level))
              (stars (make-string child-level ?*)))
-        (org-end-of-subtree t)
-        (unless (bolp) (insert "\n"))
-        (insert (format "%s TODO %s\n" stars (string-trim title)))
-        (forward-line -1)
-        (when (and effort (not (string-empty-p (string-trim effort))))
-          (org-entry-put nil "EFFORT" (string-trim effort)))
+        ;; Jump past all existing children and direct body of the current heading
+        (org-end-of-subtree t t)
+        (unless (bolp) (insert "
+"))
+        (let ((insert-pos (point)))
+          (insert (format "%s TODO %s
+" stars (string-trim title)))
+          (goto-char insert-pos)
+          (when (and effort (not (string-empty-p (string-trim effort))))
+            (org-entry-put nil "EFFORT" (string-trim effort))))
         (when (buffer-file-name) (save-buffer))))
     (org-auto-scheduler-focus-refresh)
     (message "Created child subtask: %s" title)))
 
 (defun org-auto-scheduler-focus-add-sibling (title &optional effort)
   "Add a sibling task with TITLE and optional EFFORT directly after current task."
-  (interactive "sSibling task title: \nsEffort (e.g. 30m, optional): ")
+  (interactive "sSibling task title: 
+sEffort (e.g. 30m, optional): ")
   (let ((m org-auto-scheduler-focus--target-marker))
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "No active task in Focus HUD"))
     (when (string-empty-p (string-trim title))
       (user-error "Sibling title cannot be empty"))
     (org-with-point-at m
+      (org-back-to-heading t)
       (let* ((cur-level (or (org-current-level) 1))
              (stars (make-string cur-level ?*)))
-        (org-end-of-subtree t)
-        (unless (bolp) (insert "\n"))
-        (insert (format "%s TODO %s\n" stars (string-trim title)))
-        (forward-line -1)
-        (org-toggle-tag "AUTOSCH" 'on)
-        (when (and effort (not (string-empty-p (string-trim effort))))
-          (org-entry-put nil "EFFORT" (string-trim effort)))
+        ;; Jump past entire subtree of current heading before inserting sibling
+        (org-end-of-subtree t t)
+        (unless (bolp) (insert "
+"))
+        (let ((insert-pos (point)))
+          (insert (format "%s TODO %s
+" stars (string-trim title)))
+          (goto-char insert-pos)
+          (org-toggle-tag "AUTOSCH" 'on)
+          (when (and effort (not (string-empty-p (string-trim effort))))
+            (org-entry-put nil "EFFORT" (string-trim effort))))
         (when (buffer-file-name) (save-buffer))))
     (org-auto-scheduler-focus-refresh)
     (message "Sibling task '%s' created and queued after current task." title)))
@@ -11294,6 +11333,10 @@ Returns a plist with task details or nil if no active task found."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "k") #'org-auto-scheduler-focus-add-checklist)
+    (define-key map (kbd "K") #'previous-line)
+    (define-key map (kbd "j") #'next-line)
+    (define-key map (kbd "TAB") #'org-auto-scheduler-focus-next-checklist)
+    (define-key map (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist)
     (define-key map (kbd "RET") #'org-auto-scheduler-focus-toggle-checklist)
     (define-key map (kbd "SPC") #'org-auto-scheduler-focus-toggle-checklist)
     (define-key map (kbd "n") #'org-auto-scheduler-focus-add-note)
@@ -11313,10 +11356,58 @@ Returns a plist with task details or nil if no active task found."
 
 (define-derived-mode org-auto-scheduler-focus-mode special-mode "Org-Focus-HUD"
   "Major mode for the Org Auto Scheduler Focus HUD cockpit.
-\\{org-auto-scheduler-focus-mode-map}"
+\{org-auto-scheduler-focus-mode-map}"
   (setq truncate-lines t)
   (setq buffer-read-only t)
-  (add-hook 'kill-buffer-hook #'org-auto-scheduler--focus-cleanup nil t))
+  (add-hook 'kill-buffer-hook #'org-auto-scheduler--focus-cleanup nil t)
+  ;; Evil / Spacemacs compatibility: ensure HUD single-key shortcuts win in motion/normal/visual
+  (when (and (featurep 'evil) (fboundp 'evil-local-set-key))
+    (dolist (st '(motion normal visual))
+      (evil-local-set-key st (kbd "k")         #'org-auto-scheduler-focus-add-checklist)
+      (evil-local-set-key st (kbd "K")         #'previous-line)
+      (evil-local-set-key st (kbd "j")         #'next-line)
+      (evil-local-set-key st (kbd "TAB")       #'org-auto-scheduler-focus-next-checklist)
+      (evil-local-set-key st (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist)
+      (evil-local-set-key st (kbd "RET")       #'org-auto-scheduler-focus-toggle-checklist)
+      (evil-local-set-key st (kbd "SPC")       #'org-auto-scheduler-focus-toggle-checklist)
+      (evil-local-set-key st (kbd "n")         #'org-auto-scheduler-focus-add-note)
+      (evil-local-set-key st (kbd "s")         #'org-auto-scheduler-focus-add-subtask)
+      (evil-local-set-key st (kbd "a")         #'org-auto-scheduler-focus-add-sibling)
+      (evil-local-set-key st (kbd "d")         #'org-auto-scheduler-focus-done)
+      (evil-local-set-key st (kbd "+")         #'org-auto-scheduler-focus-extend)
+      (evil-local-set-key st (kbd "=")         #'org-auto-scheduler-focus-extend)
+      (evil-local-set-key st (kbd "p")         #'org-auto-scheduler-focus-toggle-pause)
+      (evil-local-set-key st (kbd "q")         #'org-auto-scheduler-focus-quit)
+      (evil-local-set-key st (kbd "g")         #'org-auto-scheduler-focus-refresh)
+      (evil-local-set-key st (kbd "o")         #'org-auto-scheduler-focus-goto-task)
+      (evil-local-set-key st (kbd "c")         #'org-auto-scheduler-focus-clock-in-task)
+      (evil-local-set-key st (kbd "r")         (lambda () (interactive) (when (fboundp 'org-auto-scheduler-review) (org-auto-scheduler-review)))))))
+
+;; Evil/Spacemacs compatibility for Focus HUD mode map:
+(with-eval-after-load 'evil
+  (dolist (state '(normal motion visual))
+    (evil-define-key state org-auto-scheduler-focus-mode-map
+      (kbd "k")         #'org-auto-scheduler-focus-add-checklist
+      (kbd "K")         #'previous-line
+      (kbd "j")         #'next-line
+      (kbd "TAB")       #'org-auto-scheduler-focus-next-checklist
+      (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist
+      (kbd "RET")       #'org-auto-scheduler-focus-toggle-checklist
+      (kbd "SPC")       #'org-auto-scheduler-focus-toggle-checklist
+      (kbd "n")         #'org-auto-scheduler-focus-add-note
+      (kbd "s")         #'org-auto-scheduler-focus-add-subtask
+      (kbd "a")         #'org-auto-scheduler-focus-add-sibling
+      (kbd "d")         #'org-auto-scheduler-focus-done
+      (kbd "+")         #'org-auto-scheduler-focus-extend
+      (kbd "=")         #'org-auto-scheduler-focus-extend
+      (kbd "p")         #'org-auto-scheduler-focus-toggle-pause
+      (kbd "q")         #'org-auto-scheduler-focus-quit
+      (kbd "g")         #'org-auto-scheduler-focus-refresh
+      (kbd "o")         #'org-auto-scheduler-focus-goto-task
+      (kbd "c")         #'org-auto-scheduler-focus-clock-in-task
+      (kbd "r")         (lambda () (interactive) (when (fboundp 'org-auto-scheduler-review) (org-auto-scheduler-review)))))
+  (when (fboundp 'evil-set-initial-state)
+    (evil-set-initial-state 'org-auto-scheduler-focus-mode 'motion)))
 
 (defun org-auto-scheduler--focus-cleanup ()
   "Cancel timer if Focus HUD buffer is killed."
@@ -11342,10 +11433,16 @@ Returns a plist with task details or nil if no active task found."
 Brings up a dedicated, distraction-free cockpit with pacing and live capture."
   (interactive
    (list (cond
+          ((and (fboundp 'org-clock-is-active) (org-clock-is-active)
+                (boundp 'org-clock-marker) (markerp org-clock-marker) (marker-buffer org-clock-marker))
+           (org-with-point-at org-clock-marker
+             (org-back-to-heading t)
+             (point-marker)))
+          ((and (derived-mode-p 'org-mode) (ignore-errors (org-back-to-heading t)))
+           (point-marker))
           ((eq major-mode 'org-agenda-mode)
            (or (org-get-at-bol 'org-marker) (org-get-at-bol 'org-hd-marker)))
-          ((derived-mode-p 'org-mode)
-           (point-marker)))))
+          (t nil))))
   (let ((buf (get-buffer-create "*Org Focus HUD*")))
     (with-current-buffer buf
       (unless (eq major-mode 'org-auto-scheduler-focus-mode)

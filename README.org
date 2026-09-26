@@ -359,6 +359,7 @@ M-x org-auto-scheduler-focus
 
 | Key | Action | Description |
 |-----+--------+-------------|
+| =TAB= / =S-TAB= | Next/Prev Checklist | Navigate directly between checklist items in the HUD |
 | =k= | Add Checklist | Prompt for text and insert =- [ ] <text>= under current task in Org |
 | =RET= / =SPC= | Toggle Checklist | Toggle checkbox =[ ]= ↔ =[X]= in the underlying Org buffer |
 | =n= | Add Note | Prompt for note and append timestamped entry =-[HH:MM] <note>= in drawer |
