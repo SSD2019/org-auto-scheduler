@@ -134,6 +134,10 @@ Add to your Emacs configuration:
 
 These are the most important interactive commands you will use day-to-day.
 
+*** 🎯 =M-x org-auto-scheduler-focus=
+
+Launch the *Focus HUD* monotasking cockpit. Locks your attention on the currently active or scheduled task with real-time pacing, Pomodoro tracking, and in-cockpit checklist, note, subtask, and sibling capture.
+
 *** 🧭 =M-x org-auto-scheduler-dispatch=
 
 Open the *command dispatch menu* (uses =transient= when installed, falling back to a lightweight interactive prompt). From here you can trigger scheduling, preview review, save/restore review decisions, score adherence, bump tasks, or toggle non-blocking events with single keystrokes.
@@ -296,6 +300,77 @@ These properties go inside the task's =:PROPERTIES:= drawer.
   :MIN_CHUNK: 45
   :END:
 #+end_src
+
+** 🎯 Focus HUD Mode (Monotasking Cockpit)
+
+The *Focus HUD* (=*Org Focus HUD*=) is designed specifically to prevent context switching, decision fatigue, and schedule drift. It displays *only* the single current task (with zero future task distractions) and turns your editor into a high-flow productivity cockpit.
+
+Launch with:
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-focus
+#+end_src
+
+,*Keybindings:*
+- *Global Leader (Spacemacs):* ~SPC o S f~ or ~SPC o S F~
+- *Org Buffer Major Mode:* ~SPC m d f~ or ~, d f~
+- *Org Agenda:* ~C-c a F~ (leaves built-in follow mode on ~F~ intact)
+- *Dispatch Menu:* ~SPC o S d~ → ~f~ (or ~S~ in Agenda → ~f~)
+
+*** Visual Cockpit Layout
+
+#+begin_example
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ 🎯 FOCUS: Implement OAuth 2.0 PKCE Callback Handler     [14:25 · Tue Sep 25] │
+╰─────────────────────────────────────────────────────────────────────────────╯
+
+  PROJECT:  Backend / Auth Migration
+  SLOT:     14:00 – 15:00 (Today) · Effort: 60m · Pomodoro: 🍅 [25m/5m]
+
+  TIME REMAINING: 35m left
+  [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 25m clocked (41%)
+
+  ┌─ CHECKLIST [2/4] ─────────────────────────────────────────────────────────┐
+  │ [X] Generate PKCE code verifier and challenge (base64url)                 │
+  │ [X] Add redirect URL validation with state token                          │
+  │ [ ] Handle error callback when state parameter is invalid                 │
+  │ [ ] Write unit tests for expired state token and replay attacks           │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ SUBTASKS (CHILD TODOS) ──────────────────────────────────────────────────┐
+  │ • [TODO] Implement token exchange endpoint POST /oauth/token              │
+  │ • [TODO] Store refresh tokens securely in redis cache                     │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ RECENT NOTES ────────────────────────────────────────────────────────────┐
+  │ [14:18] Remember to use constant-time comparison for token hashes         │
+  │ [14:05] RFC 7636 Section 4.3 requires SHA-256 for code_challenge_method   │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  CAPTURE (Zero context switching)   ACTIONS & PACING
+  ─────────────────────────────────  ──────────────────────────────────────────
+  [k] + Checklist item               [RET] Toggle checklist item [ ] ↔ [X]
+  [n] + Quick Note                   [d]   Mark DONE & Advance
+  [s] + Child Subtask                [+]   Extend +15m
+  [a] + Sibling Task (after this)    [p]   Pause / Resume Clock
+  [o] Jump to Org File               [q]   Minimize HUD
+#+end_example
+
+*** Keybindings & In-Cockpit Actions
+
+| Key | Action | Description |
+|-----+--------+-------------|
+| =k= | Add Checklist | Prompt for text and insert =- [ ] <text>= under current task in Org |
+| =RET= / =SPC= | Toggle Checklist | Toggle checkbox =[ ]= ↔ =[X]= in the underlying Org buffer |
+| =n= | Add Note | Prompt for note and append timestamped entry =-[HH:MM] <note>= in drawer |
+| =s= | Add Subtask | Create child headline =** TODO <title>= with optional effort |
+| =a= | Add Sibling | Create sibling task =* TODO <title> :AUTOSCH:= directly after current task |
+| =d= | Mark DONE & Advance | Mark task =DONE=, clock out, and auto-clock into the next scheduled task |
+| =+= / === | Extend +15m | Extend current task effort and slot by 15m; ripples downstream tasks |
+| =p= | Pause / Resume | Toggle =org-clock-out= / =org-clock-in= |
+| =o= | Jump to Org | Open original Org file and reveal headline |
+| =c= | Clock in Task | Select and clock into any scheduled task for today |
+| =g= | Refresh | Force re-render of the HUD |
+| =q= | Minimize | Dismiss Focus HUD window (clock stays active) |
 
 ** How Scoring Works
 
