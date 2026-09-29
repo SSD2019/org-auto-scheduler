@@ -68,7 +68,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Modeline Integration:* Live adherence score displayed in your Emacs mode line.
 - *Background Scheduling:* Auto-reschedule silently while Emacs is idle.
 - *Safe Schedule Preservation:* Tasks scheduled for today remain anchored and won't endlessly slide forward on background idle syncs.
-- *Interactive Mobile & CalDAV Title Modifiers:* Use quick title prefixes like =(-r-)=, =(-s-)=, =(-\s-)=, =(-f-)=, =(-\f-)=, =(-p-)=, =(-\p-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-#A-)=, =(-#B-)=, =(-#C-)=, =(-i-)=, =(-\i-)=, or =(-r-all-)= to reschedule, set priority, make independent of siblings, pin/unpin, toggle splitting, or adjust effort from any mobile calendar without editing Org property drawers. Markers are automatically processed, applied, and stripped clean from the headline.
+- *Interactive Mobile & CalDAV Title Modifiers:* Use quick title prefixes like =(-r-)=, =(-s-)=, =(-\s-)=, =(-f-)=, =(-\f-)=, =(-p-)=, =(-\p-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-#A-)=, =(-#B-)=, =(-#C-)=, =(-i-)=, =(-\i-)=, =(-w-)=, =(-w+3d-)=, or =(-r-all-)= to reschedule, set priority, make independent of siblings, pin/unpin, toggle splitting, or adjust effort from any mobile calendar without editing Org property drawers. Markers are automatically processed, applied, and stripped clean from the headline.
 - *Automatic Task Displacement:* Newly added unscheduled =AUTOSCH= tasks automatically take their place among upcoming unpinned tasks based on priority/score, while past (lapsed), current (in-progress), and pinned tasks remain strictly fixed.
 - *Critical Path Method (CPM) & Float Analysis:* Computes forward/backward passes ($LS - ES$) on task dependency DAGs to identify bottlenecks, applying a score boost (=⚡=) to critical path tasks.
 - *Soft Project Batching:* Heuristically clusters tasks from the currently active project within a score tolerance (default 15%) to eliminate jarring context switching.
@@ -236,10 +236,29 @@ M-x org-auto-scheduler-adherence-report
 A task is eligible for scheduling when it has:
 - The =AUTOSCH= tag, *and*
 - A TODO state that appears as a key in =org-auto-scheduler-state-weights=, *and*
+- Is *not* in a waiting/dormant state defined in =org-auto-scheduler-waiting-states= (e.g. =WAITING=, =HOLD=, =PENDING=), *and*
 - Does *not* carry the =ARCHIVE= tag, *and*
 - Does *not* carry the =AUTOSCH_PLACEHOLDER= tag or property (placeholders are managed automatically).
 
+Tasks in waiting states are never allocated work slots on your calendar, but are tracked in the review buffer's dedicated *Waiting on Others* section with follow-up dates and stale warnings.
+
 Tasks blocked by incomplete =BLOCKER= / =DEPENDS_ON= dependencies are skipped unless all blocking tasks have already been scheduled in the current session.
+
+** Configurable Waiting Tasks & External Blockers
+<<configurable-waiting-tasks>>
+
+Tasks waiting on external conditions (e.g. PR reviews, approvals, client replies) should not consume active work slots on your calendar, yet must not be forgotten.
+
+- *Configurable States (=org-auto-scheduler-waiting-states=):* By default ='("WAITING" "HOLD" "PENDING")=. Any task carrying one of these states is excluded from active work blocks.
+- *Waiting on Others Section:* In the review buffer (=org-auto-scheduler-review=), all waiting tasks are gathered into a dedicated section placed below all scheduled days and unscheduled tasks.
+- *Tickler / Follow-Up Dates:* When transitioning to =WAITING=, =org-auto-scheduler= strips the time-of-day component from =SCHEDULED:= (e.g. =<2026-10-02 Fri 14:00>= → =<2026-10-02 Fri>=) so it acts as an Agenda check-in tickler without blocking your daily timeline (configurable via =org-auto-scheduler-waiting-clear-scheduled-time=).
+- *Automatic Clock-Out:* If you are clocked into a task when moving it to a waiting state, =org-auto-scheduler= clocks out immediately (=org-auto-scheduler-waiting-auto-clock-out=).
+- *Stale Nudges & Age Tracking:* If a task remains in a waiting state for longer than =org-auto-scheduler-waiting-stale-days= (default: 5 days), it displays a =⚠️= icon, =STALE= badge, and waiting duration in amber/red.
+- *Quick State Switching in Review (=t=):* Press =t= on any task in the review buffer (scheduled, unscheduled, or waiting) to change its TODO state via =completing-read=. If changed to =WAITING=, it moves to the waiting section; if changed to =TODO= or =NEXT=, it immediately slots into the proposed schedule.
+- *Quick Tickler Management in Review (=d= and =C-u d=):* Press =d= on any row in the *Waiting on Others* section to set or update its follow-up tickler date via =org-read-date= without leaving the review buffer. Press =C-u d= to clear the tickler date.
+- *Explicit Blocker Attribution (=BLOCKED (WAITING)=):* When a task cannot be scheduled due to unmet dependencies, the scheduler checks if any blocker is in a waiting state. If so, its time column is highlighted as =BLOCKED (WAITING)= with detailed tooltips and warning banners: =Blocked by WAITING: '<Blocker Task>'=.
+- *Focus HUD "Wait on This" (=w=):* In the *Focus HUD* cockpit, press =w= to pause/clock out, prompt for an optional follow-up note (logged to the task body) and optional tickler date, transition the task to =WAITING=, and seamlessly auto-advance and clock into the next scheduled task for today.
+- *Mobile Title Modifiers (=(-w-)= and =(-w+Nd-)=):* Mark tasks as waiting from any mobile calendar app by appending =(-w-)= or =(-w+3d-)= to the title. On sync, =org-auto-scheduler= strips the marker, sets the state to =WAITING=, sets the relative follow-up tickler date, records =WAITING_SINCE=, and frees up your active calendar.
 
 ** Task Properties
 
@@ -350,6 +369,7 @@ M-x org-auto-scheduler-focus
   ─────────────────────────────────  ──────────────────────────────────────────
   [k] + Checklist item               [RET] Toggle checklist item [ ] ↔ [X]
   [n] + Quick Note                   [d]   Mark DONE & Advance
+  [w] Wait on this & Advance
   [s] + Child Subtask                [+]   Extend +15m
   [a] + Sibling Task (after this)    [p]   Pause / Resume Clock
   [o] Jump to Org File               [q]   Minimize HUD
@@ -366,6 +386,7 @@ M-x org-auto-scheduler-focus
 | =s= | Add Subtask | Create child headline =** TODO <title>= with optional effort |
 | =a= | Add Sibling | Create sibling task =* TODO <title> :AUTOSCH:= directly after current task |
 | =d= | Mark DONE & Advance | Mark task =DONE=, clock out, and auto-clock into the next scheduled task |
+| =w= | Wait on This & Advance | Prompt for note & tickler date, move to =WAITING=, and advance to next scheduled task |
 | =+= / === | Extend +15m | Extend current task effort and slot by 15m; ripples downstream tasks |
 | =p= | Pause / Resume | Toggle =org-clock-out= / =org-clock-in= |
 | =o= | Jump to Org | Open original Org file and reveal headline |
@@ -565,6 +586,7 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | Action                                | =*Org Auto Scheduler Review*= | =*Org Time Grid*=    | Notes                                                   |
 |---------------------------------------+-------------------------------+----------------------+---------------------------------------------------------|
 | *Toggle task application*             | =RET=, =m=                    | =RET=, =m=           | Toggle =[X]= / =[ ]=; updates grid/table live           |
+| *Set / Change TODO State*             | =t=                           | =t=                  | Prompt for new state; recalculates schedule & waiting   |
 | *Jump to Org heading*                 | =TAB=                         | =TAB=                | Open task or event heading in Org file                  |
 | *Select Next / Prev Block*            | =n= / =p= (line nav)          | =n= / =p=            | Native timegrid block selection protected from Evil     |
 | *Day Backward / Forward*              | =<= / =>=                     | =b= / =f=            | Native timegrid day navigation preserved                |
@@ -728,6 +750,8 @@ You can add lightweight modifier markers directly to the task title in any calen
 | =-kill-=, =(-kill-)=, =(-drop-)=, =(-c-)= | *Cancel / Drop Task* | Cancels the task with the configured kill state (default =DROPPED=, customizable via =org-auto-scheduler-kill-todo-state=), removing its schedule. |
 | =-e<dur>-= (e.g. =(-e30m-)=, =(-e1h-)=, =(-e1:30-)=) | *Update Effort* | Updates the task's =:Effort:= property in place (e.g. =00:30=, =01:00=, =01:30=) and reschedules with the new duration. |
 | =-+1d-= or =(-+1d-)= or =(-defer-)= | *Defer to Tomorrow* | Postpones the task to tomorrow (removes today's scheduled timestamp and sets =:NOT_BEFORE:= to tomorrow morning). |
+| =-w-=, =(-w-)=, =(-wait-)= | *Move to WAITING* | Transitions task to =WAITING=, records =:WAITING_SINCE:=, strips time slots, and removes from active calendar scheduling. |
+| =-w+<dur>-=, =(-w+3d-)=, =(-wait+1w-)= | *WAITING with Tickler* | Transitions task to =WAITING=, sets relative follow-up tickler date (e.g. 3 days or 1 week ahead), and removes from active work blocks. |
 | =-#A-=, =(-#A-)=, =(-#a-)=, =(-pri-a-)=, =(-!a-)= | *Set Priority A* | Sets Org task priority to =A= (=org-priority ?A=) and triggers a reschedule. |
 | =-#B-=, =(-#B-)=, =(-#b-)=, =(-pri-b-)=, =(-!b-)= | *Set Priority B* | Sets Org task priority to =B= (=org-priority ?B=) and triggers a reschedule. |
 | =-#C-=, =(-#C-)=, =(-#c-)=, =(-pri-c-)=, =(-!c-)= | *Set Priority C* | Sets Org task priority to =C= (=org-priority ?C=) and triggers a reschedule. |

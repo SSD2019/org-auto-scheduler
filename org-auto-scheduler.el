@@ -388,6 +388,47 @@ in outline order, unless overridden by :ORDERED: nil, :PARALLEL: t, or :INDEPEND
   :type 'string
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-waiting-states
+  '("WAITING" "HOLD" "PENDING")
+  "List of TODO states representing tasks waiting on external events or people.
+These tasks are never allocated active work slots by the auto-scheduler.
+Instead, they are tracked and displayed in the 'Waiting on Others' section
+at the bottom of the review buffer."
+  :type '(repeat string)
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-waiting-auto-clock-out t
+  "When non-nil, automatically clock out if currently clocked into a task
+that is moved into one of `org-auto-scheduler-waiting-states'."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-waiting-clear-scheduled-time 'clear-time
+  "Action to take on SCHEDULED when a task transitions to a waiting state.
+`clear-time': remove the time-of-day component, keeping the date as a follow-up tickler (e.g. <2026-10-02>).
+`clear-all': remove the SCHEDULED property entirely.
+nil: leave SCHEDULED unchanged."
+  :type '(choice (const :tag "Strip time-of-day (keep follow-up date)" clear-time)
+                 (const :tag "Remove SCHEDULED completely" clear-all)
+                 (const :tag "Do nothing" nil))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-waiting-stale-days 5
+  "Number of days a task can remain in a waiting state before being flagged as stale."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-waiting-require-autosch-tag t
+  "If non-nil, only track waiting tasks that carry the AUTOSCH tag.
+If nil, track all tasks in `org-agenda-files' that have a waiting state."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-waiting-since-property "WAITING_SINCE"
+  "Org property used to record when a task entered a waiting state."
+  :type 'string
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-category-weights
   '(("Work" . 10)
     ("Personal" . 5)
@@ -602,7 +643,7 @@ title marker (such as -r- or -r-all-) or `force-replan'."
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-title-marker-regex
-  (let ((token "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciRSFPXCI]\\)"))
+  (let ((token "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciwRSFPXCIW]\\)"))
     (format "\\(?:(\\s-*\\)?-\\(%s\\(?:-?%s\\)*\\)-\\(?:\\s-*)\\)?" token token))
   "Regular expression matching title markers for task scheduling modifiers.
 Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\\s-), (-\\f-), (-\\p-), (-rsf-),
@@ -1307,9 +1348,11 @@ When SILENT is non-nil, suppress confirmation message."
           (setq current-sep-date (substring row-id 6)))
          ((and row-id (not (org-auto-scheduler--review-special-row-p row-id)))
           (setq order-rank (+ order-rank 100.0))
-          (let* ((checked (if entry (string= (aref entry 0) "[X]") t))
-                 (skipped (not checked))
-                 (task-data (assoc row-id org-auto-scheduler-completed-tasks))
+          (let* ((task-data (assoc row-id org-auto-scheduler-completed-tasks))
+                 (is-blocked-or-failed (and task-data (memq (nth 9 task-data) '(:blocked :failed))))
+                 (is-waiting (org-auto-scheduler--review-waiting-row-p row-id))
+                 (checked (if entry (string= (aref entry 0) "[X]") t))
+                 (skipped (if (or is-blocked-or-failed is-waiting) nil (not checked)))
                  (marker (and task-data (nth 7 task-data)))
                  (headline (and task-data (nth 5 task-data)))
                  (override (and (bound-and-true-p org-auto-scheduler--review-overrides)
@@ -1771,6 +1814,18 @@ Returns a list of markers for tasks specified in BLOCKER or DEPENDS_ON that are 
           (push m active-blockers))))
     (nreverse active-blockers)))
 
+(defun org-auto-scheduler--get-waiting-blockers (marker)
+  "Return a list of blocker markers for MARKER whose TODO state is in `org-auto-scheduler-waiting-states'."
+  (let ((blockers (org-auto-scheduler-get-blockers marker))
+        (waiting nil))
+    (dolist (m blockers)
+      (when (and (markerp m) (marker-buffer m))
+        (org-with-point-at m
+          (let ((state (org-get-todo-state)))
+            (when (and state (member state org-auto-scheduler-waiting-states))
+              (push m waiting))))))
+    (nreverse waiting)))
+
 (defun org-auto-scheduler--get-task-blockers-info (marker)
   "Return detailed list of blocker descriptions for MARKER.
 Each item is (label . status-string)."
@@ -1784,6 +1839,7 @@ Each item is (label . status-string)."
             (let* ((h (org-with-point-at m (org-get-heading t t t t)))
                    (todo (org-with-point-at m (org-get-todo-state)))
                    (is-done (member todo org-done-keywords))
+                   (is-waiting (and todo (member todo org-auto-scheduler-waiting-states)))
                    (b-id (org-with-point-at m (org-id-get)))
                    (b-task (or (cl-find m org-auto-scheduler-completed-tasks
                                         :key (lambda (x) (nth 7 x)))
@@ -1791,6 +1847,7 @@ Each item is (label . status-string)."
                    (stat-label
                     (cond
                      (is-done "[DONE]")
+                     (is-waiting (format "[WAITING: %s]" todo))
                      ((null b-task) "[NOT IN SCHEDULE]")
                      ((eq (nth 9 b-task) :skipped) "[SKIPPED]")
                      ((eq (nth 9 b-task) :failed) "[FAILED]")
@@ -1855,6 +1912,7 @@ Hash table with date strings as keys and lists of items as values.")
             (tags (org-get-tags))
             (state (org-get-todo-state))
             (is-done (and state (member state (or org-done-keywords '("DONE" "CANCELLED" "DROPPED")))))
+            (is-waiting (and state (member state org-auto-scheduler-waiting-states)))
             (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
                                 (org-entry-get nil "AUTOSCH_PLACEHOLDER")
                                 (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
@@ -1862,6 +1920,7 @@ Hash table with date strings as keys and lists of items as values.")
        (unless (or (member "AUTOSCH" tags)
                    (member "ARCHIVE" tags)
                    is-done
+                   is-waiting
                    is-placeholder
                    has-repeater)
          (let ((task-id nil)
@@ -1892,6 +1951,7 @@ Hash table with date strings as keys and lists of items as values.")
             (let* ((task-name (org-get-heading t t t t))
                    (state (org-get-todo-state))
                    (is-done (and state (member state (or org-done-keywords '("DONE" "CANCELLED" "DROPPED")))))
+                   (is-waiting (and state (member state org-auto-scheduler-waiting-states)))
                    (scheduled-time-str (org-entry-get nil "SCHEDULED"))
                    (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
                    (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
@@ -1901,10 +1961,11 @@ Hash table with date strings as keys and lists of items as values.")
                                        (org-entry-get nil "AUTOSCH_PLACEHOLDER")
                                        (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, DONE tasks, and repeater tasks (repeaters are handled separately)
+              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, DONE tasks, waiting tasks, and repeater tasks (repeaters are handled separately)
               (when (and scheduled-time
                          (not (member "AUTOSCH" tags))
                          (not is-done)
+                         (not is-waiting)
                          (not is-placeholder)
                          (not (member "ARCHIVE" tags))
                          (not has-repeater))
@@ -1921,6 +1982,7 @@ Hash table with date strings as keys and lists of items as values.")
             (let* ((task-name (org-get-heading t t t t))
                    (state (org-get-todo-state))
                    (is-done (and state (member state (or org-done-keywords '("DONE" "CANCELLED" "DROPPED")))))
+                   (is-waiting (and state (member state org-auto-scheduler-waiting-states)))
                    (scheduled-time-str (org-entry-get nil "TIMESTAMP"))
                    (scheduled-time (when scheduled-time-str (org-time-string-to-time scheduled-time-str)))
                    (has-time-flag (when scheduled-time-str (string-match "[0-9][0-9]:[0-9][0-9]" scheduled-time-str)))
@@ -1930,10 +1992,11 @@ Hash table with date strings as keys and lists of items as values.")
                                        (org-entry-get nil "AUTOSCH_PLACEHOLDER")
                                        (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
                    (has-repeater (org-auto-scheduler-has-repeater-task (point-marker))))
-              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, DONE tasks, and repeater tasks
+              ;; Exclude AUTOSCH tags, placeholders, ARCHIVE tags, DONE tasks, waiting tasks, and repeater tasks
               (when (and scheduled-time
                          (not (member "AUTOSCH" tags))
                          (not is-done)
+                         (not is-waiting)
                          (not is-placeholder)
                          (not (member "ARCHIVE" tags))
                          (not has-repeater))
@@ -2931,6 +2994,25 @@ If POM is nil, use the current point."
     (error
      (org-todo (or (car org-done-keywords) "DONE")))))
 
+(defun org-auto-scheduler--parse-wait-duration (dur-str &optional base-time)
+  "Calculate target date string (YYYY-MM-DD) by adding DUR-STR (e.g. '3d', '1w') to BASE-TIME."
+  (let ((base (or base-time (current-time))))
+    (if (and dur-str (string-match "\\([0-9]+\\)\\([dwmy]\\)" dur-str))
+        (let ((num (string-to-number (match-string 1 dur-str)))
+              (unit (match-string 2 dur-str)))
+          (format-time-string "%Y-%m-%d"
+            (cond
+             ((string= unit "d") (time-add base (days-to-time num)))
+             ((string= unit "w") (time-add base (days-to-time (* num 7))))
+             ((string= unit "m") (if (fboundp 'org-auto-scheduler-add-months)
+                                     (org-auto-scheduler-add-months base num)
+                                   (time-add base (days-to-time (* num 30)))))
+             ((string= unit "y") (if (fboundp 'org-auto-scheduler-add-months)
+                                     (org-auto-scheduler-add-months base (* num 12))
+                                   (time-add base (days-to-time (* num 365)))))
+             (t base))))
+      (format-time-string "%Y-%m-%d" base))))
+
 (defun org-auto-scheduler--process-title-markers (marker)
   "Process title markers (e.g. -r-, -s-, -f-, -p-, -\\s-, -\\f-, -\\p-, -rsf-, -r-all-,
 -x-, -done-, -kill-, -drop-, -c-, -e30m-, -e1h-, -+1d-, -defer-, -#A-, -#B-, -#C-,
@@ -2954,7 +3036,11 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
             (let* ((match-grp (mapconcat #'identity (nreverse all-grps) " "))
                    (task-id (or (org-id-get) (when (buffer-file-name) (org-id-get-create))))
                    (is-r-all (string-match-p "r-all" match-grp))
-                   (is-defer (or (string-match-p "\\+[0-9]+d" match-grp) (string-match-p "defer" match-grp)))
+                   (is-defer (and (not (string-match-p "\\(?:w\\|wait\\)\\+" match-grp))
+                                  (or (string-match-p "\\+[0-9]+d" match-grp)
+                                      (string-match-p "defer" match-grp))))
+                   (wait-dur-str (when (string-match "\\(?:w\\|wait\\)\\+\\([0-9]+[dwmy]\\)" match-grp)
+                                   (match-string 1 match-grp)))
                    (effort-str (when (string-match "e\\([0-9]+[hm0-9:]*\\)" match-grp)
                                  (match-string 1 match-grp)))
                    (effort-minutes (and effort-str (org-auto-scheduler--parse-effort-string effort-str)))
@@ -2968,8 +3054,12 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                    (is-pri-off (or (string-match-p "\\\\#" match-grp)
                                    (string-match-p "pri-none" match-grp)
                                    (string-match-p "\\\\!" match-grp)))
-                   (regex-strip "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\)")
+                   (regex-strip "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\)")
                    (clean-match (replace-regexp-in-string regex-strip "" match-grp))
+                   (is-wait (or (string-match-p "wait" match-grp)
+                                (not (null wait-dur-str))
+                                (string-match-p "\\(?:^\\|[^a-z]\\)w\\(?:$\\|[^a-z]\\)" clean-match)
+                                (string-match-p "\\(?:^\\| \\)w\\(?: \\|$\\)" match-grp)))
                    (is-kill (or (string-match-p "kill" match-grp) (string-match-p "drop" match-grp)
                                 (string-match-p "c" clean-match)))
                    (is-done (or (string-match-p "done" match-grp)
@@ -2992,7 +3082,8 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                                    is-indep-on
                                    is-indep-off
                                    (and effort-minutes t)
-                                   is-defer))
+                                   is-defer
+                                   is-wait))
                    (cleaned-title (string-trim (replace-regexp-in-string
                                                 "[ \t]+" " "
                                                 (replace-regexp-in-string regex "" heading)))))
@@ -3019,7 +3110,22 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                (is-kill
                 (org-auto-scheduler--set-todo-state org-auto-scheduler-kill-todo-state)
                 (org-schedule '(4))
-                (org-delete-property org-auto-scheduler-scheduled-property)))
+                (org-delete-property org-auto-scheduler-scheduled-property))
+               (is-wait
+                (let ((w-state (or (car org-auto-scheduler-waiting-states) "WAITING")))
+                  (org-auto-scheduler--set-todo-state w-state)
+                  (if wait-dur-str
+                      (let ((target-day (org-auto-scheduler--parse-wait-duration wait-dur-str)))
+                        (org-schedule nil target-day))
+                    (pcase org-auto-scheduler-waiting-clear-scheduled-time
+                      ('clear-time
+                       (let ((cur-sched (org-entry-get nil "SCHEDULED")))
+                         (when (and cur-sched (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" cur-sched))
+                           (org-schedule nil (match-string 1 cur-sched)))))
+                      ('clear-all
+                       (org-schedule '(4)))
+                      (_ nil)))
+                  (org-delete-property org-auto-scheduler-scheduled-property))))
 
               ;; Update Effort property if specified
               (when effort-minutes
@@ -3093,6 +3199,7 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
 
               (list :reschedule (and is-resched t)
                     :reschedule-all (and is-r-all t)
+                    :waiting (and is-wait t)
                     :splittable (and is-split-on t)
                     :freeset (and is-free-on t)
                     :pinned (and is-pin-on t)
@@ -3283,7 +3390,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                               (puthash task-id m-res marker-data)
                               (when (plist-get m-res :reschedule-all)
                                 (setq has-r-all t)))
-                            (unless (and m-res (or (plist-get m-res :done) (plist-get m-res :kill)))
+                            (unless (and m-res (or (plist-get m-res :done) (plist-get m-res :kill) (plist-get m-res :waiting)))
                               (push m sched-tasks))))))
                     (nreverse sched-tasks)))
                  (_ (org-auto-scheduler--merge-saved-decisions tasks))
@@ -3302,7 +3409,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
             (maphash
              (lambda (tid m-res)
-               (when (or (plist-get m-res :done) (plist-get m-res :kill))
+               (when (or (plist-get m-res :done) (plist-get m-res :kill) (plist-get m-res :waiting))
                  (unless (gethash tid initial-snapshot)
                    (puthash tid
                             (list :task-id tid
@@ -3344,7 +3451,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (setf (nth 7 task-info) (cl-pushnew org-auto-scheduler-pinned-tag (nth 7 task-info) :test #'string=))))
                 ;; Check if scheduled for today or future with a time
                 (cond
-                 ((or (plist-get m-res :done) (plist-get m-res :kill))
+                 ((or (plist-get m-res :done) (plist-get m-res :kill) (plist-get m-res :waiting))
                   ;; Task was marked DONE or DROPPED via title marker; skip scheduling it
                   nil)
                  (t
@@ -3599,7 +3706,8 @@ heading when the current heading does not yet have a planning line."
        (let* ((state (org-get-todo-state))
               (tags (org-get-tags))
               (is-autosch (member "AUTOSCH" tags))
-              (is-valid-state (member state valid-states))
+              (is-waiting (and state (member state org-auto-scheduler-waiting-states)))
+              (is-valid-state (and (member state valid-states) (not is-waiting)))
               (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
                                   (org-entry-get nil "AUTOSCH_PLACEHOLDER")
                                   (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
@@ -3625,6 +3733,77 @@ heading when the current heading does not yet have a planning line."
      'agenda)
     (org-auto-scheduler--log-info "Found %d schedulable tasks across the agenda" (length tasks))
     (nreverse tasks)))
+
+(defun org-auto-scheduler--get-waiting-since (marker &optional state)
+  "Return a time value indicating when the task at MARKER entered STATE or WAITING.
+Checks `org-auto-scheduler-waiting-since-property', then Org LOGBOOK drawer,
+then active/inactive timestamps, falling back to nil."
+  (org-with-point-at marker
+    (let ((prop (org-entry-get nil org-auto-scheduler-waiting-since-property)))
+      (if (and prop (not (string-empty-p prop)))
+          (condition-case nil
+              (org-time-string-to-time prop)
+            (error nil))
+        (save-excursion
+          (let ((target-state (or state "WAITING"))
+                (found-time nil))
+            (org-back-to-heading t)
+            (let ((end (save-excursion (outline-next-heading) (point))))
+              (when (re-search-forward (concat "- State +\"" (regexp-quote target-state) "\"") end t)
+                (when (re-search-forward "\\[\\([^]]+\\)\\]" (line-end-position) t)
+                  (let ((time-str (match-string-no-properties 1)))
+                    (condition-case nil
+                        (setq found-time (org-time-string-to-time time-str))
+                      (error nil))))))
+            (or found-time
+                (let ((sched (org-entry-get nil "SCHEDULED")))
+                  (when sched
+                    (condition-case nil
+                        (org-time-string-to-time sched)
+                      (error nil)))))))))))
+
+(defun org-auto-scheduler-get-waiting-tasks ()
+  "Get a list of waiting task info plists from agenda files.
+Tasks are selected if their TODO state is in `org-auto-scheduler-waiting-states'
+and (if `org-auto-scheduler-waiting-require-autosch-tag' is non-nil) they have
+the AUTOSCH tag, excluding ARCHIVE and placeholder tasks."
+  (let ((waiting-tasks '()))
+    (org-map-entries
+     (lambda ()
+       (let* ((state (org-get-todo-state))
+              (tags (org-get-tags))
+              (is-autosch (member "AUTOSCH" tags))
+              (is-waiting (and state (member state org-auto-scheduler-waiting-states)))
+              (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                  (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                  (org-entry-get nil "AUTOSCH_ORIGIN_ID"))))
+         (when (and is-waiting
+                    (or (not org-auto-scheduler-waiting-require-autosch-tag) is-autosch)
+                    (not (member "ARCHIVE" tags))
+                    (not is-placeholder))
+           (let* ((marker (point-marker))
+                  (task-id (or (org-id-get) (when (buffer-file-name) (org-id-get-create))))
+                  (headline (org-get-heading t t t t))
+                  (scheduled (org-entry-get nil "SCHEDULED"))
+                  (deadline (org-entry-get nil "DEADLINE"))
+                  (waiting-since (org-auto-scheduler--get-waiting-since marker state))
+                  (days-waiting (when waiting-since
+                                  (max 0 (floor (/ (float-time (time-subtract (current-time) waiting-since)) 86400)))))
+                  (project-name (org-auto-scheduler--get-project-name marker)))
+             (push (list :id task-id
+                         :marker marker
+                         :headline headline
+                         :state state
+                         :tags tags
+                         :scheduled scheduled
+                         :deadline deadline
+                         :waiting-since waiting-since
+                         :days-waiting days-waiting
+                         :project-name project-name)
+                   waiting-tasks)))))
+     nil
+     'agenda)
+    (nreverse waiting-tasks)))
 
 (defun org-auto-scheduler-create-recurring-instances (headline recurring scheduled not-before)
   "Create recurring instances for a task and return a list of markers for the scheduled tasks."
@@ -4703,6 +4882,24 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
           (setq available-time start-time))
 
         (cond
+         ((not all-blockers-met)
+          (let* ((waiting-blockers (org-auto-scheduler--get-waiting-blockers marker))
+                 (has-waiting-blocker (not (null waiting-blockers)))
+                 (status-str (if has-waiting-blocker "BLOCKED (WAITING)" "BLOCKED"))
+                 (first-waiting-title (when has-waiting-blocker
+                                        (org-with-point-at (car waiting-blockers)
+                                          (org-get-heading t t t t))))
+                 (reason (if has-waiting-blocker
+                             (format "Blocked by WAITING: '%s'" (or first-waiting-title "task"))
+                           "Blocked by unmet dependencies")))
+            (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is %s. %s." headline status-str reason)
+            ;; Record blocked tasks so they appear in the review buffer
+            (when org-auto-scheduler--preview-mode
+              (push (list task-id current-time current-time '("AUTOSCH") nil headline
+                          status-str marker (or topo-depth 0) :blocked (list reason))
+                    org-auto-scheduler-completed-tasks)))
+          current-time) ; Return current-time unmodified since task wasn't scheduled
+
          (is-saved-skipped
           (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is marked skipped in saved decisions." headline)
           (when org-auto-scheduler--preview-mode
@@ -4710,15 +4907,6 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                         "SKIPPED" marker (or topo-depth 0) :skipped '("Skipped in previous session"))
                   org-auto-scheduler-completed-tasks))
           current-time)
-
-         ((not all-blockers-met)
-          (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is blocked by unmet dependencies. Skipping." headline)
-          ;; Record blocked tasks so they appear in the review buffer
-          (when org-auto-scheduler--preview-mode
-            (push (list task-id current-time current-time '("AUTOSCH") nil headline
-                            "BLOCKED" marker (or topo-depth 0) :blocked '("Blocked by unmet dependencies"))
-                  org-auto-scheduler-completed-tasks))
-          current-time) ; Return current-time unmodified since task wasn't scheduled
 
          (t
           ;; Task is not blocked, proceed to find an available time
@@ -5325,6 +5513,26 @@ to ensure fresh projections are generated."
           (insert "\n\n* Summary\n")
           (insert (format "- Total tasks scheduled: %d\n"
                           (length org-auto-scheduler-completed-tasks)))
+          (let ((waiting-tasks (org-auto-scheduler-get-waiting-tasks)))
+            (when waiting-tasks
+              (let ((stale (cl-remove-if-not (lambda (w)
+                                               (let ((d (plist-get w :days-waiting)))
+                                                 (and d (>= d org-auto-scheduler-waiting-stale-days))))
+                                             waiting-tasks)))
+                (insert (format "- Waiting tasks: %d" (length waiting-tasks)))
+                (if stale
+                    (insert (format " (%d STALE >= %d days)\n" (length stale) org-auto-scheduler-waiting-stale-days))
+                  (insert "\n"))
+                (when stale
+                  (insert "\n** ⚠️ Stale Waiting Tasks Requiring Follow-Up\n")
+                  (dolist (st stale)
+                    (insert (format "  - [%s] %s (waiting %d days%s)\n"
+                                    (plist-get st :state)
+                                    (plist-get st :headline)
+                                    (or (plist-get st :days-waiting) 0)
+                                    (if (plist-get st :scheduled)
+                                        (format ", Follow-up: %s" (plist-get st :scheduled))
+                                      ""))))))))
           ;; Final alignment of the entire table
           (goto-char (point-min))
           (search-forward "|" nil t)
@@ -6344,8 +6552,8 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
              ;; Resolved blocker marker:
              (t
               (let* ((todo (org-with-point-at b (org-get-todo-state)))
-                     (is-done (member todo org-done-keywords)))
-                ;; If not DONE, check how blocker is scheduled
+                     (is-done (member todo org-done-keywords))
+                     (is-waiting (and todo (member todo org-auto-scheduler-waiting-states))))
                 (unless is-done
                   (let* ((b-head (or (org-with-point-at b (org-get-heading t t t t)) "Blocker task"))
                          (b-id (org-with-point-at b (org-id-get)))
@@ -6353,6 +6561,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                               :key (lambda (x) (nth 7 x)))
                                      (and b-id (assoc b-id org-auto-scheduler-completed-tasks)))))
                     (cond
+                      (is-waiting
+                       (push (format "⛔ Blocker is WAITING (%s): %s"
+                                     todo (org-auto-scheduler--truncate b-head 30))
+                             warnings))
                      (b-task
                       (let ((b-status (nth 9 b-task))
                             (b-start (nth 1 b-task))
@@ -6480,29 +6692,33 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 
 (defun org-auto-scheduler--review-header-line (entries)
   "Build the `header-line-format' string from ENTRIES."
-  (let ((total 0) (hours 0.0) (projects (make-hash-table :test 'equal))
+  (let ((total 0) (hours 0.0) (waiting-count 0) (projects (make-hash-table :test 'equal))
         (min-date nil) (max-date nil) (today-count 0) (today-minutes 0)
         (today-str (format-time-string "%Y-%m-%d")))
     (dolist (e entries)
       (let* ((vec (cadr e))
              (id (car e)))
         (unless (org-auto-scheduler--review-special-row-p id)
-          (cl-incf total)
-          (let* ((dur-str (aref vec 4))
-                 (dur (string-to-number dur-str))
-                 (proj (aref vec 5)))
-            (setq hours (+ hours (/ dur 60.0)))
-            (when (and proj (not (string= proj "—")))
-              (puthash proj (1+ (gethash proj projects 0)) projects))
-            ;; Check if task is today
-            (let ((task-data (assoc id org-auto-scheduler-completed-tasks)))
-              (when (and task-data (nth 1 task-data))
-                (let ((d (format-time-string "%Y-%m-%d" (nth 1 task-data))))
-                  (when (string= d today-str)
-                    (cl-incf today-count)
-                    (cl-incf today-minutes dur))
-                  (when (or (null min-date) (string< d min-date)) (setq min-date d))
-                  (when (or (null max-date) (string< max-date d)) (setq max-date d)))))))))
+          (let ((task-data (assoc id org-auto-scheduler-completed-tasks)))
+            (if task-data
+                (progn
+                  (cl-incf total)
+                  (let* ((dur-str (aref vec 4))
+                         (dur (string-to-number dur-str))
+                         (proj (aref vec 5)))
+                    (setq hours (+ hours (/ dur 60.0)))
+                    (when (and proj (not (string= proj "—")))
+                      (puthash proj (1+ (gethash proj projects 0)) projects))
+                    ;; Check if task is today
+                    (when (nth 1 task-data)
+                      (let ((d (format-time-string "%Y-%m-%d" (nth 1 task-data))))
+                        (when (string= d today-str)
+                          (cl-incf today-count)
+                          (cl-incf today-minutes dur))
+                        (when (or (null min-date) (string< d min-date)) (setq min-date d))
+                        (when (or (null max-date) (string< max-date d)) (setq max-date d))))))
+              ;; Task not in completed-tasks is in the waiting section
+              (cl-incf waiting-count))))))
     (let ((proj-legend ""))
       (maphash (lambda (name count)
                  (let ((color (and org-auto-scheduler--project-colors
@@ -6515,8 +6731,12 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                projects)
       (let* ((workday-mins (org-auto-scheduler-workday-duration-minutes))
              (gauge (org-auto-scheduler--render-capacity-gauge today-minutes workday-mins))
-             (legend (format " %s │ %d tasks (%.1fh) │%s"
-                             gauge total hours proj-legend)))
+             (waiting-badge (if (> waiting-count 0)
+                                (format " │ %s" (propertize (format "⏳ %d waiting" waiting-count)
+                                                            'face '(:inherit bold :foreground "#e5c07b")))
+                              ""))
+             (legend (format " %s │ %d scheduled (%.1fh)%s │%s"
+                             gauge total hours waiting-badge proj-legend)))
         (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
 ;;; Interactive Review Mode
@@ -6608,6 +6828,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "L")   #'org-auto-scheduler-show-change-log)
   (define-key map (kbd "C-c C-l") #'org-auto-scheduler-show-change-log)
   ;; Quit
+  (define-key map (kbd "t")     #'org-auto-scheduler-review-set-todo-state)
   (define-key map (kbd "q")     #'org-auto-scheduler-review-quit)
   (define-key map (kbd "C-c C-k") #'org-auto-scheduler-review-quit))
 
@@ -6629,6 +6850,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "L")       #'org-auto-scheduler-show-change-log
       (kbd "x")       #'org-auto-scheduler-review-execute
       (kbd "C-c C-c") #'org-auto-scheduler-review-execute
+      (kbd "t")       #'org-auto-scheduler-review-set-todo-state
       (kbd "q")       #'org-auto-scheduler-review-quit
       ;; Reordering
       (kbd "K")       #'org-auto-scheduler-review-move-up
@@ -6692,6 +6914,60 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (setq-local tabulated-list-printer #'org-auto-scheduler--tabulated-list-printer)
   (add-hook 'kill-buffer-hook #'org-auto-scheduler--review-cancel-recalc-timer nil t)
   (tabulated-list-init-header))
+
+(defun org-auto-scheduler-review-set-todo-state ()
+  "Prompt to change the TODO state of the task at point in the review buffer.
+Updates the state in the original Org buffer, runs state-change hooks,
+and refreshes the review buffer. Works on scheduled tasks, unscheduled tasks,
+and waiting tasks."
+  (interactive)
+  (let* ((row-id (tabulated-list-get-id)))
+    (when (or (null row-id) (org-auto-scheduler--review-special-row-p row-id))
+      (user-error "Not on a task row"))
+    (let* ((marker (cond
+                    ((string-prefix-p "__event_" row-id)
+                     (or (get-text-property (point) 'event-marker)
+                         (org-id-find row-id t)))
+                    ((assoc row-id org-auto-scheduler-completed-tasks)
+                     (let ((data (assoc row-id org-auto-scheduler-completed-tasks)))
+                       (or (nth 7 data) (org-id-find row-id t))))
+                    (t
+                     (org-id-find row-id t)))))
+      (unless (and marker (markerp marker) (marker-buffer marker))
+        (user-error "Cannot find original task for ID: %s" row-id))
+      (let* ((buffer (marker-buffer marker))
+             (current-state (org-with-point-at marker (org-get-todo-state)))
+             (file-keywords (with-current-buffer buffer
+                              (if (boundp 'org-todo-keywords-1)
+                                  org-todo-keywords-1
+                                '("TODO" "NEXT" "IN-PROGRESS" "WAITING" "HOLD" "DONE" "CANCELLED" "DROPPED"))))
+             (all-keywords (delete-dups (append file-keywords
+                                                org-auto-scheduler-waiting-states
+                                                (mapcar #'car org-auto-scheduler-state-weights)
+                                                '("DONE" "CANCELLED"))))
+             (choices (cons "[CLEAR]" all-keywords))
+             (prompt (format "Change TODO state for '%s' (current: %s): "
+                             (org-auto-scheduler--truncate
+                              (org-with-point-at marker (org-get-heading t t t t)) 30)
+                             (or current-state "none")))
+             (new-state (completing-read prompt choices nil t)))
+        (org-auto-scheduler--review-push-undo)
+        (with-current-buffer buffer
+          (save-excursion
+            (goto-char marker)
+            (if (string= new-state "[CLEAR]")
+                (org-todo "")
+              (org-todo new-state))))
+        (message "Updated task to state '%s'."
+                 (if (string= new-state "[CLEAR]") "none" new-state))
+        ;; Save in-progress review decisions so custom orders are kept
+        (org-auto-scheduler-review-save-decisions t)
+        ;; Recalculate preview schedule and refresh the view
+        (org-auto-scheduler-review-and-apply)
+        ;; Restore point to modified task if present
+        (when (get-buffer "*Org Auto Scheduler Review*")
+          (with-current-buffer "*Org Auto Scheduler Review*"
+            (org-auto-scheduler--review-goto-task row-id)))))))
 
 (defun org-auto-scheduler-review-toggle ()
   "Toggle the apply checkmark for the task at point.
@@ -6994,6 +7270,16 @@ of idle time, or immediately if that delay is nil or non-positive."
       (org-auto-scheduler-review-recalculate)
       (when task-id (org-auto-scheduler--review-goto-task task-id)))))
 
+(defun org-auto-scheduler--review-waiting-row-p (task-id)
+  "Return non-nil if TASK-ID belongs to a waiting task in the review buffer."
+  (and task-id
+       (let ((marker (or (get-text-property (point) 'task-marker)
+                         (org-id-find task-id t))))
+         (and marker (markerp marker) (marker-buffer marker)
+              (org-with-point-at marker
+                (let ((state (org-get-todo-state)))
+                  (and state (member state org-auto-scheduler-waiting-states))))))))
+
 (defun org-auto-scheduler-review-move-up ()
   "Move the current task up in the review list, crossing day boundaries if needed.
 Recalculates the schedule immediately afterward unless
@@ -7007,6 +7293,10 @@ Recalculates the schedule immediately afterward unless
       (if (and id1 (string-prefix-p "__event_" id1))
           (user-error "Cannot move fixed agenda event")
         (user-error "Not on a task")))
+     ((org-auto-scheduler--review-waiting-row-p id1)
+      (user-error "Cannot move WAITING task. Set state to TODO with 't' to schedule"))
+     ((and id2 (string= id2 "__sep_Waiting"))
+      (user-error "Cannot move across Waiting section separator"))
      ((or (null id2) (string= id2 "__header_shortcuts"))
       (user-error "Task is already at the top of the schedule"))
      ((string-prefix-p "__sep_" id2)
@@ -7068,6 +7358,10 @@ Recalculates the schedule immediately afterward unless
          (cond
          ((null id2)
           (user-error "Task is at the end of the schedule (use '>' to move to next day)"))
+         ((org-auto-scheduler--review-waiting-row-p id1)
+          (user-error "Cannot move WAITING task. Set state to TODO with 't' to schedule"))
+         ((and id2 (string= id2 "__sep_Waiting"))
+          (user-error "Cannot move scheduled tasks into Waiting section"))
          ((string-prefix-p "__sep_" id2)
           ;; Moving down across a day separator into the next day
           (org-auto-scheduler--review-push-undo)
@@ -7212,7 +7506,11 @@ Recalculates the schedule immediately afterward unless
           (user-error "Cannot move task before today (%s)" today-str))
         (org-auto-scheduler-review-move-to-day prev-day)))))
 
-(defun org-auto-scheduler-review-move-to-date ()
+(defun org-auto-scheduler-review-move-to-date (&optional arg)
+  "Prompt for a date (and optional time if pinnable) and move the task at point.
+If point is on a waiting task, prompt for a follow-up tickler date,
+or clear it with prefix ARG (C-u d)."
+  (interactive "P")
   "Prompt for a date (and optional time if pinnable) and move the task at point."
   (interactive)
   (let* ((task-id (tabulated-list-get-id))
@@ -7221,6 +7519,37 @@ Recalculates the schedule immediately afterward unless
         (if (and task-id (string-prefix-p "__event_" task-id))
             (user-error "Cannot move fixed agenda event")
           (user-error "Not on a task"))
+      (if (org-auto-scheduler--review-waiting-row-p task-id)
+          (let* ((marker (or (get-text-property (point) 'task-marker)
+                             (org-id-find task-id t)))
+                 (headline (and marker (markerp marker) (marker-buffer marker)
+                                (org-with-point-at marker (org-get-heading t t t t)))))
+            (unless (and marker (markerp marker) (marker-buffer marker))
+              (user-error "Cannot find original task for ID: %s" task-id))
+            (org-auto-scheduler--review-push-undo)
+            (if arg
+                (progn
+                  (with-current-buffer (marker-buffer marker)
+                    (save-excursion
+                      (goto-char marker)
+                      (org-schedule '(4))))
+                  (message "Cleared tickler date for waiting task '%s'." (or headline "")))
+              (let* ((prompt (format "Set follow-up tickler date for '%s': "
+                                     (org-auto-scheduler--truncate (or headline "task") 30)))
+                     (date-input (org-read-date nil nil nil prompt))
+                     (target-day (if (and date-input (>= (length date-input) 10))
+                                     (substring date-input 0 10)
+                                   date-input)))
+                (with-current-buffer (marker-buffer marker)
+                  (save-excursion
+                    (goto-char marker)
+                    (org-schedule nil target-day)))
+                (message "Set follow-up tickler date to <%s> for '%s'." target-day (or headline ""))))
+            (org-auto-scheduler-review-save-decisions t)
+            (org-auto-scheduler-review-and-apply)
+            (when (get-buffer "*Org Auto Scheduler Review*")
+              (with-current-buffer "*Org Auto Scheduler Review*"
+                (org-auto-scheduler--review-goto-task task-id))))
       (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
              (marker (and task (nth 7 task)))
              (is-pinnable (org-auto-scheduler-task-pinnable-p marker task-id))
@@ -7244,7 +7573,7 @@ Recalculates the schedule immediately afterward unless
             (setq over (plist-put (plist-put over :pinnable t)
                                   :pinned-time final-ans)))
           (puthash task-id over org-auto-scheduler--review-overrides))
-        (org-auto-scheduler-review-move-to-day target-day)))))
+        (org-auto-scheduler-review-move-to-day target-day))))))
 
 (defun org-auto-scheduler--review-entries-day-before (entries id)
   "Return the day string of the nearest day separator at/before ID in ENTRIES.
@@ -7374,6 +7703,64 @@ BLOCKERS-INFO, if non-nil, indicates explicit BLOCKER or DEPENDS_ON dependencies
                             'face `(:foreground ,fg-color :weight bold)
                             'help-echo tooltip))))))
 
+(defun org-auto-scheduler--format-waiting-review-entry (w-task today-str)
+  "Format a waiting task plist W-TASK for display in the review buffer."
+  (let* ((task-id (plist-get w-task :id))
+         (marker (plist-get w-task :marker))
+         (headline (plist-get w-task :headline))
+         (state (or (plist-get w-task :state) "WAITING"))
+         (days-waiting (plist-get w-task :days-waiting))
+         (is-stale (and days-waiting (>= days-waiting org-auto-scheduler-waiting-stale-days)))
+         (sched (plist-get w-task :scheduled))
+         (dead (plist-get w-task :deadline))
+         (project-name (or (plist-get w-task :project-name) "—"))
+         (proj-trunc (org-auto-scheduler--truncate project-name 18))
+         (proj-color (and org-auto-scheduler--project-colors
+                          (gethash proj-trunc org-auto-scheduler--project-colors)))
+         (checked "[ ]")
+         (dot (org-auto-scheduler--project-dot proj-trunc))
+         (state-prefix (propertize (format "[%s] " state)
+                                   'face (if is-stale '(:inherit bold :foreground "#e5c07b") 'warning)))
+         (display-headline (concat state-prefix (copy-sequence (or headline "Untitled"))))
+         (time-str (cond
+                    (sched
+                     (let* ((cleaned (replace-regexp-in-string "[<>]" "" sched))
+                            (is-past (condition-case nil
+                                         (time-less-p (org-time-string-to-time sched)
+                                                      (current-time))
+                                       (error nil))))
+                       (if is-past
+                           (propertize (format "Ping: %s" cleaned) 'face '(:inherit bold :foreground "#e06c75"))
+                         (propertize (format "Ping: %s" cleaned) 'face '(:inherit italic :foreground "#98c379")))))
+                    (dead
+                     (let ((cleaned (replace-regexp-in-string "[<>]" "" dead)))
+                       (propertize (format "Due: %s" cleaned) 'face '(:inherit italic :foreground "#e5c07b"))))
+                    (t
+                     (propertize "No Follow-up" 'face 'shadow))))
+         (dur-str (cond
+                   ((and days-waiting (> days-waiting 0))
+                    (if is-stale
+                        (propertize (format "%dd ⚠️" days-waiting) 'face '(:inherit bold :foreground "#e5c07b"))
+                      (format "%dd" days-waiting)))
+                   (days-waiting "0d")
+                   (t "—")))
+         (colored-proj (cond
+                        (proj-color (propertize (copy-sequence proj-trunc) 'face `(:foreground ,proj-color)))
+                        ((string= proj-trunc "—") "")
+                        (t (copy-sequence proj-trunc))))
+         (colored-score (if is-stale
+                            (propertize "STALE" 'face '(:inherit bold :foreground "#e06c75"))
+                          (propertize "wait" 'face 'shadow)))
+         (stat-str (if is-stale
+                       (propertize "⚠️" 'face 'warning
+                                   'help-echo (format "Waiting for %d days (threshold: %d)"
+                                                      days-waiting org-auto-scheduler-waiting-stale-days))
+                     (propertize "⏳" 'face '(:foreground "#e5c07b" :inherit bold)
+                                 'help-echo "Waiting on external condition/person"))))
+    (list task-id
+          (vector (propertize checked 'task-marker marker) dot (propertize display-headline 'task-marker marker) time-str dur-str
+                  colored-proj colored-score stat-str))))
+
 (defun org-auto-scheduler--format-task-review-entry (task today-str)
   "Format a scheduled TASK for display in the review buffer."
   (let* ((task-id (nth 0 task))
@@ -7408,7 +7795,14 @@ BLOCKERS-INFO, if non-nil, indicates explicit BLOCKER or DEPENDS_ON dependencies
                                                               'help-echo (mapconcat #'identity (reverse all-warnings) "\n")))
                          (t                       (propertize "✓" 'face 'success))))
          (time-str (cond ((eq status :failed)  (propertize "FAILED" 'face 'error))
-                         ((eq status :blocked) (propertize "BLOCKED" 'face 'warning))
+                         ((eq status :blocked)
+                          (let ((waiting-b (and marker (markerp marker) (marker-buffer marker)
+                                                (org-auto-scheduler--get-waiting-blockers marker))))
+                            (if waiting-b
+                                (propertize "BLOCKED (WAITING)" 'face 'warning
+                                            'help-echo (mapconcat #'identity (reverse all-warnings) "\n"))
+                              (propertize "BLOCKED" 'face 'warning
+                                          'help-echo (mapconcat #'identity (reverse all-warnings) "\n")))))
                          ((eq status :skipped) (propertize "SKIPPED" 'face 'shadow))
                          (start (concat (org-auto-scheduler--format-time-short start) "–"
                                         (format-time-string "%H:%M" end)))
@@ -7679,9 +8073,31 @@ and optionally existing fixed agenda events interleaved chronologically."
         (dolist (task unscheduled-tasks)
           (push (org-auto-scheduler--format-task-review-entry task today-str) raw-entries))))
 
+    ;; Waiting on Others (placed after all days and unscheduled tasks, at the very bottom)
+    (let ((waiting-tasks (org-auto-scheduler-get-waiting-tasks)))
+      (when waiting-tasks
+        (let* ((stale-count (cl-count-if (lambda (w)
+                                           (let ((d (plist-get w :days-waiting)))
+                                             (and d (>= d org-auto-scheduler-waiting-stale-days))))
+                                         waiting-tasks))
+               (sep-title (format "-- Waiting on Others (%d task%s%s) "
+                                  (length waiting-tasks)
+                                  (if (= (length waiting-tasks) 1) "" "s")
+                                  (if (> stale-count 0)
+                                      (format ", %d STALE" stale-count)
+                                    "")))
+               (sep-line (concat sep-title (make-string (max 0 (- 50 (length sep-title))) ?-)))
+               (sep-face (if (> stale-count 0) '(:inherit bold :foreground "#e5c07b") 'bold)))
+          (push (list "__sep_Waiting"
+                      (vector "" "" (propertize sep-line 'face sep-face)
+                              "" "" "" "" ""))
+                raw-entries)
+          (dolist (w-task waiting-tasks)
+            (push (org-auto-scheduler--format-waiting-review-entry w-task today-str) raw-entries)))))
+
     ;; Shortcuts banner at top
     (cons (list "__header_shortcuts"
-                (vector "" "" (propertize "  [RET] toggle  [s] split  [p] pin  [b] non-blocking  [K/J] reorder  [>/<] day  [d] date  [r] recalc  [S] save  [M] merge  [C] clear  [x] apply  [?] help" 'face 'shadow)
+                (vector "" "" (propertize "  [RET] toggle  [t] state  [s] split  [p] pin  [b] non-blocking  [K/J] reorder  [>/<] day  [d] date  [r] recalc  [S] save  [M] merge  [C] clear  [x] apply  [?] help" 'face 'shadow)
                         "" "" "" "" ""))
           (nreverse raw-entries))))
 
@@ -9228,6 +9644,7 @@ Can be invoked from either the review table or the timegrid via `i'."
       (insert "Org Auto Scheduler Review & Timegrid Keybindings:\n\n")
       (insert "  RET, m       Toggle application of task at point/selected ([X] / [ ])\n")
       (insert "  TAB          Jump to task or event in Org file\n")
+      (insert "  t            Set or change TODO state of task at point (all tasks & waiting)\n")
       (insert "  s            Toggle SPLITTABLE status on task at point/selected\n")
       (insert "  F            Toggle FREESET status (off-hours flexible; splits at midnight)\n")
       (insert "  B, b         Toggle non-blocking status of fixed agenda event (B in timegrid)\n")
@@ -9626,6 +10043,57 @@ Finds current task via active clock, agenda point, or Org headline."
     (error (org-auto-scheduler--log-warn "Error in early-done hook: %s" err))))
 
 (add-hook 'org-after-todo-state-change-hook #'org-auto-scheduler--on-todo-state-change)
+
+(defun org-auto-scheduler--on-waiting-state-change ()
+  "Hook function for `org-after-todo-state-change-hook' to handle waiting state transitions.
+Clocks out if currently clocked into the task, strips or removes SCHEDULED time
+based on `org-auto-scheduler-waiting-clear-scheduled-time', and records/clears
+the `WAITING_SINCE' property."
+  (condition-case err
+      (let* ((new-state (or (and (boundp 'org-state) (stringp org-state) org-state)
+                            (org-get-todo-state)))
+             (is-waiting (and new-state (member new-state org-auto-scheduler-waiting-states))))
+        (if is-waiting
+            (save-excursion
+              (org-back-to-heading t)
+              ;; 1. Automatic Clock-out if active
+              (when (and org-auto-scheduler-waiting-auto-clock-out
+                         (fboundp 'org-clock-is-active)
+                         (org-clock-is-active))
+                (let ((clock-m (and (boundp 'org-clock-marker) (markerp org-clock-marker) org-clock-marker)))
+                  (when (or (null clock-m)
+                            (and (equal (marker-buffer clock-m) (current-buffer))
+                                 (<= (point) (marker-position clock-m))
+                                 (< (marker-position clock-m)
+                                    (save-excursion (outline-next-heading) (point)))))
+                    (org-clock-out nil t)
+                    (message "Clocked out: task moved to %s." new-state))))
+
+              ;; 2. Clear or strip scheduled time
+              (let ((sched (org-entry-get nil "SCHEDULED")))
+                (when sched
+                  (pcase org-auto-scheduler-waiting-clear-scheduled-time
+                    ('clear-all
+                     (org-entry-delete nil "SCHEDULED")
+                     (message "Removed SCHEDULED timestamp for %s task." new-state))
+                    ('clear-time
+                     (when (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\(?: +[A-Za-z]+\\)?\\)" sched)
+                       (let ((date-part (match-string 1 sched)))
+                         (org-auto-scheduler--set-scheduled (format "<%s>" date-part))
+                         (message "Converted SCHEDULED to follow-up tickler date <%s>." date-part))))
+                    (_ nil))))
+
+              ;; 3. Record WAITING_SINCE property if not already set
+              (unless (org-entry-get nil org-auto-scheduler-waiting-since-property)
+                (org-entry-put nil org-auto-scheduler-waiting-since-property
+                               (format-time-string "%Y-%m-%d %H:%M"))))
+
+          ;; Transitioning OUT of waiting state
+          (when (org-entry-get nil org-auto-scheduler-waiting-since-property)
+            (org-entry-delete nil org-auto-scheduler-waiting-since-property))))
+    (error (org-auto-scheduler--log-warn "Error in waiting state change hook: %s" err))))
+
+(add-hook 'org-after-todo-state-change-hook #'org-auto-scheduler--on-waiting-state-change)
 
 ;;; Schedule Adherence Tracking & Scoring
 
@@ -11028,12 +11496,15 @@ Returns a plist with task details or nil if no active task found."
                     (concat (propertize "[d]" 'face 'org-auto-scheduler-focus-key-face) "   Mark DONE & Advance")))
     (insert (format "  %-35s  %-42s\n"
                     (concat (propertize "[s]" 'face 'org-auto-scheduler-focus-key-face) " + Child Subtask")
-                    (concat (propertize "[+]" 'face 'org-auto-scheduler-focus-key-face) "   Extend +15m")))
+                    (concat (propertize "[w]" 'face 'org-auto-scheduler-focus-key-face) "   Wait on this & Advance")))
     (insert (format "  %-35s  %-42s\n"
                     (concat (propertize "[a]" 'face 'org-auto-scheduler-focus-key-face) " + Sibling Task (after this)")
-                    (concat (propertize "[p]" 'face 'org-auto-scheduler-focus-key-face) "   Pause / Resume Clock")))
+                    (concat (propertize "[+]" 'face 'org-auto-scheduler-focus-key-face) "   Extend +15m")))
     (insert (format "  %-35s  %-42s\n"
                     (concat (propertize "[o]" 'face 'org-auto-scheduler-focus-key-face) " Jump to Org File")
+                    (concat (propertize "[p]" 'face 'org-auto-scheduler-focus-key-face) "   Pause / Resume Clock")))
+    (insert (format "  %-35s  %-42s\n"
+                    ""
                     (concat (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face) "   Minimize HUD")))))
 
 (defun org-auto-scheduler-focus--render-standby ()
@@ -11266,6 +11737,76 @@ sEffort (e.g. 30m, optional): ")
       (org-auto-scheduler-focus-refresh)
       (message "Task marked DONE."))))
 
+
+(defun org-auto-scheduler-focus-wait (&optional note tickler-date)
+  "Transition current task to WAITING, log an optional NOTE, and auto-advance.
+Prompts for an optional reason/note and an optional follow-up TICKLER-DATE.
+Clocks out of current task and auto-advances/clocks into the next scheduled task."
+  (interactive
+   (list (let ((n (read-string "Waiting on / Note (optional, RET to skip): ")))
+           (if (string-empty-p (string-trim n)) nil n))
+         (let ((t-ans (read-string "Follow-up tickler date (e.g. +3d, 2026-10-05, RET to skip): ")))
+           (if (string-empty-p (string-trim t-ans))
+               nil
+             (condition-case nil
+                 (org-read-date nil nil t-ans)
+               (error t-ans))))))
+  (let ((m org-auto-scheduler-focus--target-marker))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No active task in Focus HUD"))
+    (let* ((waiting-state (or (car org-auto-scheduler-waiting-states) "WAITING")))
+      (org-with-point-at m
+        ;; Change TODO state to WAITING (hook clocks out and strips time)
+        (org-todo waiting-state)
+        ;; If tickler provided, set scheduled date
+        (when (and tickler-date (not (string-empty-p (string-trim tickler-date))))
+          (let ((target-day (if (>= (length tickler-date) 10) (substring tickler-date 0 10) tickler-date)))
+            (org-schedule nil target-day)))
+        ;; If note provided, log it
+        (when (and note (not (string-empty-p (string-trim note))))
+          (let ((ts (format-time-string "%H:%M")))
+            (save-excursion
+              (goto-char (marker-position m))
+              (let ((task-end (save-excursion (or (outline-next-heading) (point-max)))))
+                (if (re-search-forward ":LOGBOOK:" task-end t)
+                    (progn
+                      (if (re-search-forward ":END:" task-end t)
+                          (goto-char (match-beginning 0))
+                        (goto-char task-end))
+                      (insert (format "  - [%s] WAITING: %s\n" ts (string-trim note))))
+                  (org-end-of-meta-data t)
+                  (unless (bolp) (insert "\n"))
+                  (insert (format "  - [%s] WAITING: %s\n" ts (string-trim note))))))))
+        ;; Ensure clocked out
+        (when (and (fboundp 'org-clock-is-active) (org-clock-is-active)
+                   (boundp 'org-clock-marker) (equal (marker-buffer org-clock-marker) (marker-buffer m))
+                   (= (marker-position org-clock-marker) (marker-position m)))
+          (org-clock-out nil t))
+        (when (buffer-file-name) (save-buffer)))
+      ;; Advance to next task if configured
+      (if org-auto-scheduler-focus-auto-clock-in-on-advance
+          (let* ((today-tasks (ignore-errors (org-auto-scheduler-get-today-scheduled-tasks)))
+                 (next-task nil))
+            (dolist (tk today-tasks)
+              (when (and (not next-task)
+                         (not (plist-get tk :is-done))
+                         (not (member (plist-get tk :state) org-auto-scheduler-waiting-states))
+                         (not (equal (plist-get tk :marker) m)))
+                (setq next-task tk)))
+            (if next-task
+                (let ((nm (plist-get next-task :marker)))
+                  (org-with-point-at nm
+                    (org-clock-in))
+                  (setq org-auto-scheduler-focus--target-marker nm)
+                  (org-auto-scheduler-focus-refresh)
+                  (message "Moved to WAITING. Advanced and clocked into: %s" (plist-get next-task :headline)))
+              (setq org-auto-scheduler-focus--target-marker nil)
+              (org-auto-scheduler-focus-refresh)
+              (message "Task moved to WAITING. No more scheduled tasks for today.")))
+        (setq org-auto-scheduler-focus--target-marker nil)
+        (org-auto-scheduler-focus-refresh)
+        (message "Task moved to WAITING.")))))
+
 (defun org-auto-scheduler-focus-extend (&optional minutes)
   "Extend the current task by MINUTES (default 15) and repack downstream tasks."
   (interactive (list (read-number "Extend current task by minutes: " 15)))
@@ -11343,6 +11884,7 @@ sEffort (e.g. 30m, optional): ")
     (define-key map (kbd "s") #'org-auto-scheduler-focus-add-subtask)
     (define-key map (kbd "a") #'org-auto-scheduler-focus-add-sibling)
     (define-key map (kbd "d") #'org-auto-scheduler-focus-done)
+    (define-key map (kbd "w") #'org-auto-scheduler-focus-wait)
     (define-key map (kbd "+") #'org-auto-scheduler-focus-extend)
     (define-key map (kbd "=") #'org-auto-scheduler-focus-extend)
     (define-key map (kbd "p") #'org-auto-scheduler-focus-toggle-pause)
@@ -11374,6 +11916,7 @@ sEffort (e.g. 30m, optional): ")
       (evil-local-set-key st (kbd "s")         #'org-auto-scheduler-focus-add-subtask)
       (evil-local-set-key st (kbd "a")         #'org-auto-scheduler-focus-add-sibling)
       (evil-local-set-key st (kbd "d")         #'org-auto-scheduler-focus-done)
+      (evil-local-set-key st (kbd "w")         #'org-auto-scheduler-focus-wait)
       (evil-local-set-key st (kbd "+")         #'org-auto-scheduler-focus-extend)
       (evil-local-set-key st (kbd "=")         #'org-auto-scheduler-focus-extend)
       (evil-local-set-key st (kbd "p")         #'org-auto-scheduler-focus-toggle-pause)
@@ -11398,6 +11941,7 @@ sEffort (e.g. 30m, optional): ")
       (kbd "s")         #'org-auto-scheduler-focus-add-subtask
       (kbd "a")         #'org-auto-scheduler-focus-add-sibling
       (kbd "d")         #'org-auto-scheduler-focus-done
+      (kbd "w")         #'org-auto-scheduler-focus-wait
       (kbd "+")         #'org-auto-scheduler-focus-extend
       (kbd "=")         #'org-auto-scheduler-focus-extend
       (kbd "p")         #'org-auto-scheduler-focus-toggle-pause
