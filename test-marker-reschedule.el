@@ -1534,6 +1534,36 @@ SCHEDULED: <%s 10:00-11:00>
         (org-auto-scheduler-focus-toggle-checklist)
         (assert-true (string-match-p "CHECKLIST \\[2/2\\]" (buffer-string)) "Test 16.3: Checklist count updated to 2/2")
         (assert-true (string-match-p "\\[X\\] Generate PKCE code" (buffer-string)) "Test 16.3: Item is now [X]")
+        ;; Verify keybindings: RET toggles checklist, SPC is preserved for Spacemacs leader / scrolling
+        (assert-equal (lookup-key org-auto-scheduler-focus-mode-map (kbd "RET"))
+                      #'org-auto-scheduler-focus-toggle-checklist
+                      "Test 16.3: RET is bound to toggle checklist")
+        (assert-equal (lookup-key org-auto-scheduler-focus-mode-map (kbd "o"))
+                      #'org-auto-scheduler-focus-goto-task-other-window
+                      "Test 16.3: 'o' is bound to org-auto-scheduler-focus-goto-task-other-window")
+        (assert-equal (lookup-key org-auto-scheduler-focus-mode-map (kbd "O"))
+                      #'org-auto-scheduler-focus-goto-task
+                      "Test 16.3: 'O' is bound to org-auto-scheduler-focus-goto-task")
+        (assert-true (not (eq (lookup-key org-auto-scheduler-focus-mode-map (kbd "SPC"))
+                              #'org-auto-scheduler-focus-toggle-checklist))
+                     "Test 16.3: SPC is NOT bound to toggle checklist (Spacemacs leader preserved)")
+
+        ;; Verify shortcuts legend is hidden by default and toggled with '?'
+        (assert-true (not (string-match-p "CAPTURE (Zero context switching)" (buffer-string)))
+                     "Test 16.3: Shortcuts legend hidden by default")
+        (assert-true (string-match-p (regexp-quote "[?] Shortcuts help") (buffer-string))
+                     "Test 16.3: '[?] Shortcuts help' prompt shown")
+        (assert-equal (lookup-key org-auto-scheduler-focus-mode-map (kbd "?"))
+                      #'org-auto-scheduler-focus-toggle-help
+                      "Test 16.3: '?' is bound to org-auto-scheduler-focus-toggle-help")
+        (org-auto-scheduler-focus-toggle-help)
+        (assert-true (string-match-p "CAPTURE (Zero context switching)" (buffer-string))
+                     "Test 16.3: Shortcuts legend shown after '?'")
+        (assert-true (string-match-p (regexp-quote "[?] Hide shortcuts help") (buffer-string))
+                     "Test 16.3: '[?] Hide shortcuts help' shown in expanded legend")
+        (org-auto-scheduler-focus-toggle-help)
+        (assert-true (not (string-match-p "CAPTURE (Zero context switching)" (buffer-string)))
+                     "Test 16.3: Shortcuts legend hidden again after second '?'")
 
         ;; 16.4: Add checklist, note, subtask, sibling
         (org-auto-scheduler-focus-add-checklist "Write unit tests")
@@ -1581,8 +1611,476 @@ SCHEDULED: <%s 10:00-11:00>
           (org-with-point-at m1
             (assert-equal (org-get-todo-state) "DONE" "Test 16.5: Task One marked DONE")))))))
 
+;; ============================================================================
+;; TEST 17: Configurable Waiting Tasks & Review Buffer Workflow
+;; ============================================================================
+
+(message "\n--- TEST 17: Configurable Waiting Tasks & Review Buffer Workflow ---")
+
+(let* ((temp-file (make-temp-file "org-test-waiting" nil ".org"))
+       (buf (find-file-noselect temp-file)))
+  (unwind-protect
+      (with-current-buffer buf
+        (insert "#+TODO: TODO NEXT IN-PROGRESS WAITING HOLD | DONE CANCELLED\n")
+        (org-mode)
+        (insert "* TODO Task With Clock :AUTOSCH:\nSCHEDULED: <2026-09-28 Mon 14:00-15:00>\n:PROPERTIES:\n:ID: test-wait-clk-1\n:EFFORT: 60\n:END:\n")
+        (insert "* WAITING Stale Task A :AUTOSCH:\nSCHEDULED: <2026-09-20 Sun>\n:PROPERTIES:\n:ID: test-wait-stale-a\n:EFFORT: 30\n:WAITING_SINCE: 2026-09-18 10:00\n:END:\n")
+        (insert "* HOLD Fresh Task B :AUTOSCH:\n:PROPERTIES:\n:ID: test-wait-fresh-b\n:EFFORT: 45\n:WAITING_SINCE: 2026-09-28 09:00\n:END:\n")
+        (insert "* TODO Normal Active C :AUTOSCH:\n:PROPERTIES:\n:ID: test-wait-active-c\n:EFFORT: 60\n:END:\n")
+        (save-buffer)
+        (let ((org-agenda-files (list temp-file)))
+
+          ;; 17.1: Hook on state transition to WAITING
+          (goto-char (point-min))
+          (re-search-forward "^\\* TODO Task With Clock")
+          (org-back-to-heading t)
+          (org-clock-in)
+          (assert-true (org-clock-is-active) "Test 17.1: Task With Clock clocked in")
+          (org-todo "WAITING")
+          (assert-true (not (org-clock-is-active)) "Test 17.1: Clock automatically stopped on transition to WAITING")
+          (let ((sched (org-entry-get nil "SCHEDULED")))
+            (assert-equal sched "<2026-09-28 Mon>" "Test 17.1: SCHEDULED time stripped to follow-up tickler date"))
+          (let ((since (org-entry-get nil "WAITING_SINCE")))
+            (assert-true (and since (not (string-empty-p since))) "Test 17.1: WAITING_SINCE property recorded"))
+          ;; Transition back to TODO removes WAITING_SINCE
+          (org-todo "TODO")
+          (assert-equal (org-entry-get nil "WAITING_SINCE") nil "Test 17.1: WAITING_SINCE removed when transitioning to TODO")
+
+          ;; 17.2: Task filtering & Stale Detection
+          (let ((schedulable (org-auto-scheduler-get-schedulable-tasks)))
+            ;; Only active tasks (Task With Clock and Normal Active C) are schedulable
+            (assert-equal (length schedulable) 2 "Test 17.2: Exactly 2 schedulable tasks (WAITING and HOLD excluded)")
+            (dolist (m schedulable)
+              (with-current-buffer (marker-buffer m)
+                (org-with-point-at m
+                  (assert-true (not (member (org-get-todo-state) org-auto-scheduler-waiting-states))
+                               "Test 17.2: Schedulable task is not in waiting-states")))))
+
+          (let ((waiting-tasks (org-auto-scheduler-get-waiting-tasks)))
+            (assert-equal (length waiting-tasks) 2 "Test 17.2: Found exactly 2 waiting tasks (Task A & Task B)")
+            (let ((stale-task (cl-find-if (lambda (w) (string= (plist-get w :id) "test-wait-stale-a")) waiting-tasks))
+                  (fresh-task (cl-find-if (lambda (w) (string= (plist-get w :id) "test-wait-fresh-b")) waiting-tasks)))
+              (assert-true (>= (plist-get stale-task :days-waiting) 8) "Test 17.2: Stale task has >= 8 days waiting")
+              (assert-true (>= (plist-get stale-task :days-waiting) org-auto-scheduler-waiting-stale-days)
+                           "Test 17.2: Stale task meets or exceeds stale threshold")
+              (assert-true (< (plist-get fresh-task :days-waiting) org-auto-scheduler-waiting-stale-days)
+                           "Test 17.2: Fresh task is below stale threshold")))
+
+          ;; 17.3: Review Buffer Layout & Placement
+          (org-auto-scheduler-review-and-apply)
+          (with-current-buffer "*Org Auto Scheduler Review*"
+            (let ((entries tabulated-list-entries)
+                  (sep-waiting-pos nil)
+                  (last-day-pos nil))
+              (let ((idx 0))
+                (dolist (e entries)
+                  (let ((id (car e)))
+                    (when (and (stringp id) (string-prefix-p "__sep_" id) (not (string= id "__sep_Waiting")))
+                      (setq last-day-pos idx))
+                    (when (and (stringp id) (string= id "__sep_Waiting"))
+                      (setq sep-waiting-pos idx))
+                    (setq idx (1+ idx)))))
+              (assert-true (and sep-waiting-pos last-day-pos (> sep-waiting-pos last-day-pos))
+                           "Test 17.3: Waiting section is placed at the bottom after all day sections")
+
+              ;; Check stale task formatting
+              (let ((stale-entry (assoc "test-wait-stale-a" entries))
+                    (fresh-entry (assoc "test-wait-fresh-b" entries)))
+                (assert-true stale-entry "Test 17.3: Stale task entry found in review list")
+                (assert-true fresh-entry "Test 17.3: Fresh task entry found in review list")
+                ;; Stale entry has warning symbol in St column (idx 7)
+                (assert-true (string-match-p "⚠️" (aref (cadr stale-entry) 7))
+                             "Test 17.3: Stale task displays ⚠️ in status column")
+                (assert-true (string-match-p "STALE" (aref (cadr stale-entry) 6))
+                             "Test 17.3: Stale task displays STALE in score column")
+                (assert-true (string-match-p "⏳" (aref (cadr fresh-entry) 7))
+                             "Test 17.3: Fresh task displays ⏳ in status column")))
+
+            ;; 17.4: Review Movement Guards & State Changing via 't'
+            ;; Movement guard: moving waiting task throws error
+            (org-auto-scheduler--review-goto-task "test-wait-stale-a")
+            (condition-case err
+                (progn (org-auto-scheduler-review-move-up) (assert-true nil "Test 17.4: Should error on move-up"))
+              (user-error
+               (assert-true (string-match-p "WAITING" (error-message-string err))
+                            "Test 17.4: Move-up correctly blocked on waiting task")))
+
+            ;; Change state using review command (mock completing-read to return "TODO")
+            (cl-letf (((symbol-function 'completing-read) (lambda (&rest _args) "TODO")))
+              (org-auto-scheduler-review-set-todo-state))
+            ;; Verify the task in the org buffer changed to TODO
+            (with-current-buffer buf
+              (let ((m (org-id-find "test-wait-stale-a" t)))
+                (org-with-point-at m
+                  (assert-equal (org-get-todo-state) "TODO" "Test 17.4: Task state in buffer changed to TODO via 't'"))))
+
+            ;; 17.5: Header line format includes waiting badge
+            (let ((hdr (org-auto-scheduler--review-header-line tabulated-list-entries)))
+              (assert-true (string-match-p "waiting" (nth 3 hdr))
+                           "Test 17.5: Header line displays waiting tasks badge"))
+
+            (kill-buffer "*Org Auto Scheduler Review*"))))
+    (when (buffer-live-p buf) (kill-buffer buf))
+    (delete-file temp-file)))
+
+
+;; ============================================================================
+;; TEST 18: Advanced Waiting Features (Tickler 'd', Blocker Attribution, HUD 'w', Mobile Markers)
+;; ============================================================================
+(message "\n--- TEST 18: Advanced Waiting Features (Tickler 'd', Blocker Attribution, HUD 'w', Mobile Markers) ---")
+
+(let* ((temp-file (make-temp-file "org-test-waiting-adv" nil ".org"))
+       (state-file (make-temp-file "org-test-waiting-state" nil ".el"))
+       (buf (find-file-noselect temp-file)))
+  (unwind-protect
+      (with-current-buffer buf
+        (insert "#+TODO: TODO NEXT IN-PROGRESS WAITING HOLD | DONE CANCELLED\n")
+        (org-mode)
+        ;; Task for Test 18.1: Review quick-tickler 'd'
+        (insert "* WAITING Waiting Task Tickler :AUTOSCH:\n:PROPERTIES:\n:ID: test-adv-tickler\n:EFFORT: 30\n:WAITING_SINCE: 2026-09-20 10:00\n:END:\n")
+        ;; Tasks for Test 18.2: Blocker Attribution
+        (insert "* WAITING Dependency Blocker Task :AUTOSCH:\n:PROPERTIES:\n:ID: test-adv-blocker\n:EFFORT: 60\n:WAITING_SINCE: 2026-09-25 10:00\n:END:\n")
+        (insert "* TODO Blocked Downstream Task :AUTOSCH:\n:PROPERTIES:\n:ID: test-adv-downstream\n:EFFORT: 45\n:BLOCKER: test-adv-blocker\n:END:\n")
+        ;; Tasks for Test 18.3: Focus HUD 'w'
+        (let ((today-d (format-time-string "%Y-%m-%d %a")))
+          (insert (format "* TODO Focus Current Task :AUTOSCH:\nSCHEDULED: <%s 14:00-15:00>\n:PROPERTIES:\n:ID: test-adv-focus-cur\n:EFFORT: 60\n:END:\n" today-d))
+          (insert (format "* TODO Focus Next Task :AUTOSCH:\nSCHEDULED: <%s 15:00-16:00>\n:PROPERTIES:\n:ID: test-adv-focus-nxt\n:EFFORT: 60\n:END:\n" today-d)))
+        (save-buffer)
+        (let ((org-agenda-files (list temp-file))
+              (org-auto-scheduler-review-state-file state-file)
+              (org-auto-scheduler--saved-review-decisions nil)
+              (org-auto-scheduler--review-overrides (make-hash-table :test 'equal)))
+
+          ;; 18.1: Review Quick-Tickler Key ('d' and 'C-u d')
+          (org-auto-scheduler-review-and-apply)
+          (with-current-buffer "*Org Auto Scheduler Review*"
+            (org-auto-scheduler--review-goto-task "test-adv-tickler")
+            ;; Test setting follow-up date with 'd'
+            (cl-letf (((symbol-function 'org-read-date) (lambda (&rest _args) "2026-10-05")))
+              (org-auto-scheduler-review-move-to-date))
+            (with-current-buffer buf
+              (let ((m (org-id-find "test-adv-tickler" t)))
+                (org-with-point-at m
+                  (assert-equal (org-entry-get nil "SCHEDULED") "<2026-10-05 Mon>"
+                                "Test 18.1: Set tickler date on waiting task via 'd'"))))
+
+            ;; Test clearing follow-up date with 'C-u d'
+            (org-auto-scheduler-review-move-to-date '(4))
+            (with-current-buffer buf
+              (let ((m (org-id-find "test-adv-tickler" t)))
+                (org-with-point-at m
+                  (assert-equal (org-entry-get nil "SCHEDULED") nil
+                                "Test 18.1: Cleared tickler date on waiting task via 'C-u d'"))))
+            (kill-buffer "*Org Auto Scheduler Review*"))
+
+          ;; 18.2: Waiting Blocker Attribution
+          (let* ((downstream-marker (org-id-find "test-adv-downstream" t))
+                 (waiting-blockers (org-auto-scheduler--get-waiting-blockers downstream-marker)))
+            (assert-equal (length waiting-blockers) 1
+                          "Test 18.2: Detected exactly 1 waiting blocker")
+            ;; Check warning attribution
+            (let ((warns (org-auto-scheduler--check-task-warnings
+                          (list "test-adv-downstream" nil nil '("AUTOSCH") nil "Blocked Downstream Task"
+                                "BLOCKED" downstream-marker 1 :blocked)
+                          downstream-marker)))
+              (assert-true (cl-some (lambda (w) (string-match-p "Blocker is WAITING (WAITING)" w)) warns)
+                           "Test 18.2: Warning mentions Blocker is WAITING"))
+            ;; Check review buffer rendering
+            (org-auto-scheduler-review-and-apply)
+            (with-current-buffer "*Org Auto Scheduler Review*"
+              (let ((downstream-entry (assoc "test-adv-downstream" tabulated-list-entries)))
+                (assert-true downstream-entry "Test 18.2: Downstream task present in review list")
+                ;; Time column reflects BLOCKED (WAITING)
+                (assert-true (string-match-p "BLOCKED (WAITING)" (aref (cadr downstream-entry) 3))
+                             "Test 18.2: Time column displays BLOCKED (WAITING)"))
+              (kill-buffer "*Org Auto Scheduler Review*")))
+
+          ;; 18.3: Focus HUD 'w' ("Wait on This")
+          (let ((cur-m (org-id-find "test-adv-focus-cur" t))
+                (nxt-m (org-id-find "test-adv-focus-nxt" t))
+                (hud-buf (get-buffer-create "*Org Focus HUD*")))
+            (with-current-buffer buf
+              (goto-char cur-m)
+              (org-clock-in))
+            (assert-true (org-clock-is-active) "Test 18.3: Clocked into current task")
+            ;; Launch HUD
+            (with-current-buffer hud-buf
+              (org-auto-scheduler-focus-mode)
+              (setq org-auto-scheduler-focus--target-marker cur-m)
+              (org-auto-scheduler-focus-refresh))
+            (let ((org-auto-scheduler-focus-auto-clock-in-on-advance t))
+              (with-current-buffer hud-buf
+                (org-auto-scheduler-focus-wait "Waiting for client response" "2026-10-12")))
+            ;; Verify current task transitioned to WAITING
+            (with-current-buffer buf
+              (org-with-point-at cur-m
+                (assert-equal (org-get-todo-state) "WAITING"
+                             "Test 18.3: Task transitioned to WAITING via Focus HUD 'w'")
+                (assert-equal (org-entry-get nil "SCHEDULED") "<2026-10-12 Mon>"
+                             "Test 18.3: Follow-up tickler scheduled date set via Focus HUD 'w'")
+                (let ((task-body (buffer-substring-no-properties (point-min) (point-max))))
+                  (assert-true (string-match-p "WAITING: Waiting for client response" task-body)
+                               "Test 18.3: Waiting note logged in task body"))))
+            ;; Verify auto-advanced and clocked into next task in HUD buffer
+            (with-current-buffer hud-buf
+              (assert-equal org-auto-scheduler-focus--target-marker nxt-m
+                           "Test 18.3: Focus HUD auto-advanced target to next task"))
+            (when (fboundp 'org-clock-is-active)
+              (when (org-clock-is-active)
+                (org-clock-out)))
+            (when (buffer-live-p hud-buf)
+              (kill-buffer hud-buf)))
+
+          ;; 18.4: Mobile Title Modifiers
+          ;; Insert fresh tasks with markers directly before marker processing
+          (with-current-buffer buf
+            (goto-char (point-max))
+            (insert "* TODO Mobile Plain Marker Task (-w-) :AUTOSCH:\n:PROPERTIES:\n:ID: test-adv-mobile-w\n:EFFORT: 30\n:END:\n")
+            (insert "* TODO Mobile Relative Dur Task (-w+3d-) :AUTOSCH:\n:PROPERTIES:\n:ID: test-adv-mobile-3d\n:EFFORT: 45\n:END:\n")
+            (save-buffer))
+
+          ;; Process Mobile Task A (-w-)
+          (let ((m-w (org-id-find "test-adv-mobile-w" t)))
+            (org-auto-scheduler--process-title-markers m-w)
+            (with-current-buffer buf
+              (org-with-point-at m-w
+                (assert-equal (org-get-heading t t t t) "Mobile Plain Marker Task"
+                             "Test 18.4: (-w-) stripped from headline")
+                (assert-equal (org-get-todo-state) "WAITING"
+                             "Test 18.4: (-w-) transitioned state to WAITING")
+                (assert-true (org-entry-get nil "WAITING_SINCE")
+                             "Test 18.4: WAITING_SINCE recorded for (-w-)"))))
+
+          ;; Process Mobile Task B (-w+3d-)
+          (let ((m-3d (org-id-find "test-adv-mobile-3d" t))
+                (expected-date (org-auto-scheduler--parse-wait-duration "3d")))
+            (org-auto-scheduler--process-title-markers m-3d)
+            (with-current-buffer buf
+              (org-with-point-at m-3d
+                (assert-equal (org-get-heading t t t t) "Mobile Relative Dur Task"
+                             "Test 18.4: (-w+3d-) stripped from headline")
+                (assert-equal (org-get-todo-state) "WAITING"
+                             "Test 18.4: (-w+3d-) transitioned state to WAITING")
+                (let ((sched (org-entry-get nil "SCHEDULED")))
+                  (assert-true (and sched (string-prefix-p (format "<%s" expected-date) sched))
+                               "Test 18.4: (-w+3d-) set relative scheduled follow-up date")))))
+
+          ;; Run scheduler to ensure mobile waiting tasks are not allocated active time slots
+          (org-auto-scheduler-schedule-tasks)
+          (let ((schedulable (org-auto-scheduler-get-schedulable-tasks)))
+            (dolist (m schedulable)
+              (with-current-buffer (marker-buffer m)
+                (org-with-point-at m
+                  (assert-true (not (member (org-get-todo-state) org-auto-scheduler-waiting-states))
+                               "Test 18.4: Schedulable task is not in waiting-states")))))))
+    (when (buffer-live-p buf) (kill-buffer buf))
+    (when (file-exists-p state-file) (delete-file state-file))
+    (delete-file temp-file)))
+
+
+;; ============================================================================
+;; TEST 19: Focus HUD Boundary Isolation & Target Heading Resolution
+;; ============================================================================
+(message "\n--- TEST 19: Focus HUD Boundary Isolation & Target Resolution ---")
+
+(let* ((temp-file (make-temp-file "test-focus-boundary-" nil ".org"))
+       (buf (find-file-noselect temp-file))
+       (hud-buf (get-buffer-create "*Org Focus HUD*")))
+  (unwind-protect
+      (with-current-buffer buf
+        (org-mode)
+        (insert "* TODO Target Task\n:PROPERTIES:\n:EFFORT: 30m\n:END:\n* TODO Neighbor Task\n:LOGBOOK:\n:END:\n")
+        (save-buffer)
+        (let ((m-target (progn (goto-char (point-min)) (point-marker))))
+
+          ;; 19.1: Adding checklist item 'k' to a task with NO existing checklist items
+          ;; Must stay within m-target and NOT leak into Neighbor Task
+          (with-current-buffer hud-buf
+            (org-auto-scheduler-focus-mode)
+            (setq org-auto-scheduler-focus--target-marker m-target)
+            (org-auto-scheduler-focus-refresh)
+            (org-auto-scheduler-focus-add-checklist "First Target Checklist"))
+
+          (with-current-buffer buf
+            (let ((content (buffer-string)))
+              (assert-true (string-match "\\* TODO Target Task\n:PROPERTIES:\n:EFFORT: 30m\n:END:\n  - \\[ \\] First Target Checklist\n\\* TODO Neighbor Task" content)
+                           "Test 19.1: Checklist item inserted into Target Task without leaking into Neighbor Task")))
+
+          ;; 19.2: Adding note 'n' to Target Task (which has no LOGBOOK)
+          ;; Must not leak into Neighbor Task's LOGBOOK
+          (with-current-buffer hud-buf
+            (org-auto-scheduler-focus-add-note "Target Quick Note"))
+          (with-current-buffer buf
+            (let* ((m-neighbor (save-excursion
+                                 (goto-char (point-min))
+                                 (re-search-forward "Neighbor Task")
+                                 (org-back-to-heading t)
+                                 (point-marker)))
+                   (target-notes (org-auto-scheduler-focus--get-notes m-target))
+                   (neighbor-notes (org-auto-scheduler-focus--get-notes m-neighbor)))
+              (assert-equal (length target-notes) 1 "Test 19.2: Exactly 1 note on Target Task")
+              (assert-true (string-match-p "Target Quick Note" (car target-notes)) "Test 19.2: Target note content matches")
+              (assert-equal (length neighbor-notes) 0 "Test 19.2: Neighbor Task LOGBOOK received 0 notes")))
+
+          ;; 19.3: Adding child subtask 's'
+          (with-current-buffer hud-buf
+            (org-auto-scheduler-focus-add-subtask "Target Child Subtask" "15m"))
+          (with-current-buffer buf
+            (let ((subtasks (org-auto-scheduler-focus--get-subtasks m-target)))
+              (assert-equal (length subtasks) 1 "Test 19.3: Target Task has 1 child subtask")
+              (assert-equal (plist-get (car subtasks) :title) "Target Child Subtask" "Test 19.3: Child title matches")))
+
+          ;; 19.4: Adding sibling task 'a'
+          (with-current-buffer hud-buf
+            (org-auto-scheduler-focus-add-sibling "Target Sibling Task" "20m"))
+          (with-current-buffer buf
+            (save-excursion
+              (goto-char (point-min))
+              (assert-true (re-search-forward "^\\* TODO Target Sibling Task.*:AUTOSCH:" nil t)
+                           "Test 19.4: Sibling task inserted at level 1 with :AUTOSCH:"))))
+
+        ;; 19.5: Target Heading Resolution: Invoking focus on an Org heading when another task is clocked
+        (let ((clocked-file (make-temp-file "test-focus-clock-" nil ".org"))
+              (clocked-buf nil))
+          (unwind-protect
+              (progn
+                (setq clocked-buf (find-file-noselect clocked-file))
+                (with-current-buffer clocked-buf
+                  (org-mode)
+                  (insert "* TODO Background Clocked Task\n")
+                  (save-buffer)
+                  (goto-char (point-min))
+                  (org-clock-in))
+                ;; Now, user is visiting buf on Neighbor Task
+                (with-current-buffer buf
+                  (goto-char (point-min))
+                  (re-search-forward "Neighbor Task")
+                  ;; Call interactive form resolution
+                  (let ((resolved-marker
+                         (cond
+                          ((and (derived-mode-p 'org-mode)
+                                (not (derived-mode-p 'org-agenda-mode))
+                                (ignore-errors (save-excursion (org-back-to-heading t) (point-marker)))))
+                          ((eq major-mode 'org-agenda-mode)
+                           (let ((m (or (org-get-at-bol 'org-marker) (org-get-at-bol 'org-hd-marker))))
+                             (and m (markerp m) (marker-buffer m) m)))
+                          ((and (fboundp 'org-clock-is-active) (org-clock-is-active)
+                                (boundp 'org-clock-marker) (markerp org-clock-marker) (marker-buffer org-clock-marker))
+                           (org-with-point-at org-clock-marker
+                             (org-back-to-heading t)
+                             (point-marker)))
+                          (t nil))))
+                    (assert-true (and resolved-marker (equal (marker-buffer resolved-marker) buf))
+                                 "Test 19.5: Active org-mode buffer heading prioritized over background clocked task")
+                    (with-current-buffer (marker-buffer resolved-marker)
+                      (org-with-point-at resolved-marker
+                        (assert-equal (org-get-heading t t t t) "Neighbor Task"
+                                     "Test 19.5: Resolved heading is Neighbor Task"))))))
+            (when (fboundp 'org-clock-is-active)
+              (when (org-clock-is-active) (org-clock-out nil t)))
+            (when (buffer-live-p clocked-buf) (kill-buffer clocked-buf))
+            (when (file-exists-p clocked-file) (delete-file clocked-file)))))
+    (when (buffer-live-p buf) (kill-buffer buf))
+    (when (file-exists-p temp-file) (delete-file temp-file))))
+
+
+;;; ============================================================================
+;;; TEST 20: Focus HUD Time Remaining Calculation & Active Clock Detection
+;;; ============================================================================
+(message "\n--- TEST 20: Focus HUD Time Remaining & Active Clock Detection ---")
+(let* ((temp-file (make-temp-file "org-test-focus-clock-" nil ".org"))
+       (buf (find-file-noselect temp-file)))
+  (unwind-protect
+      (with-current-buffer buf
+        (org-mode)
+        ;; Task 1: 4-hour task (effort 240m), scheduled 2 days in the future (e.g. 14:00-18:00)
+        ;; Previously, time remaining calculated (time-subtract end-time now), giving ~2861m!
+        ;; Now, remaining time must reflect actual effort remaining (240m).
+        (let* ((future-date (format-time-string "%Y-%m-%d" (time-add (current-time) (* 2 86400)))))
+          (insert (format "* TODO Four Hour Future Task\nSCHEDULED: <%s Thu 14:00-18:00>\n:PROPERTIES:\n:Effort:   4:00\n:END:\n:LOGBOOK:\n:END:\n\n* TODO Secondary Task\n:PROPERTIES:\n:Effort:   1:00\n:END:\n" future-date))
+          (save-buffer))
+        (goto-char (point-min))
+        (let ((m1 (point-marker)))
+          (re-search-forward "Secondary Task")
+          (org-back-to-heading t)
+          (let ((m2 (point-marker)))
+            ;; 20.1 Test task-clocked-p and Focus HUD before clocking in
+            (assert-equal (org-auto-scheduler--task-clocked-p m1) nil
+                          "Test 20.1: m1 is not clocked in initially")
+            (org-auto-scheduler-focus m1)
+            (let ((hud-buf (get-buffer "*Org Focus HUD*")))
+              (with-current-buffer hud-buf
+                (assert-true (string-match-p "TIME REMAINING: 4h 00m left (240m)" (buffer-string))
+                             "Test 20.1: 4-hour future task displays '4h 00m left (240m)' (not 2800+ mins)")
+                (assert-true (string-match-p "\\[PAUSED / NOT CLOCKED\\]" (buffer-string))
+                             "Test 20.1: [PAUSED / NOT CLOCKED] shown when not clocked in")
+                (assert-true (string-match-p "14:00 – 18:00" (buffer-string))
+                             "Test 20.1: Slot times rendered")
+                (assert-true (not (string-match-p "14:00 – 18:00 (Today)" (buffer-string)))
+                             "Test 20.1: Future slot does not claim '(Today)'")))
+
+            ;; 20.2 Clock into m1 (drawer gets CLOCK line, org-clock-marker is inside drawer)
+            (with-current-buffer buf
+              (goto-char (marker-position m1))
+              (org-clock-in))
+            (assert-true (org-clocking-p) "Test 20.2: Clock is active")
+            (assert-true (org-auto-scheduler--task-clocked-p m1)
+                         "Test 20.2: org-auto-scheduler--task-clocked-p returns t for m1")
+            (assert-equal (org-auto-scheduler--task-clocked-p m2) nil
+                          "Test 20.2: org-auto-scheduler--task-clocked-p returns nil for m2")
+
+            ;; 20.3 Focus HUD while clocked in
+            (org-auto-scheduler-focus-refresh)
+            (let ((hud-buf (get-buffer "*Org Focus HUD*")))
+              (with-current-buffer hud-buf
+                (assert-true (string-match-p "TIME REMAINING: 4h 00m left (240m)" (buffer-string))
+                             "Test 20.3: TIME REMAINING remains 240m while clock just started")
+                (assert-true (not (string-match-p "\\[PAUSED / NOT CLOCKED\\]" (buffer-string)))
+                             "Test 20.3: [PAUSED / NOT CLOCKED] is NOT displayed when clocked in")))
+
+            ;; 20.4 Toggle pause via Focus HUD 'p'
+            (org-auto-scheduler-focus-toggle-pause)
+            (assert-true (not (org-clocking-p)) "Test 20.4: Clock stopped after toggle pause")
+            (let ((hud-buf (get-buffer "*Org Focus HUD*")))
+              (with-current-buffer hud-buf
+                (assert-true (string-match-p "\\[PAUSED / NOT CLOCKED\\]" (buffer-string))
+                             "Test 20.4: [PAUSED / NOT CLOCKED] appears after toggle pause")))
+
+            ;; 20.5 Resume clock via Focus HUD 'p'
+            (org-auto-scheduler-focus-toggle-pause)
+            (assert-true (org-clocking-p) "Test 20.5: Clock resumed after second toggle pause")
+            (assert-true (org-auto-scheduler--task-clocked-p m1)
+                         "Test 20.5: Task m1 is clocked in after resume")
+
+            ;; 20.6 Active clock time inclusion in clocked-time
+            ;; Mock clock having started 30 minutes ago
+            (setq org-clock-start-time (time-subtract (current-time) 1800))
+            (assert-equal (org-auto-scheduler-get-clocked-time m1) 30
+                          "Test 20.6: Active clock 30m elapsed included in clocked time")
+            (org-auto-scheduler-focus-refresh)
+            (let ((hud-buf (get-buffer "*Org Focus HUD*")))
+              (with-current-buffer hud-buf
+                (assert-true (string-match-p "TIME REMAINING: 3h 30m left (210m)" (buffer-string))
+                             "Test 20.6: TIME REMAINING updated to 3h 30m left (210m)")
+                (assert-true (string-match-p "30m clocked (12%)" (buffer-string))
+                             "Test 20.6: Progress shows 30m clocked (12%)")))
+
+            ;; 20.7 Test 'o' opens task in other window and 'O' opens in current window
+            (let ((hud-buf (get-buffer "*Org Focus HUD*")))
+              (with-current-buffer hud-buf
+                (org-auto-scheduler-focus-goto-task-other-window)
+                (assert-equal (current-buffer) buf
+                              "Test 20.7: Focused on original org buffer after other-window jump")
+                (assert-equal (point) (marker-position m1)
+                              "Test 20.7: Cursor positioned on target task headline after jump")))
+
+            ;; Clean up clock
+            (when (org-clocking-p) (org-clock-out nil t)))))
+    (when (buffer-live-p buf) (kill-buffer buf))
+    (when (file-exists-p temp-file) (delete-file temp-file))))
+
 (if (= test-failures 0)
-    (message "ALL 16 TEST SUITES PASSED PERFECTLY!")
+    (message "ALL 20 TEST SUITES PASSED PERFECTLY!")
   (message "FAILURES DETECTED: %d" test-failures))
 (message "==============================================")
 

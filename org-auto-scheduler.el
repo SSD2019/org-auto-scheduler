@@ -2120,6 +2120,26 @@ Checks for what-if overrides in the review buffer if active."
     (and (>= start-minutes scheduler-start-minutes)
          (<= end-minutes scheduler-end-minutes))))
 
+(defun org-auto-scheduler--task-clocked-p (marker)
+  "Return non-nil if the task at MARKER is currently clocked in."
+  (and (markerp marker)
+       (marker-buffer marker)
+       (or (and (fboundp 'org-clocking-p) (org-clocking-p))
+           (and (fboundp 'org-clock-is-active) (org-clock-is-active)))
+       (let ((clock-buf (or (and (boundp 'org-clock-hd-marker) (markerp org-clock-hd-marker) (marker-buffer org-clock-hd-marker))
+                            (and (boundp 'org-clock-marker) (markerp org-clock-marker) (marker-buffer org-clock-marker))))
+             (clock-pos (or (and (boundp 'org-clock-hd-marker) (markerp org-clock-hd-marker) (marker-position org-clock-hd-marker))
+                            (and (boundp 'org-clock-marker) (markerp org-clock-marker)
+                                 (org-with-point-at org-clock-marker
+                                   (ignore-errors (org-back-to-heading t) (point))))))
+             (marker-pos (org-with-point-at marker
+                           (ignore-errors (org-back-to-heading t) (point)))))
+         (and clock-buf
+              (equal clock-buf (marker-buffer marker))
+              clock-pos
+              marker-pos
+              (= clock-pos marker-pos)))))
+
 (defun org-auto-scheduler-get-clocked-time (marker)
   "Get the total clocked time for the task at MARKER in minutes, including current clock,
 but only considering time after the last DONE, NOTE, or DROPPED state change."
@@ -2136,9 +2156,7 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
           (setq marker (point-marker)))
 
         ;; Check for current clock
-        (when (and (org-clocking-p)
-                   (equal (marker-buffer org-clock-marker) (current-buffer))
-                   (= (marker-position org-clock-marker) (point)))
+        (when (org-auto-scheduler--task-clocked-p marker)
           (setq current-clock-time (float-time (time-subtract (current-time) org-clock-start-time))))
 
         (org-back-to-heading t)
@@ -3273,16 +3291,7 @@ Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date
                (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
                  (cons start-time (or end-time (time-add start-time (seconds-to-time 3600)))))))))))))
 
-(defun org-auto-scheduler--task-clocked-p (marker)
-  "Return non-nil if the task at MARKER is currently clocked in."
-  (and (markerp marker)
-       (marker-buffer marker)
-       (fboundp 'org-clocking-p)
-       (org-clocking-p)
-       (boundp 'org-clock-marker)
-       (markerp org-clock-marker)
-       (equal (marker-buffer org-clock-marker) (marker-buffer marker))
-       (= (marker-position org-clock-marker) (marker-position marker))))
+;; Note: `org-auto-scheduler--task-clocked-p' is defined earlier near `org-auto-scheduler-get-clocked-time'.
 
 (defun org-auto-scheduler--task-unscheduled-p (task-info)
   "Return non-nil if TASK-INFO represents an unscheduled task eligible for today.
@@ -11085,7 +11094,9 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
              (sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED")))
              (range (when sched-str (org-auto-scheduler-parse-scheduled-time-range sched-str)))
              (end-time (nth 1 range))
-             (overrun-mins (when end-time
+             (today-str (format-time-string "%Y-%m-%d" now))
+             (is-today-slot (and end-time (string= (format-time-string "%Y-%m-%d" end-time) today-str)))
+             (overrun-mins (when (and is-today-slot (time-less-p end-time now))
                              (round (/ (float-time (time-subtract now end-time)) 60)))))
         (if (and overrun-mins (> overrun-mins 0))
             (setq org-auto-scheduler--overrun-string
@@ -11184,6 +11195,15 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-focus-show-help nil
+  "Whether to display the shortkey legend by default in the Focus HUD cockpit.
+Defaults to nil (hidden until `?' is toggled)."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defvar-local org-auto-scheduler-focus--show-help nil
+  "Buffer-local flag indicating whether the shortcuts help is toggled visible.")
+
 (defvar org-auto-scheduler--focus-timer nil
   "Timer for updating the Focus HUD buffer.")
 
@@ -11194,13 +11214,19 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
   "Return a list of checklist items for task at MARKER.
 Each item is a plist (:pos POS :state STATE :text TEXT)."
   (org-with-point-at marker
-    (let ((items '())
-          (end (save-excursion
-                 (or (outline-next-heading) (point-max)))))
+    (org-back-to-heading t)
+    (let* ((items '())
+           (body-end (save-excursion
+                       (or (and (org-goto-first-child) (point))
+                           (and (outline-next-heading) (point))
+                           (point-max))))
+           (meta-end (save-excursion
+                       (org-back-to-heading t)
+                       (org-end-of-meta-data t)
+                       (min (point) body-end))))
       (save-excursion
-        (goto-char (marker-position marker))
-        (org-end-of-meta-data t)
-        (while (re-search-forward "^[ \t]*[-+*][ \t]+\\(\\[[ Xx-]\\]\\)[ \t]+\\(.*\\)$" end t)
+        (goto-char meta-end)
+        (while (re-search-forward "^[ \t]*[-+*][ \t]+\\(\\[[ Xx-]\\]\\)[ \t]+\\(.*\\)$" body-end t)
           (let ((pos (match-beginning 1))
                 (state (match-string-no-properties 1))
                 (text (match-string-no-properties 2)))
@@ -11211,9 +11237,11 @@ Each item is a plist (:pos POS :state STATE :text TEXT)."
   "Return a list of immediate child subtasks for task at MARKER.
 Each item is a plist (:pos POS :state STATE :title TITLE)."
   (org-with-point-at marker
+    (org-back-to-heading t)
     (let ((items '()))
       (save-excursion
         (goto-char (marker-position marker))
+        (org-back-to-heading t)
         (when (org-goto-first-child)
           (let ((done-loop nil))
             (while (not done-loop)
@@ -11228,12 +11256,20 @@ Each item is a plist (:pos POS :state STATE :title TITLE)."
 (defun org-auto-scheduler-focus--get-notes (marker)
   "Return a list of up to 4 recent timestamped notes for task at MARKER."
   (org-with-point-at marker
-    (let ((notes '())
-          (end (save-excursion
-                 (or (outline-next-heading) (point-max)))))
+    (org-back-to-heading t)
+    (let* ((notes '())
+           (body-end (save-excursion
+                       (or (and (org-goto-first-child) (point))
+                           (and (outline-next-heading) (point))
+                           (point-max))))
+           (meta-end (save-excursion
+                       (org-back-to-heading t)
+                       (org-end-of-meta-data t)
+                       (min (point) body-end))))
       (save-excursion
         (goto-char (marker-position marker))
-        (while (re-search-forward "^[ \t]*- \\(?:Note taken on \\)?\\[\\([^]]+\\)\\]\\(?: \\\\\\\\\\\n[ \t]*\\)?\\(.*\\)$" end t)
+        (org-back-to-heading t)
+        (while (re-search-forward "^[ \t]*- \\(?:Note taken on \\)?\\[\\([0-9][^]]*\\)\\]\\(?: \\\\\\\\\\n[ \t]*\\)?\\(.*\\)$" body-end t)
           (let* ((ts (match-string-no-properties 1))
                  (body (match-string-no-properties 2))
                  (short-ts (if (string-match "\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" ts)
@@ -11243,9 +11279,8 @@ Each item is a plist (:pos POS :state STATE :title TITLE)."
             (unless (string-empty-p note-text)
               (push (format "[%s] %s" short-ts note-text) notes)))))
       (save-excursion
-        (goto-char (marker-position marker))
-        (org-end-of-meta-data t)
-        (while (re-search-forward "^[ \t]*- \\(\\[[0-9]\\{2\\}:[0-9]\\{2\\}\\]\\)[ \t]+\\(.*\\)$" end t)
+        (goto-char meta-end)
+        (while (re-search-forward "^[ \t]*- \\(\\[[0-9]\\{2\\}:[0-9]\\{2\\}\\]\\)[ \t]+\\(.*\\)$" body-end t)
           (let ((ts (match-string-no-properties 1))
                 (text (match-string-no-properties 2)))
             (unless (member (format "%s %s" ts text) notes)
@@ -11309,10 +11344,7 @@ Returns a plist with task details or nil if no active task found."
                                (or org-auto-scheduler-default-task-duration 30)))
                (effort-mins (round raw-effort))
                (clocked-mins (round (or (ignore-errors (org-auto-scheduler-get-clocked-time marker)) 0)))
-               (is-clocked (and (fboundp 'org-clock-is-active) (org-clock-is-active)
-                                (boundp 'org-clock-marker) (markerp org-clock-marker)
-                                (equal (marker-buffer org-clock-marker) (marker-buffer marker))
-                                (= (marker-position org-clock-marker) (marker-position marker))))
+               (is-clocked (org-auto-scheduler--task-clocked-p marker))
                (pomo-spec (when (fboundp 'org-auto-scheduler-get-task-pomodoro-spec)
                             (org-auto-scheduler-get-task-pomodoro-spec marker)))
                (checklists (org-auto-scheduler-focus--get-checklists marker))
@@ -11346,18 +11378,25 @@ Returns a plist with task details or nil if no active task found."
          (pomo (plist-get task-info :pomodoro))
          (now (current-time))
          (time-str (format-time-string "%H:%M · %a %b %d" now))
-         (overrun-mins (when end-time
-                         (round (/ (float-time (time-subtract now end-time)) 60))))
+         (today-str (format-time-string "%Y-%m-%d" now))
+         (is-today-slot (and end-time (string= (format-time-string "%Y-%m-%d" end-time) today-str)))
+         ;; Overrun calculations:
+         ;; 1. Slot overrun: task was scheduled for a slot today, now is past scheduled end, and clocked in
+         (slot-overrun-mins (when (and is-today-slot (time-less-p end-time now) is-clocked)
+                              (round (/ (float-time (time-subtract now end-time)) 60))))
+         ;; 2. Effort overrun: clocked time exceeds estimated effort
+         (effort-overrun-mins (when (> clocked effort)
+                                (- clocked effort)))
+         (overrun-mins (or slot-overrun-mins effort-overrun-mins))
          (is-overrun (and overrun-mins (> overrun-mins 0)))
          (pct (min 100 (round (/ (* (float clocked) 100.0) effort))))
          (bar-width org-auto-scheduler-focus-bar-width)
          (filled-chars (min bar-width (round (* (/ (float pct) 100.0) bar-width))))
          (empty-chars (max 0 (- bar-width filled-chars)))
+         ;; Remaining effort is effort minus clocked time (not wall-clock distance to future slots!)
          (rem-mins (if is-overrun
                        0
-                     (if end-time
-                         (max 0 (round (/ (float-time (time-subtract end-time now)) 60)))
-                       (max 0 (- effort clocked))))))
+                     (max 0 (- effort clocked)))))
 
     ;; 1. Header Box
     (insert "╭" (make-string 77 ?─) "╮\n")
@@ -11375,11 +11414,21 @@ Returns a plist with task details or nil if no active task found."
 
     ;; 2. Metadata Lines
     (insert "  " (propertize "PROJECT:" 'face 'bold) "  " parent "\n")
-    (let ((slot-str (if (and start-time end-time)
-                        (format "%s – %s (Today)"
+    (let ((slot-str (cond
+                     ((and start-time end-time)
+                      (if is-today-slot
+                          (format "%s – %s (Today)"
+                                  (format-time-string "%H:%M" start-time)
+                                  (format-time-string "%H:%M" end-time))
+                        (format "%s – %s (%s)"
                                 (format-time-string "%H:%M" start-time)
-                                (format-time-string "%H:%M" end-time))
-                      "Flexible / Not Scheduled")))
+                                (format-time-string "%H:%M" end-time)
+                                (format-time-string "%a %b %d" start-time))))
+                     (start-time
+                      (format "%s (%s)"
+                              (format-time-string "%H:%M" start-time)
+                              (if is-today-slot "Today" (format-time-string "%a %b %d" start-time))))
+                     (t "Flexible / Not Scheduled"))))
       (insert "  " (propertize "SLOT:   " 'face 'bold) "  " slot-str
               (format " · Effort: %dm" effort)
               (if pomo
@@ -11388,21 +11437,31 @@ Returns a plist with task details or nil if no active task found."
               "\n\n"))
 
     ;; 3. Progress Bar & Pacing
-    (let ((bar-str (concat
+    (let* ((bar-str (concat
                     "["
                     (propertize (make-string filled-chars ?█) 'face 'org-auto-scheduler-focus-progress-done-face)
                     (propertize (make-string empty-chars ?░) 'face 'org-auto-scheduler-focus-progress-remain-face)
                     "]"))
+          (rem-str (cond
+                    ((<= rem-mins 0) "0m left")
+                    ((>= rem-mins 60)
+                     (format "%dh %02dm left (%dm)" (/ rem-mins 60) (% rem-mins 60) rem-mins))
+                    (t (format "%dm left" rem-mins))))
           (status-str (cond
                        (is-overrun
-                        (propertize (format "⚠️ OVERRUN: +%dm past scheduled end!" overrun-mins)
+                        (propertize (if slot-overrun-mins
+                                        (format "⚠️ OVERRUN: +%dm past scheduled end!" overrun-mins)
+                                      (format "⚠️ OVERRUN: +%dm over planned effort!" overrun-mins))
                                     'face 'org-auto-scheduler-focus-overrun-face))
                        ((not is-clocked)
-                        (format "TIME REMAINING: %dm left  " rem-mins))
+                        (format "TIME REMAINING: %s  " rem-str))
                        (t
-                        (format "TIME REMAINING: %dm left" rem-mins)))))
+                        (format "TIME REMAINING: %s" rem-str)))))
       (insert "  " status-str
-              (if (not is-clocked) (propertize "[PAUSED / NOT CLOCKED]" 'face 'org-auto-scheduler-focus-overrun-face) "")
+              (if (not is-clocked)
+                  (concat (if (string-suffix-p " " status-str) "" "  ")
+                          (propertize "[PAUSED / NOT CLOCKED]" 'face 'org-auto-scheduler-focus-overrun-face))
+                "")
               "\n")
       (insert "  " bar-str (format " %dm clocked (%d%%)\n\n" clocked pct)))
 
@@ -11438,7 +11497,7 @@ Returns a plist with task details or nil if no active task found."
                                        'focus-check-pos (plist-get item :pos)
                                        'focus-marker (plist-get task-info :marker)
                                        'mouse-face 'highlight
-                                       'help-echo "RET or SPC to toggle checklist item")))
+                                       'help-echo "RET to toggle checklist item")))
             (insert line-str))))
       (insert "  " (propertize (concat "└" (make-string 76 ?─) "┘") 'face 'org-auto-scheduler-focus-box-face) "\n\n"))
 
@@ -11485,27 +11544,38 @@ Returns a plist with task details or nil if no active task found."
                       "\n")))
           (insert "  " (propertize (concat "└" (make-string 76 ?─) "┘") 'face 'org-auto-scheduler-focus-box-face) "\n\n"))))
 
-    ;; 7. Keybindings Footer Table
-    (insert "  " (propertize "CAPTURE (Zero context switching)   ACTIONS & PACING" 'face 'org-auto-scheduler-focus-section-face) "\n")
-    (insert "  " (propertize (concat (make-string 33 ?─) "  " (make-string 42 ?─)) 'face 'org-auto-scheduler-focus-box-face) "\n")
-    (insert (format "  %-35s  %-42s\n"
-                    (concat (propertize "[k]" 'face 'org-auto-scheduler-focus-key-face) " + Checklist item")
-                    (concat (propertize "[RET]" 'face 'org-auto-scheduler-focus-key-face) " Toggle checklist item [ ] ↔ [X]")))
-    (insert (format "  %-35s  %-42s\n"
-                    (concat (propertize "[n]" 'face 'org-auto-scheduler-focus-key-face) " + Quick Note")
-                    (concat (propertize "[d]" 'face 'org-auto-scheduler-focus-key-face) "   Mark DONE & Advance")))
-    (insert (format "  %-35s  %-42s\n"
-                    (concat (propertize "[s]" 'face 'org-auto-scheduler-focus-key-face) " + Child Subtask")
-                    (concat (propertize "[w]" 'face 'org-auto-scheduler-focus-key-face) "   Wait on this & Advance")))
-    (insert (format "  %-35s  %-42s\n"
-                    (concat (propertize "[a]" 'face 'org-auto-scheduler-focus-key-face) " + Sibling Task (after this)")
-                    (concat (propertize "[+]" 'face 'org-auto-scheduler-focus-key-face) "   Extend +15m")))
-    (insert (format "  %-35s  %-42s\n"
-                    (concat (propertize "[o]" 'face 'org-auto-scheduler-focus-key-face) " Jump to Org File")
-                    (concat (propertize "[p]" 'face 'org-auto-scheduler-focus-key-face) "   Pause / Resume Clock")))
-    (insert (format "  %-35s  %-42s\n"
-                    ""
-                    (concat (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face) "   Minimize HUD")))))
+    ;; 7. Keybindings Footer Table (toggled with '?')
+    (if org-auto-scheduler-focus--show-help
+        (progn
+          (insert "  " (propertize "CAPTURE (Zero context switching)   ACTIONS & PACING" 'face 'org-auto-scheduler-focus-section-face) "\n")
+          (insert "  " (propertize (concat (make-string 33 ?─) "  " (make-string 42 ?─)) 'face 'org-auto-scheduler-focus-box-face) "\n")
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[k]" 'face 'org-auto-scheduler-focus-key-face) " + Checklist item")
+                          (concat (propertize "[RET]" 'face 'org-auto-scheduler-focus-key-face) " Toggle checklist item [ ] ↔ [X]")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[n]" 'face 'org-auto-scheduler-focus-key-face) " + Quick Note")
+                          (concat (propertize "[d]" 'face 'org-auto-scheduler-focus-key-face) "   Mark DONE & Advance")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[s]" 'face 'org-auto-scheduler-focus-key-face) " + Child Subtask")
+                          (concat (propertize "[w]" 'face 'org-auto-scheduler-focus-key-face) "   Wait on this & Advance")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[a]" 'face 'org-auto-scheduler-focus-key-face) " + Sibling Task (after this)")
+                          (concat (propertize "[+]" 'face 'org-auto-scheduler-focus-key-face) "   Extend +15m")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[o]" 'face 'org-auto-scheduler-focus-key-face) " Open in Other Window")
+                          (concat (propertize "[p]" 'face 'org-auto-scheduler-focus-key-face) "   Pause / Resume Clock")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[O]" 'face 'org-auto-scheduler-focus-key-face) " Jump to Org File")
+                          (concat (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face) "   Minimize HUD")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[?]" 'face 'org-auto-scheduler-focus-key-face) " Hide shortcuts help")
+                          ""))))
+      (insert "  " (propertize "[?]" 'face 'org-auto-scheduler-focus-key-face)
+              " " (propertize "Shortcuts help" 'face 'shadow)
+              "  ·  "
+              (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face)
+              " " (propertize "Minimize" 'face 'shadow)
+              "\n")))
 
 (defun org-auto-scheduler-focus--render-standby ()
   "Render standby view when no active or scheduled task is detected."
@@ -11525,7 +11595,33 @@ Returns a plist with task details or nil if no active task found."
     (insert (format "  %s  Refresh Focus HUD\n"
                     (propertize "[g]" 'face 'org-auto-scheduler-focus-key-face)))
     (insert (format "  %s  Close Focus HUD\n"
-                    (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face)))))
+                    (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face)))
+    (if org-auto-scheduler-focus--show-help
+        (progn
+          (insert (format "  %s  Hide shortcuts help\n\n"
+                          (propertize "[?]" 'face 'org-auto-scheduler-focus-key-face)))
+          (insert "  " (propertize "ALL FOCUS SHORTCUTS:" 'face 'org-auto-scheduler-focus-section-face) "\n")
+          (insert "  " (propertize (concat (make-string 33 ?─) "  " (make-string 42 ?─)) 'face 'org-auto-scheduler-focus-box-face) "\n")
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[k]" 'face 'org-auto-scheduler-focus-key-face) " + Checklist item")
+                          (concat (propertize "[RET]" 'face 'org-auto-scheduler-focus-key-face) " Toggle checklist item [ ] ↔ [X]")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[n]" 'face 'org-auto-scheduler-focus-key-face) " + Quick Note")
+                          (concat (propertize "[d]" 'face 'org-auto-scheduler-focus-key-face) "   Mark DONE & Advance")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[s]" 'face 'org-auto-scheduler-focus-key-face) " + Child Subtask")
+                          (concat (propertize "[w]" 'face 'org-auto-scheduler-focus-key-face) "   Wait on this & Advance")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[a]" 'face 'org-auto-scheduler-focus-key-face) " + Sibling Task (after this)")
+                          (concat (propertize "[+]" 'face 'org-auto-scheduler-focus-key-face) "   Extend +15m")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[o]" 'face 'org-auto-scheduler-focus-key-face) " Open in Other Window")
+                          (concat (propertize "[p]" 'face 'org-auto-scheduler-focus-key-face) "   Pause / Resume Clock")))
+          (insert (format "  %-35s  %-42s\n"
+                          (concat (propertize "[O]" 'face 'org-auto-scheduler-focus-key-face) " Jump to Org File")
+                          (concat (propertize "[q]" 'face 'org-auto-scheduler-focus-key-face) "   Minimize HUD"))))
+      (insert (format "  %s  Show all shortcuts\n"
+                      (propertize "[?]" 'face 'org-auto-scheduler-focus-key-face))))))
 
 (defun org-auto-scheduler-focus-refresh ()
   "Re-render the Focus HUD buffer, preserving cursor position if possible."
@@ -11579,21 +11675,29 @@ Returns a plist with task details or nil if no active task found."
     (when (string-empty-p (string-trim item-text))
       (user-error "Checklist item text cannot be empty"))
     (org-with-point-at m
+      (org-back-to-heading t)
       (save-excursion
-        (let ((end (save-excursion (or (outline-next-heading) (point-max))))
-              (last-check-pos nil))
-          (goto-char (marker-position m))
-          (org-end-of-meta-data t)
-          (while (re-search-forward "^[ \t]*[-+*][ \t]+\\[[ Xx-]\\]" end t)
-            (setq last-check-pos (line-end-position)))
-          (if last-check-pos
-              (progn
-                (goto-char last-check-pos)
-                (insert (format "\n  - [ ] %s" (string-trim item-text))))
-            (org-end-of-meta-data t)
-            (unless (bolp) (insert "\n"))
-            (insert (format "  - [ ] %s\n" (string-trim item-text)))))
-        (when (buffer-file-name) (save-buffer))))
+        (let* ((body-end (save-excursion
+                           (or (and (org-goto-first-child) (point))
+                               (and (outline-next-heading) (point))
+                               (point-max))))
+               (meta-end (save-excursion
+                           (org-back-to-heading t)
+                           (org-end-of-meta-data t)
+                           (min (point) body-end)))
+               (last-check-pos nil))
+          (save-excursion
+            (goto-char meta-end)
+            (while (re-search-forward "^[ \t]*[-+*][ \t]+\\[[ Xx-]\\]" body-end t)
+              (setq last-check-pos (line-end-position)))
+            (if last-check-pos
+                (progn
+                  (goto-char last-check-pos)
+                  (insert (format "\n  - [ ] %s" (string-trim item-text))))
+              (goto-char meta-end)
+              (unless (bolp) (insert "\n"))
+              (insert (format "  - [ ] %s\n" (string-trim item-text))))))
+        (when (buffer-file-name (buffer-base-buffer)) (save-buffer))))
     (org-auto-scheduler-focus-refresh)
     (message "Added checklist item: %s" item-text)))
 
@@ -11607,19 +11711,28 @@ Returns a plist with task details or nil if no active task found."
       (user-error "Note text cannot be empty"))
     (let ((ts (format-time-string "%H:%M")))
       (org-with-point-at m
+        (org-back-to-heading t)
         (save-excursion
-          (goto-char (marker-position m))
-          (let ((task-end (save-excursion (or (outline-next-heading) (point-max)))))
-            (if (re-search-forward ":LOGBOOK:" task-end t)
+          (let* ((body-end (save-excursion
+                             (or (and (org-goto-first-child) (point))
+                                 (and (outline-next-heading) (point))
+                                 (point-max))))
+                 (meta-end (save-excursion
+                             (org-back-to-heading t)
+                             (org-end-of-meta-data t)
+                             (min (point) body-end))))
+            (goto-char (marker-position m))
+            (org-back-to-heading t)
+            (if (re-search-forward "^[ \t]*:LOGBOOK:[ \t]*$" body-end t)
                 (progn
-                  (if (re-search-forward ":END:" task-end t)
+                  (if (re-search-forward "^[ \t]*:END:[ \t]*$" body-end t)
                       (goto-char (match-beginning 0))
-                    (goto-char task-end))
+                    (goto-char body-end))
                   (insert (format "  - [%s] %s\n" ts (string-trim note-text))))
-              (org-end-of-meta-data t)
+              (goto-char meta-end)
               (unless (bolp) (insert "\n"))
-              (insert (format "  - [%s] %s\n" ts (string-trim note-text)))))
-          (when (buffer-file-name) (save-buffer)))))
+              (insert (format "  - [%s] %s\n" ts (string-trim note-text))))
+            (when (buffer-file-name (buffer-base-buffer)) (save-buffer))))))
     (org-auto-scheduler-focus-refresh)
     (message "Note saved.")))
 
@@ -11667,7 +11780,7 @@ sEffort (e.g. 20m, optional): ")
           (goto-char insert-pos)
           (when (and effort (not (string-empty-p (string-trim effort))))
             (org-entry-put nil "EFFORT" (string-trim effort))))
-        (when (buffer-file-name) (save-buffer))))
+        (when (buffer-file-name (buffer-base-buffer)) (save-buffer))))
     (org-auto-scheduler-focus-refresh)
     (message "Created child subtask: %s" title)))
 
@@ -11695,7 +11808,7 @@ sEffort (e.g. 30m, optional): ")
           (org-toggle-tag "AUTOSCH" 'on)
           (when (and effort (not (string-empty-p (string-trim effort))))
             (org-entry-put nil "EFFORT" (string-trim effort))))
-        (when (buffer-file-name) (save-buffer))))
+        (when (buffer-file-name (buffer-base-buffer)) (save-buffer))))
     (org-auto-scheduler-focus-refresh)
     (message "Sibling task '%s' created and queued after current task." title)))
 
@@ -11707,9 +11820,7 @@ sEffort (e.g. 30m, optional): ")
       (user-error "No active task in Focus HUD"))
     (org-with-point-at m
       (org-todo "DONE")
-      (when (and (fboundp 'org-clock-is-active) (org-clock-is-active)
-                 (boundp 'org-clock-marker) (equal (marker-buffer org-clock-marker) (marker-buffer m))
-                 (= (marker-position org-clock-marker) (marker-position m)))
+      (when (org-auto-scheduler--task-clocked-p m)
         (org-clock-out nil t))
       (when (buffer-file-name) (save-buffer)))
     (when (fboundp 'org-auto-scheduler--on-todo-state-change)
@@ -11778,9 +11889,7 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
                   (unless (bolp) (insert "\n"))
                   (insert (format "  - [%s] WAITING: %s\n" ts (string-trim note))))))))
         ;; Ensure clocked out
-        (when (and (fboundp 'org-clock-is-active) (org-clock-is-active)
-                   (boundp 'org-clock-marker) (equal (marker-buffer org-clock-marker) (marker-buffer m))
-                   (= (marker-position org-clock-marker) (marker-position m)))
+        (when (org-auto-scheduler--task-clocked-p m)
           (org-clock-out nil t))
         (when (buffer-file-name) (save-buffer)))
       ;; Advance to next task if configured
@@ -11822,7 +11931,7 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
   (let ((m org-auto-scheduler-focus--target-marker))
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "No active task in Focus HUD"))
-    (if (and (fboundp 'org-clock-is-active) (org-clock-is-active))
+    (if (org-auto-scheduler--task-clocked-p m)
         (progn
           (org-clock-out)
           (org-auto-scheduler-focus-refresh)
@@ -11831,6 +11940,15 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
         (org-clock-in))
       (org-auto-scheduler-focus-refresh)
       (message "Clock RESUMED."))))
+
+(defun org-auto-scheduler-focus-toggle-help ()
+  "Toggle visibility of the shortkey legend in the Focus HUD."
+  (interactive)
+  (setq org-auto-scheduler-focus--show-help (not org-auto-scheduler-focus--show-help))
+  (org-auto-scheduler-focus-refresh)
+  (message (if org-auto-scheduler-focus--show-help
+               "Shortcuts legend displayed. Press '?' again to hide."
+             "Shortcuts legend hidden. Press '?' to view.")))
 
 (defun org-auto-scheduler-focus-quit ()
   "Dismiss the Focus HUD window. Clock remains running."
@@ -11844,6 +11962,17 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
     (unless (and m (markerp m) (marker-buffer m))
       (user-error "No active task in Focus HUD"))
     (switch-to-buffer (marker-buffer m))
+    (goto-char (marker-position m))
+    (org-reveal)
+    (org-show-entry)))
+
+(defun org-auto-scheduler-focus-goto-task-other-window ()
+  "Jump to the original Org buffer and headline for the current task in another window."
+  (interactive)
+  (let ((m org-auto-scheduler-focus--target-marker))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No active task in Focus HUD"))
+    (switch-to-buffer-other-window (marker-buffer m))
     (goto-char (marker-position m))
     (org-reveal)
     (org-show-entry)))
@@ -11878,8 +12007,8 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
     (define-key map (kbd "j") #'next-line)
     (define-key map (kbd "TAB") #'org-auto-scheduler-focus-next-checklist)
     (define-key map (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist)
+    ;; RET toggles checklist; SPC left untouched for Spacemacs leader and scrolling
     (define-key map (kbd "RET") #'org-auto-scheduler-focus-toggle-checklist)
-    (define-key map (kbd "SPC") #'org-auto-scheduler-focus-toggle-checklist)
     (define-key map (kbd "n") #'org-auto-scheduler-focus-add-note)
     (define-key map (kbd "s") #'org-auto-scheduler-focus-add-subtask)
     (define-key map (kbd "a") #'org-auto-scheduler-focus-add-sibling)
@@ -11888,19 +12017,27 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
     (define-key map (kbd "+") #'org-auto-scheduler-focus-extend)
     (define-key map (kbd "=") #'org-auto-scheduler-focus-extend)
     (define-key map (kbd "p") #'org-auto-scheduler-focus-toggle-pause)
+    (define-key map (kbd "?") #'org-auto-scheduler-focus-toggle-help)
     (define-key map (kbd "q") #'org-auto-scheduler-focus-quit)
     (define-key map (kbd "g") #'org-auto-scheduler-focus-refresh)
-    (define-key map (kbd "o") #'org-auto-scheduler-focus-goto-task)
+    (define-key map (kbd "o") #'org-auto-scheduler-focus-goto-task-other-window)
+    (define-key map (kbd "O") #'org-auto-scheduler-focus-goto-task)
     (define-key map (kbd "c") #'org-auto-scheduler-focus-clock-in-task)
     (define-key map (kbd "r") (lambda () (interactive) (when (fboundp 'org-auto-scheduler-review) (org-auto-scheduler-review))))
     map)
   "Keymap for `org-auto-scheduler-focus-mode'.")
+
+;; Ensure reload updates keymap even if defvar was previously initialized
+(define-key org-auto-scheduler-focus-mode-map (kbd "o") #'org-auto-scheduler-focus-goto-task-other-window)
+(define-key org-auto-scheduler-focus-mode-map (kbd "O") #'org-auto-scheduler-focus-goto-task)
+(define-key org-auto-scheduler-focus-mode-map (kbd "?") #'org-auto-scheduler-focus-toggle-help)
 
 (define-derived-mode org-auto-scheduler-focus-mode special-mode "Org-Focus-HUD"
   "Major mode for the Org Auto Scheduler Focus HUD cockpit.
 \{org-auto-scheduler-focus-mode-map}"
   (setq truncate-lines t)
   (setq buffer-read-only t)
+  (setq org-auto-scheduler-focus--show-help org-auto-scheduler-focus-show-help)
   (add-hook 'kill-buffer-hook #'org-auto-scheduler--focus-cleanup nil t)
   ;; Evil / Spacemacs compatibility: ensure HUD single-key shortcuts win in motion/normal/visual
   (when (and (featurep 'evil) (fboundp 'evil-local-set-key))
@@ -11911,7 +12048,6 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
       (evil-local-set-key st (kbd "TAB")       #'org-auto-scheduler-focus-next-checklist)
       (evil-local-set-key st (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist)
       (evil-local-set-key st (kbd "RET")       #'org-auto-scheduler-focus-toggle-checklist)
-      (evil-local-set-key st (kbd "SPC")       #'org-auto-scheduler-focus-toggle-checklist)
       (evil-local-set-key st (kbd "n")         #'org-auto-scheduler-focus-add-note)
       (evil-local-set-key st (kbd "s")         #'org-auto-scheduler-focus-add-subtask)
       (evil-local-set-key st (kbd "a")         #'org-auto-scheduler-focus-add-sibling)
@@ -11920,9 +12056,11 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
       (evil-local-set-key st (kbd "+")         #'org-auto-scheduler-focus-extend)
       (evil-local-set-key st (kbd "=")         #'org-auto-scheduler-focus-extend)
       (evil-local-set-key st (kbd "p")         #'org-auto-scheduler-focus-toggle-pause)
+      (evil-local-set-key st (kbd "?")         #'org-auto-scheduler-focus-toggle-help)
       (evil-local-set-key st (kbd "q")         #'org-auto-scheduler-focus-quit)
       (evil-local-set-key st (kbd "g")         #'org-auto-scheduler-focus-refresh)
-      (evil-local-set-key st (kbd "o")         #'org-auto-scheduler-focus-goto-task)
+      (evil-local-set-key st (kbd "o")         #'org-auto-scheduler-focus-goto-task-other-window)
+      (evil-local-set-key st (kbd "O")         #'org-auto-scheduler-focus-goto-task)
       (evil-local-set-key st (kbd "c")         #'org-auto-scheduler-focus-clock-in-task)
       (evil-local-set-key st (kbd "r")         (lambda () (interactive) (when (fboundp 'org-auto-scheduler-review) (org-auto-scheduler-review)))))))
 
@@ -11936,7 +12074,6 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
       (kbd "TAB")       #'org-auto-scheduler-focus-next-checklist
       (kbd "<backtab>") #'org-auto-scheduler-focus-prev-checklist
       (kbd "RET")       #'org-auto-scheduler-focus-toggle-checklist
-      (kbd "SPC")       #'org-auto-scheduler-focus-toggle-checklist
       (kbd "n")         #'org-auto-scheduler-focus-add-note
       (kbd "s")         #'org-auto-scheduler-focus-add-subtask
       (kbd "a")         #'org-auto-scheduler-focus-add-sibling
@@ -11945,9 +12082,11 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
       (kbd "+")         #'org-auto-scheduler-focus-extend
       (kbd "=")         #'org-auto-scheduler-focus-extend
       (kbd "p")         #'org-auto-scheduler-focus-toggle-pause
+      (kbd "?")         #'org-auto-scheduler-focus-toggle-help
       (kbd "q")         #'org-auto-scheduler-focus-quit
       (kbd "g")         #'org-auto-scheduler-focus-refresh
-      (kbd "o")         #'org-auto-scheduler-focus-goto-task
+      (kbd "o")         #'org-auto-scheduler-focus-goto-task-other-window
+      (kbd "O")         #'org-auto-scheduler-focus-goto-task
       (kbd "c")         #'org-auto-scheduler-focus-clock-in-task
       (kbd "r")         (lambda () (interactive) (when (fboundp 'org-auto-scheduler-review) (org-auto-scheduler-review)))))
   (when (fboundp 'evil-set-initial-state)
@@ -11977,21 +12116,24 @@ Clocks out of current task and auto-advances/clocks into the next scheduled task
 Brings up a dedicated, distraction-free cockpit with pacing and live capture."
   (interactive
    (list (cond
+          ((and (derived-mode-p 'org-mode)
+                (not (derived-mode-p 'org-agenda-mode))
+                (ignore-errors (save-excursion (org-back-to-heading t) (point-marker)))))
+          ((eq major-mode 'org-agenda-mode)
+           (let ((m (or (org-get-at-bol 'org-marker) (org-get-at-bol 'org-hd-marker))))
+             (and m (markerp m) (marker-buffer m) m)))
           ((and (fboundp 'org-clock-is-active) (org-clock-is-active)
                 (boundp 'org-clock-marker) (markerp org-clock-marker) (marker-buffer org-clock-marker))
            (org-with-point-at org-clock-marker
              (org-back-to-heading t)
              (point-marker)))
-          ((and (derived-mode-p 'org-mode) (ignore-errors (org-back-to-heading t)))
-           (point-marker))
-          ((eq major-mode 'org-agenda-mode)
-           (or (org-get-at-bol 'org-marker) (org-get-at-bol 'org-hd-marker)))
           (t nil))))
   (let ((buf (get-buffer-create "*Org Focus HUD*")))
     (with-current-buffer buf
       (unless (eq major-mode 'org-auto-scheduler-focus-mode)
         (org-auto-scheduler-focus-mode))
-      (setq org-auto-scheduler-focus--target-marker marker)
+      (when marker
+        (setq org-auto-scheduler-focus--target-marker marker))
       (org-auto-scheduler-focus-refresh))
     (unless org-auto-scheduler--focus-timer
       (setq org-auto-scheduler--focus-timer
