@@ -134,7 +134,7 @@ Add to your Emacs configuration:
 
 These are the most important interactive commands you will use day-to-day.
 
-*** 🎯 =M-x org-auto-scheduler-focus=
+*** 🎯 =M-x org-auto-scheduler-focus= (or =M-x org-focus-hud=)
 
 Launch the *Focus HUD* monotasking cockpit. Locks your attention on the currently active or scheduled task with real-time pacing, Pomodoro tracking, and in-cockpit checklist, note, subtask, and sibling capture.
 
@@ -326,7 +326,7 @@ The *Focus HUD* (=*Org Focus HUD*=) is designed specifically to prevent context 
 
 Launch with:
 #+begin_src emacs-lisp
-M-x org-auto-scheduler-focus
+M-x org-auto-scheduler-focus   ; or M-x org-focus-hud
 #+end_src
 
 ,*Keybindings:*
@@ -350,9 +350,11 @@ M-x org-auto-scheduler-focus
 
   ┌─ CHECKLIST [2/4] ─────────────────────────────────────────────────────────┐
   │ [X] Generate PKCE code verifier and challenge (base64url)                 │
-  │ [X] Add redirect URL validation with state token                          │
+  │   • RFC 7636 Section 4.3 plain text notes and specifications             │
+  │   [X] Add redirect URL validation with state token                        │
   │ [ ] Handle error callback when state parameter is invalid                 │
-  │ [ ] Write unit tests for expired state token and replay attacks           │
+  │   • Check query parameter error_description                               │
+  │   [ ] Write unit tests for expired state token and replay attacks         │
   └───────────────────────────────────────────────────────────────────────────┘
 
   ┌─ SUBTASKS (CHILD TODOS) ──────────────────────────────────────────────────┐
@@ -365,20 +367,30 @@ M-x org-auto-scheduler-focus
   │ [14:05] RFC 7636 Section 4.3 requires SHA-256 for code_challenge_method   │
   └───────────────────────────────────────────────────────────────────────────┘
 
-  [?] Shortcuts help  ·  [q] Minimize
+  ┌─ WORK LOG [4] (Press 'l' to log) ─────────────────────────────────────────┐
+  │ [2026-09-29 Tue 14:30] Completed token endpoint unit tests                │
+  │ [2026-09-29 Tue 14:15] Fixed PKCE verification edge case                  │
+  │ [2026-09-29 Tue 13:50] Integrated redis token cache                       │
+  │ [2026-09-29 Tue 13:30] Started OAuth proxy implementation                 │
+  │ (Scroll: [ / ])                                                           │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  [?] Shortcuts help  ·  [l] Log  ·  [r] Refresh  ·  [q] Minimize
 #+end_example
 
 Press =?= at any time to expand or collapse the full in-cockpit shortcuts legend:
 #+begin_example
   CAPTURE (Zero context switching)   ACTIONS & PACING
   ─────────────────────────────────  ──────────────────────────────────────────
-  [k] + Checklist item               [RET] Toggle checklist item [ ] ↔ [X]
-  [n] + Quick Note                   [d]   Mark DONE & Advance
-  [s] + Child Subtask                [w]   Wait on this & Advance
-  [a] + Sibling Task (after this)    [+]   Extend +15m
-  [o] Open in Other Window           [p]   Pause / Resume Clock
-  [O] Jump to Org File               [q]   Minimize HUD
-  [?] Hide shortcuts help
+  [k] + Checklist / bullet item      [RET] Toggle item [ ] ↔ [X]
+  [M-j] / [M-k] Move item down / up  [r]   Refresh node details
+  [M-h] / [M-l] Outdent / Indent     [d]   Mark DONE & Advance
+  [l] + Log Work Done ([timestamp])  [w]   Wait on this & Advance
+  [n] + Quick Note                   [+]   Extend +15m
+  [s] + Child Subtask                [p]   Pause / Resume Clock
+  [a] + Sibling Task (after this)    [q]   Minimize HUD
+  [[] / []] Scroll Work Log          [?]   Hide shortcuts help
+  [o] Open in Other Window           [O]   Jump to Org File
 #+end_example
 
 *** Keybindings & In-Cockpit Actions
@@ -386,8 +398,15 @@ Press =?= at any time to expand or collapse the full in-cockpit shortcuts legend
 | Key | Action | Description |
 |-----+--------+-------------|
 | =TAB= / =S-TAB= | Next/Prev Checklist | Navigate directly between checklist items in the HUD |
-| =k= | Add Checklist | Prompt for text and insert =- [ ] <text>= under current task in Org |
-| =RET= | Toggle Checklist | Toggle checkbox =[ ]= ↔ =[X]= in the underlying Org buffer |
+| =k= | Add Checklist / Bullet | Contextual addition: inserts below cursor item matching indentation; if not on item, appends at end of lists across body. Prefix with =- =, =+ =, =*= or =C-u= for plain bullets |
+| =RET= | Toggle Checklist | Toggle checkbox =[ ]= ↔ =[X]=, or add =[ ]= to a plain bullet |
+| =M-k= / =M-<up>= | Move Item Up | *Option 2a*: Surgically swap item block with predecessor across intervening body text/images, preserving indentation |
+| =M-j= / =M-<down>= | Move Item Down | *Option 2a*: Surgically swap item block with successor across intervening body text/images, preserving indentation |
+| =M-h= / =M-<left>= | Outdent Item | Promote item block (-2 spaces), preserving relative child indentation |
+| =M-l= / =M-<right>= | Indent Item | Demote item block (+2 spaces), preserving relative child indentation |
+| =r= / =g= | Refresh Node Details | Refresh HUD from underlying Org buffer (updates bullets, checklist states, time, effort) |
+| =l= | Log Work Done | Prompt for work done and append =- [YYYY-MM-DD Day HH:MM] <work>= under =:LOGBOOK:= |
+| =[= / =]= | Scroll Work Log | Scroll visible window in the fixed-size Work Log section (older / newer) |
 | =n= | Add Note | Prompt for note and append timestamped entry =-[HH:MM] <note>= in drawer |
 | =s= | Add Subtask | Create child headline =** TODO <title>= with optional effort |
 | =a= | Add Sibling | Create sibling task =* TODO <title> :AUTOSCH:= directly after current task |
@@ -398,9 +417,15 @@ Press =?= at any time to expand or collapse the full in-cockpit shortcuts legend
 | =o= | Jump to Org (Other Window) | Open original Org file and reveal headline in other window |
 | =O= | Jump to Org | Open original Org file and reveal headline in current window |
 | =c= | Clock in Task | Select and clock into any scheduled task for today |
-| =g= | Refresh | Force re-render of the HUD |
 | =?= | Toggle Shortcuts Legend | Toggle the in-cockpit shortcuts legend on/off (hidden by default) |
 | =q= | Minimize | Dismiss Focus HUD window (clock stays active) |
+
+*** Option 2a Surgical Item Block Swapping & Contextual Insertion
+
+- *Item Block Unit*: An item consists of its bullet line plus any continuation lines, attached notes, inline media/links, and nested child sub-bullets indented deeper than the item.
+- *Surrounding Body Preservation*: Moving items with =M-j= / =M-k= surgically extracts only the item block and inserts it before/after adjacent item blocks. Any intervening non-list body paragraphs, code blocks, or linked screenshots remain 100% untouched in their original locations.
+- *Indentation (Option 2a)*: Items retain their original indentation level when moved across different list sections or hierarchy tiers. Use =M-h= (outdent) or =M-l= (indent) to adjust indentation levels cleanly.
+- *Contextual Insertion*: Pressing =k= while positioned on an item in the Focus HUD inserts the new item directly below that item's entire block, automatically inheriting its indentation. If the cursor is positioned outside list items (e.g. on the timer, effort gauge, or work log), =k= appends the item at the very end of the lists across the task body.
 
 ** How Scoring Works
 
@@ -1253,6 +1278,25 @@ Example configuration:
 ;; Note: you can invert this per-run using C-u r
 ;; (setq org-auto-scheduler-review-compact-schedule nil)
 #+end_src
+
+** Modular Architecture
+
+=org-auto-scheduler= is organized into focused submodules. You only need to require the main entry point in your Emacs configuration:
+
+#+begin_src emacs-lisp
+(require 'org-auto-scheduler)
+#+end_src
+
+This automatically loads all submodules:
+
+- =org-auto-scheduler.el=: Core topological scheduler, Kahn's algorithm, dynamic repacking, effort estimation, slot calculation, and agenda integration.
+- =org-auto-scheduler-review.el=: Tabulated interactive review mode, capacity load gauge, decision persistence (save/restore/merge/skip), task chop, What-If diff mode, and synchronized =org-timegrid= split view.
+- =org-auto-scheduler-analytics.el=: Schedule adherence tracking and scoring, weekly retrospective review, compact Gantt timeline, and overrun modeline indicator.
+- =org-auto-scheduler-daemon.el=: Background async runner, idle timers, and task change audit logging.
+
+*** Companion Packages
+
+- [[https://github.com/SSD2019/org-focus-hud][org-focus-hud]]: Standalone monotasking focus HUD cockpit. Can be used alongside =org-auto-scheduler= or independently with vanilla Org mode.
 
 ** Debugging
 
