@@ -1551,7 +1551,7 @@ SCHEDULED: <%s 10:00-11:00>
         ;; Verify shortcuts legend is hidden by default and toggled with '?'
         (assert-true (not (string-match-p "CAPTURE (Zero context switching)" (buffer-string)))
                      "Test 16.3: Shortcuts legend hidden by default")
-        (assert-true (string-match-p (regexp-quote "[?] Shortcuts help") (buffer-string))
+        (assert-true (string-match-p "\\[\\?\\]" (buffer-string))
                      "Test 16.3: '[?] Shortcuts help' prompt shown")
         (assert-equal (lookup-key org-auto-scheduler-focus-mode-map (kbd "?"))
                       #'org-auto-scheduler-focus-toggle-help

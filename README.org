@@ -211,6 +211,7 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-debug=                          | Run scheduler with debug logging, then open the log buffer.                                |
 | =org-auto-scheduler-toggle-background=              | Toggle idle/background auto-scheduling on or off.                                          |
 | =org-auto-scheduler-setup-background=               | Manually (re-)initialize the idle timer.                                                   |
+| =org-auto-scheduler-reload=                         | Reload package and all submodules cleanly from disk.                                       |
 | =org-auto-scheduler-historical-insights=            | Show per-category effort-estimate accuracy multipliers.                                    |
 | =org-auto-scheduler-show-repeater-projections=      | Display projected repeater/habit occurrences.                                              |
 | =org-auto-scheduler-clear-repeater-cache=           | Invalidate the repeater-projections cache.                                                 |
@@ -1293,6 +1294,16 @@ This automatically loads all submodules:
 - =org-auto-scheduler-review.el=: Tabulated interactive review mode, capacity load gauge, decision persistence (save/restore/merge/skip), task chop, What-If diff mode, and synchronized =org-timegrid= split view.
 - =org-auto-scheduler-analytics.el=: Schedule adherence tracking and scoring, weekly retrospective review, compact Gantt timeline, and overrun modeline indicator.
 - =org-auto-scheduler-daemon.el=: Background async runner, idle timers, and task change audit logging.
+
+*** Clean Reloading
+
+When making updates to any submodule or configuration without restarting the Emacs daemon:
+
+#+begin_src emacs-lisp
+M-x org-auto-scheduler-reload
+#+end_src
+
+This unloads and cleanly re-evaluates all submodules from disk and re-arms the background idle timers.
 
 *** Companion Packages
 

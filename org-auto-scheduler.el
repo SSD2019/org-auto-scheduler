@@ -38,6 +38,10 @@
     (when (and dir (file-directory-p dir))
       (add-to-list 'load-path dir))))
 
+(defvar org-auto-scheduler-base-dir
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "Base directory of the `org-auto-scheduler' package.")
+
 (require 'org)
 (require 'cl-lib)
 (require 'org-id)
@@ -56,6 +60,11 @@
 
 (log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
 (org-auto-scheduler--log-set-level 'debug)
+
+;; Submodules (loaded before defcustoms so :set hooks can access daemon/review functions)
+(require 'org-auto-scheduler-daemon)
+(require 'org-auto-scheduler-analytics)
+(require 'org-auto-scheduler-review)
 
 (defgroup org-auto-scheduler nil
   "Customization options for org-auto-scheduler."
@@ -363,7 +372,7 @@ zero-float tasks."
 (defvar org-auto-scheduler--critical-tasks (make-hash-table :test 'equal)
   "Hash table mapping task-id to t for tasks currently identified on the critical path.")
 
-(defcustom org-auto-scheduler-siblings-sequential nil
+(defcustom org-auto-scheduler-siblings-sequential t
   "When non-nil (default), project subtasks under the same parent are scheduled sequentially
 in outline order, unless overridden by :ORDERED: nil, :PARALLEL: t, or :INDEPENDENT: t."
   :type 'boolean
@@ -780,10 +789,6 @@ Defaults to `org-auto-scheduler-history.el` inside your Emacs directory."
 ;; Auto-save history when Emacs closes, and load when plugin loads
 (add-hook 'kill-emacs-hook #'org-auto-scheduler-save-history)
 (org-auto-scheduler-load-history)
-
-(require 'org-auto-scheduler-daemon)
-(require 'org-auto-scheduler-analytics)
-(require 'org-auto-scheduler-review)
 
 
 (defun org-auto-scheduler-track-historical-effort ()
@@ -5173,6 +5178,26 @@ Delegates to `org-focus-hud'."
   (if (fboundp 'org-focus-hud)
       (org-focus-hud marker)
     (user-error "The `org-focus-hud' package is required to launch the Focus HUD cockpit")))
+
+;;;###autoload
+(defun org-auto-scheduler-reload ()
+  "Reload `org-auto-scheduler' and all its submodules cleanly from disk.
+Re-evaluates core, daemon, analytics, and review modules,
+and re-arms background scheduler timers if enabled."
+  (interactive)
+  (let ((dir (or (and (boundp 'org-auto-scheduler-base-dir) org-auto-scheduler-base-dir)
+                 (file-name-directory (or (locate-library "org-auto-scheduler") "")))))
+    (when (and dir (file-directory-p dir))
+      (add-to-list 'load-path dir)))
+  (message "Reloading org-auto-scheduler and submodules...")
+  (load (or (locate-library "org-auto-scheduler") "org-auto-scheduler") nil t)
+  (load (or (locate-library "org-auto-scheduler-daemon") "org-auto-scheduler-daemon") nil t)
+  (load (or (locate-library "org-auto-scheduler-analytics") "org-auto-scheduler-analytics") nil t)
+  (load (or (locate-library "org-auto-scheduler-review") "org-auto-scheduler-review") nil t)
+  (when (and (bound-and-true-p org-auto-scheduler-background-enabled)
+             (fboundp 'org-auto-scheduler-setup-background))
+    (org-auto-scheduler-setup-background))
+  (message "Org Auto Scheduler successfully reloaded."))
 
 (provide 'org-auto-scheduler)
 

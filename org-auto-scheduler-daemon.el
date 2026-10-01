@@ -10,8 +10,25 @@
 
 ;;; Code:
 
+(eval-and-compile
+  (let ((dir (file-name-directory (or load-file-name buffer-file-name default-directory))))
+    (when (and dir (file-directory-p dir))
+      (add-to-list 'load-path dir))))
+
 (require 'org)
 (require 'cl-lib)
+
+(defvar org-auto-scheduler--idle-timer nil
+  "Primary idle timer for background auto-scheduling.")
+
+(defvar org-auto-scheduler--repeat-idle-timer nil
+  "Timer for repeating background auto-scheduling during continuous idle.")
+
+(defvar org-auto-scheduler--background-running nil
+  "Flag to prevent concurrent background scheduling runs.")
+
+(defvar org-auto-scheduler--background-thread nil
+  "Thread object running the background scheduler asynchronously.")
 
 (defun org-auto-scheduler-background-run ()
   "Run the scheduler silently in the background.
@@ -135,41 +152,42 @@ if the current system's hostname (short or FQDN, case-insensitive) is in the lis
   "Set up or cancel the background auto-scheduling timer based on the current setting."
   (interactive)
   (org-auto-scheduler--log-info "Setting up background scheduler. Enabled: %s"
-                                org-auto-scheduler-background-enabled)
+                                (bound-and-true-p org-auto-scheduler-background-enabled))
 
   ;; Cancel existing timers if present
-  (when org-auto-scheduler--idle-timer
+  (when (bound-and-true-p org-auto-scheduler--idle-timer)
     (org-auto-scheduler--log-debug "Canceling existing background timer")
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
 
-  (when org-auto-scheduler--repeat-idle-timer
+  (when (bound-and-true-p org-auto-scheduler--repeat-idle-timer)
     (org-auto-scheduler--log-debug "Canceling existing background repeat timer")
     (cancel-timer org-auto-scheduler--repeat-idle-timer)
     (setq org-auto-scheduler--repeat-idle-timer nil))
 
   ;; Create new timer if enabled
-  (when org-auto-scheduler-background-enabled
-    (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds, Async: %s"
-                                  org-auto-scheduler-idle-time
-                                  org-auto-scheduler-background-interval
-                                  org-auto-scheduler-background-async)
-    (setq org-auto-scheduler--idle-timer
-          (run-with-idle-timer
-           org-auto-scheduler-idle-time
-           t  ; REPEAT: t means fire each time Emacs becomes idle for idle-time seconds
-           #'org-auto-scheduler-background-run))
-    (add-hook 'kill-emacs-hook #'org-auto-scheduler-cleanup-background)))
+  (when (bound-and-true-p org-auto-scheduler-background-enabled)
+    (let ((idle-time (if (boundp 'org-auto-scheduler-idle-time) org-auto-scheduler-idle-time 300))
+          (interval (if (boundp 'org-auto-scheduler-background-interval) org-auto-scheduler-background-interval 300))
+          (async (if (boundp 'org-auto-scheduler-background-async) org-auto-scheduler-background-async t)))
+      (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds, Async: %s"
+                                    idle-time interval async)
+      (setq org-auto-scheduler--idle-timer
+            (run-with-idle-timer
+             idle-time
+             t  ; REPEAT: t means fire each time Emacs becomes idle for idle-time seconds
+             #'org-auto-scheduler-background-run))
+      (add-hook 'kill-emacs-hook #'org-auto-scheduler-cleanup-background))))
 
 ;; Ensure background scheduler is set up after user config and custom settings load
 (add-hook 'emacs-startup-hook #'org-auto-scheduler-setup-background t)
 
 (defun org-auto-scheduler-cleanup-background ()
   "Clean up background scheduler resources when Emacs is shutting down."
-  (when org-auto-scheduler--idle-timer
+  (when (bound-and-true-p org-auto-scheduler--idle-timer)
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
-  (when org-auto-scheduler--repeat-idle-timer
+  (when (bound-and-true-p org-auto-scheduler--repeat-idle-timer)
     (cancel-timer org-auto-scheduler--repeat-idle-timer)
     (setq org-auto-scheduler--repeat-idle-timer nil))
   (setq org-auto-scheduler--background-running nil))
