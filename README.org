@@ -823,8 +823,10 @@ Org Auto Scheduler includes an automatic *Change Log* that captures every modifi
 - *Noise-Free & Collated:* Runs that make zero changes are omitted by default (=org-auto-scheduler-change-log-record-empty= is =nil=). When enabled (=t=), consecutive background runs with no changes are cleanly collated into the same node with timestamped bullet points (=org-auto-scheduler-change-log-collate-empty=, default =t=), preventing log bloat while preserving execution heartbeats.
 - *Echo Notification:* When changes occur, Emacs briefly alerts you in the echo area: =Org Auto Scheduler [background]: 2 task(s) updated. [M-x org-auto-scheduler-show-change-log]=.
 - *Automatic File Saving:* Modified Org agenda files are automatically saved to disk when background changes occur (=org-auto-scheduler-background-save-buffers=, default =t=).
+- *Previous Days Rollover on First Run:* When enabled (=org-auto-scheduler-background-reschedule-past-tasks=, default =nil=), automatically reschedules all uncompleted TODO-state AUTOSCH tasks of previous days to today on the first background run of each day, re-integrating them into today's timeline by priority and saving agenda buffers.
 
 Commands:
+- =M-x org-auto-scheduler-reschedule-past-tasks-to-today=: Manually reschedule uncompleted previous days' AUTOSCH tasks to today.
 - =M-x org-auto-scheduler-show-change-log= (or =L= / =C-c C-l= in review buffer): View the change log buffer, positioned at the latest run.
 - =M-x org-auto-scheduler-clear-change-log=: Erase the change log buffer and optionally truncate the persistent log file.
 
@@ -1224,6 +1226,7 @@ Backward-compatible aliases:
 | =org-auto-scheduler-change-log-notify=         | =t=     | Display an echo area message when a background run updates tasks.              |
 | =org-auto-scheduler-change-log-max-entries=   | =200=   | Maximum number of run entries retained before older entries are pruned.        |
 | =org-auto-scheduler-background-save-buffers=  | =t=     | Automatically save modified agenda files to disk after background changes.     |
+| =org-auto-scheduler-background-reschedule-past-tasks= | =nil=   | Automatically reschedule uncompleted TODO AUTOSCH tasks of previous days to today on the first background run of the day. |
 
 *** CalDAV Sync
 

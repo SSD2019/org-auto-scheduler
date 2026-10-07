@@ -18,6 +18,9 @@
 (require 'org)
 (require 'cl-lib)
 
+(declare-function org-auto-scheduler-reschedule-past-tasks-to-today "org-auto-scheduler" (&optional target-date scope))
+(declare-function org-auto-scheduler-schedule-tasks "org-auto-scheduler" (&optional force-replan))
+
 (defvar org-auto-scheduler--idle-timer nil
   "Primary idle timer for background auto-scheduling.")
 
@@ -74,30 +77,46 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
                         (fboundp 'main-thread)
                         (not (eq (current-thread) (main-thread)))))
          (run-type (if is-async 'background-async 'background-sync))
-         (start-time (current-time)))
-    (org-auto-scheduler--log-info "Starting background auto-scheduler run (async: %s)..."
-                                  (if is-async "yes" "no"))
+         (start-time (current-time))
+         (today-str (format-time-string "%Y-%m-%d" start-time))
+         (is-first-run-of-day (not (equal org-auto-scheduler--last-background-run-date today-str)))
+         (resched-past-count 0))
+    (setq org-auto-scheduler--last-background-run-date today-str)
+    (org-auto-scheduler--log-info "Starting background auto-scheduler run (async: %s, first-of-day: %s)..."
+                                  (if is-async "yes" "no")
+                                  (if is-first-run-of-day "yes" "no"))
     (unwind-protect
         (condition-case err
             (let ((org-auto-scheduler-silent-mode t)
                   (org-auto-scheduler--current-run-type run-type)
                   (org-auto-scheduler--run-start-time start-time))
+              ;; On first background run of the day, optionally reschedule uncompleted past tasks
+              (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-past-tasks)
+                         is-first-run-of-day
+                         (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
+                (setq resched-past-count
+                      (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
               ;; Run scheduler in silent mode
               (org-auto-scheduler-schedule-tasks)
               ;; Save agenda buffers if configured and changes were made
               (when (and org-auto-scheduler-background-save-buffers
-                         org-auto-scheduler--last-run-changes
-                         (> (length org-auto-scheduler--last-run-changes) 0))
+                         (or (and org-auto-scheduler--last-run-changes
+                                  (> (length org-auto-scheduler--last-run-changes) 0))
+                             (> resched-past-count 0)))
                 (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
                 (save-some-buffers t (lambda ()
                                        (and (buffer-file-name)
                                             (member (buffer-file-name) (org-agenda-files t))))))
               ;; Notify user if changes were made
               (when (and org-auto-scheduler-change-log-notify
-                         org-auto-scheduler--last-run-changes
-                         (> (length org-auto-scheduler--last-run-changes) 0))
-                (message "Org Auto Scheduler [background]: %d task(s) updated. [M-x org-auto-scheduler-show-change-log]"
-                         (length org-auto-scheduler--last-run-changes))))
+                         (or (and org-auto-scheduler--last-run-changes
+                                  (> (length org-auto-scheduler--last-run-changes) 0))
+                             (> resched-past-count 0)))
+                (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
+                         (length (or org-auto-scheduler--last-run-changes '()))
+                         (if (> resched-past-count 0)
+                             (format " (%d from past days rescheduled)" resched-past-count)
+                           ""))))
           (error
            (org-auto-scheduler--log-error "Error in background scheduler: %s" err)
            (when (org-auto-scheduler--should-log-changes-p)
@@ -190,7 +209,8 @@ if the current system's hostname (short or FQDN, case-insensitive) is in the lis
   (when (bound-and-true-p org-auto-scheduler--repeat-idle-timer)
     (cancel-timer org-auto-scheduler--repeat-idle-timer)
     (setq org-auto-scheduler--repeat-idle-timer nil))
-  (setq org-auto-scheduler--background-running nil))
+  (setq org-auto-scheduler--background-running nil)
+  (setq org-auto-scheduler--last-background-run-date nil))
 
 
 ;;; ============================================================================

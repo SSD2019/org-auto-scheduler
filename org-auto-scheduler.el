@@ -620,6 +620,17 @@ Older entries beyond this limit are pruned to prevent unbounded growth."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-background-reschedule-past-tasks nil
+  "When non-nil, automatically reschedule uncompleted TODO-state AUTOSCH tasks of previous days to today on the first background run of the day."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defvaralias 'org-auto-scheduler-background-reschedule-past-tasks-first-run
+  'org-auto-scheduler-background-reschedule-past-tasks)
+
+(defvar org-auto-scheduler--last-background-run-date nil
+  "Date string (YYYY-MM-DD) of the most recent background scheduler run.")
+
 (defvar org-auto-scheduler--current-run-type nil
   "Tracks current scheduler execution mode: \='background-async, \='background-sync, or nil (manual).")
 
@@ -2809,7 +2820,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
 Uses `org-schedule` directly to avoid `org-entry-put` advancing to the next
 heading when the current heading does not yet have a planning line."
   (org-back-to-heading t)
-  (org-schedule nil schedule-str))
+  (let ((inhibit-message (or inhibit-message (bound-and-true-p org-auto-scheduler-silent-mode))))
+    (org-schedule nil schedule-str)))
 
 (defun org-auto-scheduler-get-schedulable-tasks ()
   "Get a list of markers for schedulable tasks from the agenda files, including recurring task instances."
@@ -4733,6 +4745,73 @@ Uses `transient` if available, otherwise falls back to a simple prompt."
       (format "<%s>--<%s>"
               (format-time-string "%Y-%m-%d %a %H:%M" start-time)
               (format-time-string "%Y-%m-%d %a %H:%M" end-time)))))
+
+(defun org-auto-scheduler-reschedule-past-tasks-to-today (&optional target-date scope)
+  "Reschedule all uncompleted TODO-state AUTOSCH tasks of previous days to TARGET-DATE (default today).
+SCOPE specifies the search scope for `org-map-entries' (defaults to \='agenda when
+agenda files exist, or nil for current buffer).
+Returns the number of tasks rescheduled."
+  (interactive)
+  (let* ((today-str (or target-date (format-time-string "%Y-%m-%d")))
+         (search-scope (or scope (if (org-agenda-files t) 'agenda nil)))
+         (done-states (or org-done-keywords '("DONE" "CANCELLED" "DROPPED")))
+         (waiting-states (bound-and-true-p org-auto-scheduler-waiting-states))
+         (count 0)
+         (rescheduled-tasks '()))
+    (org-map-entries
+     (lambda ()
+       (let* ((state (or (org-get-todo-state)
+                         (save-excursion
+                           (org-back-to-heading t)
+                           (when (looking-at "^\\*+[ 	]+\\([A-Z-]+\\)[ 	]+")
+                             (let ((kw (match-string-no-properties 1)))
+                               (when (assoc kw org-auto-scheduler-state-weights)
+                                 kw))))))
+              (tags (org-get-tags))
+              (is-autosch (member "AUTOSCH" tags))
+              (is-archive (member "ARCHIVE" tags))
+              (is-waiting (and state waiting-states (member state waiting-states)))
+              (is-done (or (null state)
+                           (member state done-states)
+                           (and (bound-and-true-p org-auto-scheduler-kill-todo-state)
+                                (string= state org-auto-scheduler-kill-todo-state))))
+              (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                  (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                  (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
+              (has-repeater (org-auto-scheduler-has-repeater-task (point-marker)))
+              (sched-str (org-entry-get nil "SCHEDULED")))
+         (when (and is-autosch
+                    (not is-archive)
+                    (not is-waiting)
+                    (not is-done)
+                    (not is-placeholder)
+                    (not has-repeater)
+                    sched-str)
+           (let ((sched-date (and (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched-str)
+                                  (match-string 1 sched-str))))
+             (when (and sched-date (string< sched-date today-str))
+               (let ((headline (org-get-heading t t t t)))
+                 (org-auto-scheduler--log-info "Rescheduling past task '%s' (%s) to %s"
+                                               headline sched-str today-str)
+                 (org-auto-scheduler--set-scheduled today-str)
+                 ;; If task had a PINNED_TIME with a past date, update date portion to today-str
+                 (let ((pinned-prop (org-entry-get nil org-auto-scheduler-pinned-time-property)))
+                   (when (and pinned-prop
+                              (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)[ 	]+\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" pinned-prop))
+                     (let ((pdate (match-string 1 pinned-prop))
+                           (ptime (match-string 2 pinned-prop)))
+                       (when (string< pdate today-str)
+                         (org-set-property org-auto-scheduler-pinned-time-property (format "%s %s" today-str ptime))))))
+                 (cl-incf count)
+                 (push headline rescheduled-tasks)))))))
+     nil
+     search-scope)
+    (when (> count 0)
+      (org-auto-scheduler--log-info "Rescheduled %d past AUTOSCH task(s) to %s: %s"
+                                    count today-str (string-join (nreverse rescheduled-tasks) ", ")))
+    (when (called-interactively-p 'interactive)
+      (message "Rescheduled %d past AUTOSCH task(s) to %s." count today-str))
+    count))
 
 (defun org-auto-scheduler-get-today-scheduled-tasks (&optional date-str)
   "Return a list of AUTOSCH tasks scheduled for DATE-STR (default today).
