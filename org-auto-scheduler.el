@@ -1990,6 +1990,61 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                (setq max-conflict-end task-end-with-gap)))))
        max-conflict-end))))
 
+(defun org-auto-scheduler--task-has-agenda-conflict-p (start-time end-time task-id &optional proposed-tags)
+  "Return non-nil if time slot [START-TIME, END-TIME] conflicts with an external agenda event.
+Returns the conflicting agenda item with the earliest start time.
+Checks non-AUTOSCH agenda items (e.g. calendar/meetings) and daily catch-up blocks.
+Excludes TASK-ID and non-blocking items."
+  (when (and start-time end-time)
+    (let* ((agenda-items (org-auto-scheduler-get-agenda-items start-time))
+           (is-freeset (or (member org-auto-scheduler-freeset-tag proposed-tags)
+                           (member "PINNABLE" proposed-tags)))
+           (is-pinned (or (member org-auto-scheduler-pinned-tag proposed-tags)
+                          (and task-id (org-auto-scheduler-task-pinned-p nil task-id))))
+           (earliest-conflict nil))
+      ;; Check daily catch-up / slack window
+      (when (and org-auto-scheduler-daily-catchup-block
+                 (not is-freeset)
+                 (not is-pinned))
+        (let* ((c-start-str (car org-auto-scheduler-daily-catchup-block))
+               (c-end-str (if (consp (cdr org-auto-scheduler-daily-catchup-block))
+                              (cadr org-auto-scheduler-daily-catchup-block)
+                            (cdr org-auto-scheduler-daily-catchup-block)))
+               (c-start (org-auto-scheduler-time-with-time-string start-time c-start-str))
+               (c-end (org-auto-scheduler-time-with-time-string start-time c-end-str)))
+          (when (and c-start c-end
+                     (time-less-p start-time c-end)
+                     (time-less-p c-start end-time))
+            (setq earliest-conflict (list "catchup-block" c-start c-end nil t "Catch-up block" t nil)))))
+      ;; Check blocking agenda items
+      (dolist (item agenda-items)
+        (let* ((item-id (nth 0 item))
+               (item-start (nth 1 item))
+               (item-end (nth 2 item))
+               (item-tags (nth 3 item))
+               (consider-for-conflicts (nth 4 item))
+               (item-name (nth 5 item))
+               (has-time (nth 6 item))
+               (marker (nth 7 item))
+               (is-autosch (member "AUTOSCH" item-tags))
+               (is-nb (or (null consider-for-conflicts)
+                          (org-auto-scheduler-task-non-blocking-p item-id marker item-name)))
+               (needs-buf (or (member "buffertime" item-tags) (member "buffertime" proposed-tags)))
+               (active-gap (if needs-buf 15 org-auto-scheduler-task-gap))
+               (item-start-gap (when item-start (time-subtract item-start (seconds-to-time (* 60 active-gap)))))
+               (item-end-gap (when item-end (time-add item-end (seconds-to-time (* 60 active-gap))))))
+          (when (and item-start item-end
+                     (not (equal item-id task-id))
+                     (not is-autosch)
+                     (not is-nb)
+                     has-time
+                     (time-less-p start-time item-end-gap)
+                     (time-less-p item-start-gap end-time))
+            (if (or (null earliest-conflict)
+                    (time-less-p item-start (nth 1 earliest-conflict)))
+                (setq earliest-conflict item)))))
+      earliest-conflict)))
+
 
 (defun org-auto-scheduler-next-available-time (start-time duration &optional proposed-tags)
   "Find the next available time slot starting from START-TIME for DURATION minutes."
@@ -2646,7 +2701,23 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                                (and m (plist-get m :reschedule-all))))
                                            today-scheduled)))
                           (t
-                           (cl-find-if (lambda (e) (plist-get e :reschedule)) today-scheduled)))))
+                           (cl-find-if
+                            (lambda (e)
+                              (let* ((tid (plist-get e :task-id))
+                                     (m (gethash tid marker-data))
+                                     (st (plist-get e :start-time))
+                                     (et (plist-get e :end-time))
+                                     (t-info (plist-get e :task-info))
+                                     (tags (nth 7 t-info)))
+                                (or (plist-get e :reschedule)
+                                    (and m (or (plist-get m :splittable)
+                                               (plist-get m :remove-splittable)
+                                               (plist-get m :freeset)
+                                               (plist-get m :remove-freeset)))
+                                    (and st et
+                                         (time-less-p now et)
+                                         (org-auto-scheduler--task-has-agenda-conflict-p st et tid tags)))))
+                            today-scheduled)))))
                    (has-unscheduled
                     (and preserve-today
                          (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule)))
@@ -2702,13 +2773,22 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                 (let ((reschedule-task-ids (make-hash-table :test 'equal)))
                   ;; Identify preserved tasks vs upcoming unpinned tasks
                   (dolist (e today-scheduled)
-                    (if (or (plist-get e :lapsed-or-current)
-                            (plist-get e :pinned)
-                            (and org-auto-scheduler-preserve-future-scheduled
-                                 (not (plist-get e :is-today))))
-                        (push e preserved-entries)
-                      ;; Upcoming unpinned task for today: mark as eligible for rescheduling
-                      (puthash (plist-get e :task-id) t reschedule-task-ids)))
+                    (let* ((tid (plist-get e :task-id))
+                           (st (plist-get e :start-time))
+                           (et (plist-get e :end-time))
+                           (t-info (plist-get e :task-info))
+                           (tags (nth 7 t-info))
+                           (has-conflict (and st et
+                                              (time-less-p now et)
+                                              (org-auto-scheduler--task-has-agenda-conflict-p st et tid tags))))
+                      (if (and (not has-conflict)
+                               (or (plist-get e :lapsed-or-current)
+                                   (plist-get e :pinned)
+                                   (and org-auto-scheduler-preserve-future-scheduled
+                                        (not (plist-get e :is-today)))))
+                          (push e preserved-entries)
+                        ;; Upcoming unpinned task for today OR conflicting task: mark as eligible for rescheduling
+                        (puthash tid t reschedule-task-ids))))
                   (setq preserved-entries (nreverse preserved-entries))
 
                   ;; Also mark all tasks in tasks-to-schedule as eligible
