@@ -33,6 +33,211 @@
 (defvar org-auto-scheduler--background-thread nil
   "Thread object running the background scheduler asynchronously.")
 
+(defcustom org-auto-scheduler-lockfile-max-age-seconds 600
+  "Maximum age in seconds before an Emacs `.#' lockfile is considered stale.
+Local lockfiles are checked via `process-attributes' PID liveness first;
+remote lockfiles (e.g. synced via Dropbox) older than this threshold are
+treated as stale so crashed sessions do not block the daemon indefinitely."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-lease-file
+  (expand-file-name ".org-auto-scheduler-lease.el" user-emacs-directory)
+  "File used to track the active background daemon host lease across synced machines."
+  :type 'string
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-eod-auto-trigger 'notify
+  "End-of-day wrap-up action executed ONLY on the background-enabled server.
+Requires both `org-auto-scheduler-background-enabled' and
+`org-auto-scheduler-allowed-on-this-computer-p' to be non-nil.
+When `notify' (default), scores today's adherence and displays a wrap-up notification
+once after `org-auto-scheduler-end-time'.
+When `open', automatically opens the `org-auto-scheduler-eod-review' buffer.
+When nil, disables automatic end-of-day triggers."
+  :type '(choice (const :tag "Score adherence & notify on server" notify)
+                 (const :tag "Auto-open EOD Wrap-Up buffer on server" open)
+                 (const :tag "Disabled" nil))
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--last-eod-run-date nil
+  "Date string (YYYY-MM-DD) when the server-only end-of-day trigger last ran.")
+
+(defvar org-auto-scheduler--warned-conflict-files (make-hash-table :test 'equal)
+  "Hash table of Dropbox conflicted-copy files already warned about in this session.")
+
+(defvar org-auto-scheduler--seen-lockfiles (make-hash-table :test 'equal)
+  "Hash table mapping (FILE . LOCK-STR) to the `float-time' when first observed.
+Used to detect stale remote `.#' lockfiles even when `file-attributes' returns nil on dangling symlinks.")
+
+(defun org-auto-scheduler--lockfile-active-p (file)
+  "Return non-nil if FILE has an active (non-stale) Emacs `.#' lockfile from another session."
+  (when (and file (stringp file))
+    (let* ((dir (file-name-directory file))
+           (base (file-name-nondirectory file))
+           (lockfile (expand-file-name (concat ".#" base) dir))
+           (lock-status (ignore-errors (file-locked-p file)))
+           (symlink-target (ignore-errors (file-symlink-p lockfile)))
+           (lock-str (or (and (stringp symlink-target) symlink-target)
+                         (and (stringp lock-status) lock-status))))
+      (if (null lock-str)
+          nil
+        (let* ((seen-key (cons file lock-str))
+               (now-flt (float-time (current-time)))
+               (first-seen (or (gethash seen-key org-auto-scheduler--seen-lockfiles)
+                               (puthash seen-key now-flt org-auto-scheduler--seen-lockfiles)))
+               (max-age (or org-auto-scheduler-lockfile-max-age-seconds 600)))
+          (if (string-match "\\([^@]+\\)@\\([^.:]+\\)\\(?:\\.[^:]*\\)?\\.\\([0-9]+\\)" lock-str)
+              (let* ((host (downcase (match-string 2 lock-str)))
+                     (pid (string-to-number (match-string 3 lock-str)))
+                     (my-host (downcase (car (split-string (system-name) "\\.")))))
+                (if (string= host my-host)
+                    ;; Same host: check if PID is another live local process
+                    (and (/= pid (emacs-pid))
+                         (not (null (ignore-errors (process-attributes pid)))))
+                  ;; Remote host: check mtime (if regular file) or first-seen age (for dangling symlink)
+                  (let* ((attrs (ignore-errors (file-attributes lockfile)))
+                         (mtime (and attrs (file-attribute-modification-time attrs)))
+                         (age (if mtime
+                                  (- now-flt (float-time mtime))
+                                (- now-flt first-seen))))
+                    (< age max-age))))
+            ;; Unparseable lock string: check mtime or first-seen age
+            (let* ((attrs (ignore-errors (file-attributes lockfile)))
+                   (mtime (and attrs (file-attribute-modification-time attrs)))
+                   (age (if mtime
+                            (- now-flt (float-time mtime))
+                          (- now-flt first-seen))))
+              (< age max-age))))))))
+
+(defun org-auto-scheduler--check-dropbox-conflict-files (files)
+  "Emit a one-time non-blocking warning if any Dropbox conflicted copy exists alongside FILES."
+  (dolist (file files)
+    (when (and file (stringp file) (file-exists-p file))
+      (let* ((dir (file-name-directory file))
+             (stem (file-name-sans-extension (file-name-nondirectory file)))
+             (pattern (concat "^" (regexp-quote stem) ".*conflicted copy.*\\.org$"))
+             (conflicts (ignore-errors (directory-files dir t pattern t))))
+        (dolist (cf conflicts)
+          (unless (gethash cf org-auto-scheduler--warned-conflict-files)
+            (puthash cf t org-auto-scheduler--warned-conflict-files)
+            (org-auto-scheduler--log-warn
+             "Dropbox conflicted copy detected (non-blocking): %s" cf)))))))
+
+(defun org-auto-scheduler--prepare-agenda-buffers-for-daemon ()
+  "Verify agenda buffers are safe for a background daemon run.
+1. Checks for active (non-stale) `.#' lockfiles -> returns nil if locked.
+2. Checks if any visited agenda buffer has unsaved local edits (`buffer-modified-p') -> returns nil.
+3. Auto-reverts unmodified buffers whose disk files were updated externally (e.g. by Dropbox).
+4. Returns a hash table mapping agenda file paths to their disk modification times."
+  (let ((files (ignore-errors (org-agenda-files t)))
+        (mtimes (make-hash-table :test 'equal))
+        (safe t))
+    (org-auto-scheduler--check-dropbox-conflict-files files)
+    (dolist (file files)
+      (when (and safe file (file-exists-p file))
+        (let ((buf (get-file-buffer file)))
+          (cond
+           ((org-auto-scheduler--lockfile-active-p file)
+            (org-auto-scheduler--log-debug
+             "Background daemon aborted: active lockfile on %s" file)
+            (setq safe nil))
+           ((and buf (buffer-modified-p buf))
+            (org-auto-scheduler--log-debug
+             "Background daemon aborted: unsaved local buffer modifications in %s" (buffer-name buf))
+            (setq safe nil))
+           (t
+            (when (and buf (not (verify-visited-file-modtime buf)))
+              (org-auto-scheduler--log-info
+               "Auto-reverting unmodified agenda buffer %s after external disk update" (buffer-name buf))
+              (with-current-buffer buf
+                (ignore-errors (revert-buffer t t t))))
+            (let ((attrs (ignore-errors (file-attributes file))))
+              (when attrs
+                (puthash file (file-attribute-modification-time attrs) mtimes))))))))
+    (and safe mtimes)))
+
+(defun org-auto-scheduler--agenda-mtimes-unchanged-p (mtime-snapshot)
+  "Return non-nil if all files in MTIME-SNAPSHOT still have identical disk mtimes and clean buffers."
+  (let ((ok t))
+    (when (hash-table-p mtime-snapshot)
+      (maphash
+       (lambda (file old-mtime)
+         (when ok
+           (let* ((buf (get-file-buffer file))
+                  (attrs (ignore-errors (file-attributes file)))
+                  (cur-mtime (and attrs (file-attribute-modification-time attrs))))
+             (when (or (and buf (buffer-modified-p buf))
+                       (and old-mtime cur-mtime (not (time-equal-p old-mtime cur-mtime)))
+                       (org-auto-scheduler--lockfile-active-p file))
+               (setq ok nil)))))
+       mtime-snapshot))
+    ok))
+
+(defun org-auto-scheduler--acquire-or-refresh-host-lease ()
+  "Acquire or refresh the active background daemon host lease.
+Returns non-nil if lease is held by this host, or nil if another host holds a fresh lease."
+  (condition-case nil
+      (let* ((my-host (system-name))
+             (now (float-time (current-time)))
+             (lease-ttl (or org-auto-scheduler-lockfile-max-age-seconds 600))
+             (existing (when (and org-auto-scheduler-lease-file
+                                  (file-exists-p org-auto-scheduler-lease-file))
+                         (with-temp-buffer
+                           (insert-file-contents org-auto-scheduler-lease-file)
+                           (ignore-errors (read (current-buffer))))))
+             (holder (and (plistp existing) (plist-get existing :hostname)))
+             (ts (and (plistp existing) (plist-get existing :timestamp))))
+        (if (and holder ts
+                 (not (string-equal-ignore-case holder my-host))
+                 (< (- now ts) lease-ttl))
+            (progn
+              (org-auto-scheduler--log-debug
+               "Background daemon skipped: active lease held by %s (age %.0fs)"
+               holder (- now ts))
+              nil)
+          (when org-auto-scheduler-lease-file
+            (with-temp-file org-auto-scheduler-lease-file
+              (insert (format "(:hostname %S :pid %d :timestamp %.0f)\n"
+                              my-host (emacs-pid) now))))
+          t))
+    (error t)))
+
+(defun org-auto-scheduler--agenda-has-title-markers-p ()
+  "Return non-nil if any agenda buffer currently contains inline title markers (e.g. (-r-))."
+  (let ((found nil))
+    (dolist (file (ignore-errors (org-agenda-files t)))
+      (when (and (not found) file (file-exists-p file))
+        (with-current-buffer (find-file-noselect file)
+          (save-excursion
+            (goto-char (point-min))
+            (when (re-search-forward org-auto-scheduler-title-marker-regex nil t)
+              (setq found t))))))
+    found))
+
+(defun org-auto-scheduler--maybe-run-server-eod-check (now)
+  "Run end-of-day adherence scoring and optional wrap-up trigger ONLY on the background-enabled server."
+  (when (and org-auto-scheduler-background-enabled
+             (org-auto-scheduler-allowed-on-this-computer-p)
+             org-auto-scheduler-eod-auto-trigger)
+    (let* ((today-str (format-time-string "%Y-%m-%d" now))
+           (now-mins (org-auto-scheduler-time-to-minutes (format-time-string "%H:%M" now)))
+           (end-mins (org-auto-scheduler-time-to-minutes org-auto-scheduler-end-time)))
+      (when (and (>= now-mins end-mins)
+                 (not (equal org-auto-scheduler--last-eod-run-date today-str)))
+        (setq org-auto-scheduler--last-eod-run-date today-str)
+        (when (and (fboundp 'org-auto-scheduler--has-snapshot-for-date-p)
+                   (org-auto-scheduler--has-snapshot-for-date-p today-str)
+                   (fboundp 'org-auto-scheduler-score-schedule))
+          (ignore-errors (org-auto-scheduler-score-schedule today-str)))
+        (cond
+         ((and (eq org-auto-scheduler-eod-auto-trigger 'open)
+               (not noninteractive)
+               (fboundp 'org-auto-scheduler-eod-review))
+          (org-auto-scheduler-eod-review today-str))
+         ((eq org-auto-scheduler-eod-auto-trigger 'notify)
+          (message "Org Auto Scheduler [EOD]: Workday ended. Run M-x org-auto-scheduler-eod-review (or `E' in dispatch menu) to wrap up today.")))))))
+
 (defun org-auto-scheduler-background-run ()
   "Run the scheduler silently in the background.
 If `org-auto-scheduler-background-async' is non-nil and `make-thread' is supported,
@@ -89,34 +294,51 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
         (condition-case err
             (let ((org-auto-scheduler-silent-mode t)
                   (org-auto-scheduler--current-run-type run-type)
-                  (org-auto-scheduler--run-start-time start-time))
-              ;; On first background run of the day, optionally reschedule uncompleted past tasks
-              (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-past-tasks)
-                         is-first-run-of-day
-                         (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
-                (setq resched-past-count
-                      (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
-              ;; Run scheduler in silent mode
-              (org-auto-scheduler-schedule-tasks)
-              ;; Save agenda buffers if configured and changes were made
-              (when (and org-auto-scheduler-background-save-buffers
-                         (or (and org-auto-scheduler--last-run-changes
-                                  (> (length org-auto-scheduler--last-run-changes) 0))
-                             (> resched-past-count 0)))
-                (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
-                (save-some-buffers t (lambda ()
-                                       (and (buffer-file-name)
-                                            (member (buffer-file-name) (org-agenda-files t))))))
-              ;; Notify user if changes were made
-              (when (and org-auto-scheduler-change-log-notify
-                         (or (and org-auto-scheduler--last-run-changes
-                                  (> (length org-auto-scheduler--last-run-changes) 0))
-                             (> resched-past-count 0)))
-                (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
-                         (length (or org-auto-scheduler--last-run-changes '()))
-                         (if (> resched-past-count 0)
-                             (format " (%d from past days rescheduled)" resched-past-count)
-                           ""))))
+                  (org-auto-scheduler--run-start-time start-time)
+                  (mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon)))
+              (when (and mtime-snapshot
+                         (org-auto-scheduler--acquire-or-refresh-host-lease))
+                ;; On first background run of the day, optionally reschedule uncompleted past tasks
+                (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-past-tasks)
+                           is-first-run-of-day
+                           (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
+                  (setq resched-past-count
+                        (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
+                ;; Two-Phase Execution:
+                ;; Phase 1: Pure in-memory dry-run (when no inline title markers require stripping)
+                (if (or (> resched-past-count 0)
+                        (org-auto-scheduler--agenda-has-title-markers-p))
+                    (org-auto-scheduler-schedule-tasks)
+                  (let ((org-auto-scheduler--preview-mode t))
+                    (org-auto-scheduler-schedule-tasks))
+                  ;; Phase 2: Fast atomic commit ONLY if Phase 1 detected actual schedule changes
+                  ;; and disk mtimes / buffer clean state remain unchanged.
+                  (when (and org-auto-scheduler--last-run-changes
+                             (> (length org-auto-scheduler--last-run-changes) 0)
+                             (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
+                    (let ((org-auto-scheduler--preview-mode nil))
+                      (org-auto-scheduler-schedule-tasks))))
+                ;; Save agenda buffers if configured and changes were made
+                (when (and org-auto-scheduler-background-save-buffers
+                           (or (and org-auto-scheduler--last-run-changes
+                                    (> (length org-auto-scheduler--last-run-changes) 0))
+                               (> resched-past-count 0)))
+                  (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
+                  (save-some-buffers t (lambda ()
+                                         (and (buffer-file-name)
+                                              (member (buffer-file-name) (org-agenda-files t))))))
+                ;; Notify user if changes were made
+                (when (and org-auto-scheduler-change-log-notify
+                           (or (and org-auto-scheduler--last-run-changes
+                                    (> (length org-auto-scheduler--last-run-changes) 0))
+                               (> resched-past-count 0)))
+                  (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
+                           (length (or org-auto-scheduler--last-run-changes '()))
+                           (if (> resched-past-count 0)
+                               (format " (%d from past days rescheduled)" resched-past-count)
+                             "")))
+                ;; Server-only End-of-Day adherence check
+                (org-auto-scheduler--maybe-run-server-eod-check (current-time))))
           (error
            (org-auto-scheduler--log-error "Error in background scheduler: %s" err)
            (when (org-auto-scheduler--should-log-changes-p)

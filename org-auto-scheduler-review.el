@@ -107,6 +107,21 @@ table or the timegrid."
 (defvar-local org-auto-scheduler--timegrid-current-layout nil
   "Tracks whether the active timegrid split is 'side-by-side or 'horizontal.")
 
+(defcustom org-auto-scheduler-snapshot-on-review-apply 'prompt
+  "Whether to record today's baseline schedule snapshot on first review apply (`x').
+Values can be:
+  `prompt' - Ask with `y-or-n-p' on the first apply of the day (default).
+  `always' - Automatically snapshot on the first apply of the day.
+  `never'  - Only snapshot when explicitly pressing `A' in the review buffer."
+  :type '(choice (const :tag "Prompt on first apply of the day" prompt)
+                 (const :tag "Always snapshot on first apply" always)
+                 (const :tag "Never auto-snapshot (manual `A' only)" never))
+  :group 'org-auto-scheduler)
+
+(defvar-local org-auto-scheduler--review-marked-ids nil
+  "List of task-ids marked with `*' for bulk operations in the review buffer.")
+
+
 
 (unless (fboundp 'org-auto-scheduler--log-debug)
   (defun org-auto-scheduler--log-debug (&rest _args) nil))
@@ -1137,8 +1152,15 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                      (t
                       (push (format "⛔ Blocker not scheduled: %s"
                                     (org-auto-scheduler--truncate b-head 30))
-                            warnings))))))))))))
-    warnings))
+                            warnings)))))))))))
+    ;; 4. Check for negative CPM Total Float (deadline-infeasible dependency chain)
+    (let* ((tid (nth 0 task))
+           (fl (and tid (fboundp 'org-auto-scheduler-task-float-hours)
+                    (org-auto-scheduler-task-float-hours tid))))
+      (when (and (numberp fl) (< fl -0.01))
+        (push (format "⛔ Negative CPM Float (%.1fh): Dependency chain exceeds deadline!" fl)
+              warnings)))
+    warnings)))
 
 (defun org-auto-scheduler--smart-effort-label (marker)
   "Return effort string, appending '[?]' if using default/historical estimate."
@@ -1282,8 +1304,35 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                 (format " │ %s" (propertize (format "⏳ %d waiting" waiting-count)
                                                             'face '(:inherit bold :foreground "#e5c07b")))
                               ""))
-             (legend (format " %s │ %d scheduled (%.1fh)%s │%s"
-                             gauge total hours waiting-badge proj-legend)))
+             (neg-float-count (cl-count-if
+                               (lambda (tk)
+                                 (let ((fl (and (fboundp 'org-auto-scheduler-task-float-hours)
+                                                (org-auto-scheduler-task-float-hours (nth 0 tk)))))
+                                   (and (numberp fl) (< fl -0.01))))
+                               org-auto-scheduler-completed-tasks))
+             (neg-badge (if (> neg-float-count 0)
+                            (format " │ %s"
+                                    (propertize (format "⛔ %d DEADLINE INFEASIBLE" neg-float-count)
+                                                'face 'error))
+                          ""))
+             (marked-badge (if (and (boundp 'org-auto-scheduler--review-marked-ids)
+                                    org-auto-scheduler--review-marked-ids)
+                               (format " │ %s"
+                                       (propertize (format "★ %d marked"
+                                                           (length org-auto-scheduler--review-marked-ids))
+                                                   'face 'warning))
+                             ""))
+             (snap-count (and (fboundp 'org-auto-scheduler--snapshot-count-for-date)
+                              (org-auto-scheduler--snapshot-count-for-date today-str)))
+             (snap-badge (if (and snap-count (> snap-count 0))
+                             (format " │ %s"
+                                     (propertize (format "📸 Snapshot: ✓ (%d)" snap-count)
+                                                 'face 'success))
+                           (format " │ %s"
+                                   (propertize "📸 Snapshot: None [A]"
+                                               'face 'shadow))))
+             (legend (format " %s │ %d scheduled (%.1fh)%s%s%s%s │%s"
+                             gauge total hours waiting-badge neg-badge marked-badge snap-badge proj-legend)))
         (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
 ;;; Interactive Review Mode
@@ -1312,6 +1361,11 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "TAB") #'org-auto-scheduler-review-jump)
   (define-key map (kbd "x")   #'org-auto-scheduler-review-execute)
   (define-key map (kbd "C-c C-c") #'org-auto-scheduler-review-execute)
+  ;; Inspector, Snapshot & Dependency Explorer
+  (define-key map (kbd "I")   #'org-auto-scheduler-review-inspect-task)
+  (define-key map (kbd "A")   #'org-auto-scheduler-review-snapshot-schedule)
+  (define-key map (kbd "G")   #'org-auto-scheduler-explore-dependencies)
+  (define-key map (kbd "C-c C-g") #'org-auto-scheduler-explore-dependencies)
   ;; Reorder
   (define-key map (kbd "K")   #'org-auto-scheduler-review-move-up)
   (define-key map (kbd "J")   #'org-auto-scheduler-review-move-down)
@@ -1345,8 +1399,14 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "u")   #'org-auto-scheduler-review-undo)
   ;; Filters
   (define-key map (kbd "f t") #'org-auto-scheduler-review-filter-today)
+  (define-key map (kbd "f d") #'org-auto-scheduler-review-filter-by-day)
   (define-key map (kbd "f p") #'org-auto-scheduler-review-filter-project)
+  (define-key map (kbd "f g") #'org-auto-scheduler-review-filter-by-tag)
+  (define-key map (kbd "f c") #'org-auto-scheduler-review-filter-by-category)
+  (define-key map (kbd "f s") #'org-auto-scheduler-review-filter-by-status)
+  (define-key map (kbd "f #") #'org-auto-scheduler-review-filter-by-priority)
   (define-key map (kbd "f a") #'org-auto-scheduler-review-filter-clear)
+  (define-key map (kbd "f /") #'org-auto-scheduler-review-filter-clear)
   (define-key map (kbd "/")   #'org-auto-scheduler-review-filter-regexp)
   ;; Bulk operations
   (define-key map (kbd "* a") #'org-auto-scheduler-review-mark-all)
@@ -1354,6 +1414,11 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (define-key map (kbd "* t") #'org-auto-scheduler-review-mark-today)
   (define-key map (kbd "* p") #'org-auto-scheduler-review-mark-project)
   (define-key map (kbd "* %") #'org-auto-scheduler-review-mark-regexp)
+  (define-key map (kbd "* m") #'org-auto-scheduler-review-mark-row)
+  (define-key map (kbd "* d") #'org-auto-scheduler-review-mark-day)
+  (define-key map (kbd "* P") #'org-auto-scheduler-review-mark-project-rows)
+  (define-key map (kbd "* u") #'org-auto-scheduler-review-unmark-selected-rows)
+  (define-key map (kbd "* o") #'org-auto-scheduler-review-defer-overflow-tasks)
   ;; What-if
   (define-key map (kbd "e")   #'org-auto-scheduler-review-edit-effort)
   ;; Views
@@ -1388,6 +1453,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "RET")     #'org-auto-scheduler-review-toggle
       (kbd "TAB")     #'org-auto-scheduler-review-jump
       (kbd "m")       #'org-auto-scheduler-review-toggle
+      (kbd "I")       #'org-auto-scheduler-review-inspect-task
+      (kbd "A")       #'org-auto-scheduler-review-snapshot-schedule
+      (kbd "G")       #'org-auto-scheduler-explore-dependencies
+      (kbd "C-c C-g") #'org-auto-scheduler-explore-dependencies
       (kbd "B")       #'org-auto-scheduler-review-toggle-non-blocking
       (kbd "b")       #'org-auto-scheduler-review-toggle-non-blocking
       (kbd "s")       #'org-auto-scheduler-review-toggle-splittable
@@ -1430,8 +1499,14 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "O")       #'org-auto-scheduler-review-move-before
       ;; Filters
       (kbd "f t")     #'org-auto-scheduler-review-filter-today
+      (kbd "f d")     #'org-auto-scheduler-review-filter-by-day
       (kbd "f p")     #'org-auto-scheduler-review-filter-project
+      (kbd "f g")     #'org-auto-scheduler-review-filter-by-tag
+      (kbd "f c")     #'org-auto-scheduler-review-filter-by-category
+      (kbd "f s")     #'org-auto-scheduler-review-filter-by-status
+      (kbd "f #")     #'org-auto-scheduler-review-filter-by-priority
       (kbd "f a")     #'org-auto-scheduler-review-filter-clear
+      (kbd "f /")     #'org-auto-scheduler-review-filter-clear
       (kbd "/")       #'org-auto-scheduler-review-filter-regexp
       ;; Bulk operations
       (kbd "* a")     #'org-auto-scheduler-review-mark-all
@@ -1439,6 +1514,11 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
       (kbd "* t")     #'org-auto-scheduler-review-mark-today
       (kbd "* p")     #'org-auto-scheduler-review-mark-project
       (kbd "* %")     #'org-auto-scheduler-review-mark-regexp
+      (kbd "* m")     #'org-auto-scheduler-review-mark-row
+      (kbd "* d")     #'org-auto-scheduler-review-mark-day
+      (kbd "* P")     #'org-auto-scheduler-review-mark-project-rows
+      (kbd "* u")     #'org-auto-scheduler-review-unmark-selected-rows
+      (kbd "* o")     #'org-auto-scheduler-review-defer-overflow-tasks
       ;; Toggle fixed agenda events
       (kbd "E")       #'org-auto-scheduler-review-toggle-agenda-events
       ;; Help
@@ -1458,8 +1538,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (setq tabulated-list-sort-key nil)  ; We sort chronologically ourselves in --build-review-entries
   (setq-local revert-buffer-function #'org-auto-scheduler-review-refresh-revert)
   (setq-local org-auto-scheduler--review-overrides (make-hash-table :test 'equal))
+  (setq-local org-auto-scheduler--review-marked-ids nil)
   (setq-local tabulated-list-printer #'org-auto-scheduler--tabulated-list-printer)
   (add-hook 'kill-buffer-hook #'org-auto-scheduler--review-cancel-recalc-timer nil t)
+  (add-hook 'post-command-hook #'org-auto-scheduler--review-maybe-update-inspector nil t)
   (tabulated-list-init-header))
 
 (defun org-auto-scheduler-review-set-todo-state ()
@@ -2644,7 +2726,7 @@ and optionally existing fixed agenda events interleaved chronologically."
 
     ;; Shortcuts banner at top
     (cons (list "__header_shortcuts"
-                (vector "" "" (propertize "  [RET] toggle  [t] state  [s] split  [p] pin  [b] non-blocking  [K/J] reorder  [>/<] day  [d] date  [r] recalc  [S] save  [M] merge  [C] clear  [x] apply  [?] help" 'face 'shadow)
+                (vector "" "" (propertize "  [RET] toggle  [I] inspect  [A] snapshot  [G] deps  [t] state  [s] split  [p] pin  [K/J] reorder  [>/<] day  [d] date  [r] recalc  [S] save  [x] apply  [?] help" 'face 'shadow)
                         "" "" "" "" ""))
           (nreverse raw-entries))))
 
@@ -2748,6 +2830,69 @@ tasks are constrained to start on or after their current day section."
   "Revert function for `org-auto-scheduler-review-mode'."
   (org-auto-scheduler-review-refresh))
 
+(defun org-auto-scheduler-review-snapshot-schedule ()
+  "Record today's proposed review schedule (checked tasks) as the baseline snapshot for adherence analytics.
+Bound to `A' in `org-auto-scheduler-review-mode'."
+  (interactive)
+  (let* ((today-str (format-time-string "%Y-%m-%d"))
+         (existing (and (fboundp 'org-auto-scheduler--snapshot-count-for-date)
+                        (org-auto-scheduler--snapshot-count-for-date today-str)))
+         (proceed (or (null existing)
+                      (= existing 0)
+                      noninteractive
+                      (y-or-n-p (format "Today already has a snapshot (%d tasks). Overwrite with current review schedule? "
+                                        existing)))))
+    (when proceed
+      (let ((tasks '()))
+        (dolist (tk org-auto-scheduler-completed-tasks)
+          (let* ((tid (nth 0 tk))
+                 (start (nth 1 tk))
+                 (end (nth 2 tk))
+                 (headline (nth 5 tk))
+                 (marker (nth 7 tk))
+                 (status (nth 9 tk))
+                 (entry (and (boundp 'tabulated-list-entries)
+                             (cadr (assoc tid tabulated-list-entries))))
+                 (checked (if entry (string= (aref entry 0) "[X]") t)))
+            (when (and checked start end
+                       (not (memq status '(:failed :blocked :skipped)))
+                       (string= (format-time-string "%Y-%m-%d" start) today-str))
+              (let* ((effort (round (/ (float-time (time-subtract end start)) 60.0)))
+                     (has-m (and marker (markerp marker) (marker-buffer marker)))
+                     (file (and has-m (buffer-file-name (marker-buffer marker))))
+                     (pos (and has-m (marker-position marker)))
+                     (cat (if has-m (org-with-point-at marker (org-get-category)) "default"))
+                     (tags (and has-m (org-with-point-at marker (org-get-tags))))
+                     (sched-str (format "<%s-%s>"
+                                        (format-time-string "%Y-%m-%d %a %H:%M" start)
+                                        (format-time-string "%H:%M" end))))
+                (push (list :id tid
+                            :file file
+                            :pos pos
+                            :heading headline
+                            :headline headline
+                            :start (format-time-string "%H:%M" start)
+                            :end (format-time-string "%H:%M" end)
+                            :effort effort
+                            :category cat
+                            :tags tags
+                            :scheduled sched-str)
+                      tasks)))))
+        (setq tasks (nreverse tasks))
+        (when (boundp 'org-auto-scheduler--adherence-snapshots)
+          (let ((existing-entry (assoc today-str org-auto-scheduler--adherence-snapshots)))
+            (if existing-entry
+                (setcdr existing-entry tasks)
+              (push (cons today-str tasks) org-auto-scheduler--adherence-snapshots))))
+        (when (fboundp 'org-auto-scheduler-save-adherence)
+          (org-auto-scheduler-save-adherence))
+        (when (derived-mode-p 'org-auto-scheduler-review-mode)
+          (setq header-line-format
+                (org-auto-scheduler--review-header-line tabulated-list-entries))
+          (force-mode-line-update))
+        (message "📸 Recorded baseline schedule snapshot for %s (%d tasks)."
+                 today-str (length tasks))))))
+
 (defun org-auto-scheduler-review-execute ()
   "Apply the scheduled times for all checked tasks in the review buffer.
 Automatically recalculates dependent times based on visual layout before execution."
@@ -2838,6 +2983,17 @@ Automatically recalculates dependent times based on visual layout before executi
     (save-some-buffers t (lambda ()
                            (and (buffer-file-name)
                                 (member (buffer-file-name) (org-agenda-files t)))))
+    ;; Optionally snapshot today's baseline schedule on first apply of the day
+    (when (and (> applied-count 0)
+               (fboundp 'org-auto-scheduler--has-snapshot-for-date-p)
+               (not (org-auto-scheduler--has-snapshot-for-date-p (format-time-string "%Y-%m-%d"))))
+      (cond
+       ((eq org-auto-scheduler-snapshot-on-review-apply 'always)
+        (ignore-errors (org-auto-scheduler-review-snapshot-schedule)))
+       ((and (eq org-auto-scheduler-snapshot-on-review-apply 'prompt)
+             (not noninteractive)
+             (y-or-n-p "Snapshot today's schedule as baseline for adherence analytics? "))
+        (ignore-errors (org-auto-scheduler-review-snapshot-schedule)))))
     (unwind-protect
         (progn
           (when org-auto-scheduler-review-auto-save-decisions
@@ -3222,6 +3378,247 @@ With prefix ARG (C-u p) or empty input, unpins the task."
           (aset vec 0 "[X]")
           (aset vec 2 (substring-no-properties (aref vec 2))))))
     (tabulated-list-print t)))
+
+(defun org-auto-scheduler-review-filter-by-day (&optional day-str)
+  "Filter review list to show only tasks scheduled on DAY-STR (YYYY-MM-DD)."
+  (interactive)
+  (let* ((dates nil))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (when (nth 1 tk)
+        (cl-pushnew (format-time-string "%Y-%m-%d" (nth 1 tk)) dates :test #'string=)))
+    (setq dates (sort dates #'string<))
+    (let ((choice (or day-str
+                      (if dates
+                          (completing-read "Filter by scheduled day: " dates nil t)
+                        (org-read-date nil nil nil "Filter by date: ")))))
+      (setq org-auto-scheduler--review-active-filter
+            (lambda (id _vec)
+              (let ((task-data (assoc id org-auto-scheduler-completed-tasks)))
+                (and task-data (nth 1 task-data)
+                     (string= (format-time-string "%Y-%m-%d" (nth 1 task-data)) choice)))))
+      (org-auto-scheduler--apply-current-filter)
+      (message "Filtered by day: %s" choice))))
+
+(defun org-auto-scheduler-review-filter-by-tag (&optional tag)
+  "Filter review list by Org TAG (including inherited tags)."
+  (interactive)
+  (let ((tags nil))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (let ((m (nth 7 tk)))
+        (when (and m (markerp m) (marker-buffer m))
+          (dolist (tg (org-with-point-at m (org-get-tags)))
+            (unless (string= tg org-auto-scheduler-tag)
+              (cl-pushnew (substring-no-properties tg) tags :test #'string=))))))
+    (let ((choice (or tag (completing-read "Filter by tag: " (sort tags #'string<) nil nil))))
+      (if (string-empty-p choice)
+          (org-auto-scheduler-review-filter-clear)
+        (setq org-auto-scheduler--review-active-filter
+              (lambda (id _vec)
+                (let* ((tk (assoc id org-auto-scheduler-completed-tasks))
+                       (m (and tk (nth 7 tk))))
+                  (and m (markerp m) (marker-buffer m)
+                       (member choice (mapcar #'substring-no-properties
+                                              (org-with-point-at m (org-get-tags))))))))
+        (org-auto-scheduler--apply-current-filter)
+        (message "Filtered by tag: :%s:" choice)))))
+
+(defun org-auto-scheduler-review-filter-by-category (&optional category)
+  "Filter review list by Org CATEGORY."
+  (interactive)
+  (let ((cats nil))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (let ((m (nth 7 tk)))
+        (when (and m (markerp m) (marker-buffer m))
+          (let ((c (org-with-point-at m (org-get-category))))
+            (when c (cl-pushnew (substring-no-properties c) cats :test #'string=))))))
+    (let ((choice (or category (completing-read "Filter by category: " (sort cats #'string<) nil t))))
+      (setq org-auto-scheduler--review-active-filter
+            (lambda (id _vec)
+              (let* ((tk (assoc id org-auto-scheduler-completed-tasks))
+                     (m (and tk (nth 7 tk))))
+                (and m (markerp m) (marker-buffer m)
+                     (string= choice (substring-no-properties
+                                      (or (org-with-point-at m (org-get-category)) "")))))))
+      (org-auto-scheduler--apply-current-filter)
+      (message "Filtered by category: %s" choice))))
+
+(defun org-auto-scheduler-review-filter-by-status (&optional status-type)
+  "Filter review list by STATUS-TYPE (`warnings', `blocked', `critical', `pinned', `waiting')."
+  (interactive)
+  (let* ((choices '("warnings" "blocked" "critical" "pinned" "waiting"))
+         (choice (or status-type (completing-read "Filter by status: " choices nil t))))
+    (setq org-auto-scheduler--review-active-filter
+          (lambda (id _vec)
+            (let* ((tk (assoc id org-auto-scheduler-completed-tasks))
+                   (m (and tk (nth 7 tk)))
+                   (st (and tk (nth 9 tk))))
+              (pcase choice
+                ("warnings"
+                 (and tk (or (memq st '(:blocked :failed))
+                             (org-auto-scheduler--check-task-warnings tk m))))
+                ("blocked"
+                 (and tk (memq st '(:blocked :failed))))
+                ("critical"
+                 (let ((fl (and (fboundp 'org-auto-scheduler-task-float-hours)
+                                (org-auto-scheduler-task-float-hours id))))
+                   (and (numberp fl) (<= fl 0.01))))
+                ("pinned"
+                 (and tk (org-auto-scheduler-task-pinned-p m id)))
+                ("waiting"
+                 (null tk))
+                (_ t)))))
+    (org-auto-scheduler--apply-current-filter)
+    (message "Filtered by status: %s" choice)))
+
+(defun org-auto-scheduler-review-filter-by-priority (&optional prio)
+  "Filter review list by Org PRIORITY (`A', `B', `C', or `none')."
+  (interactive)
+  (let ((choice (or prio (completing-read "Filter by priority: " '("A" "B" "C" "none") nil t))))
+    (setq org-auto-scheduler--review-active-filter
+          (lambda (id _vec)
+            (let* ((tk (assoc id org-auto-scheduler-completed-tasks))
+                   (m (and tk (nth 7 tk)))
+                   (p (and m (markerp m) (marker-buffer m)
+                           (org-with-point-at m (org-entry-get nil "PRIORITY")))))
+              (if (string= choice "none")
+                  (or (null p) (string-empty-p p))
+                (equal p choice)))))
+    (org-auto-scheduler--apply-current-filter)
+    (message "Filtered by priority: [#%s]" choice)))
+
+(defun org-auto-scheduler--review-selected-task-ids ()
+  "Return list of selected task IDs from `*` marks, active region, or row at point."
+  (cond
+   ((and (boundp 'org-auto-scheduler--review-marked-ids)
+         org-auto-scheduler--review-marked-ids)
+    (copy-sequence org-auto-scheduler--review-marked-ids))
+   ((use-region-p)
+    (let ((beg (region-beginning))
+          (end (region-end))
+          (ids '()))
+      (save-excursion
+        (goto-char beg)
+        (beginning-of-line)
+        (while (and (< (point) end) (not (eobp)))
+          (let ((id (tabulated-list-get-id)))
+            (when (and id (not (org-auto-scheduler--review-special-row-p id)))
+              (push id ids)))
+          (forward-line 1)))
+      (nreverse ids)))
+   (t
+    (let ((id (tabulated-list-get-id)))
+      (when (and id (not (org-auto-scheduler--review-special-row-p id)))
+        (list id))))))
+
+(defun org-auto-scheduler--review-refresh-mark-indicators ()
+  "Update the ● column in `tabulated-list-entries' to show ★ on marked rows."
+  (dolist (e tabulated-list-entries)
+    (let ((id (car e))
+          (vec (cadr e)))
+      (when (and id (not (org-auto-scheduler--review-special-row-p id)))
+        (let* ((tk (assoc id org-auto-scheduler-completed-tasks))
+               (m (and tk (nth 7 tk)))
+               (proj (org-auto-scheduler--truncate (or (and m (org-auto-scheduler--get-project-name m)) "—") 18)))
+          (if (member id org-auto-scheduler--review-marked-ids)
+              (aset vec 1 (propertize "★" 'face 'warning))
+            (aset vec 1 (org-auto-scheduler--project-dot proj)))))))
+  (tabulated-list-print t)
+  (setq header-line-format
+        (org-auto-scheduler--review-header-line tabulated-list-entries)))
+
+(defun org-auto-scheduler-review-mark-row ()
+  "Toggle bulk selection mark (`★') on the task row at point and advance line."
+  (interactive)
+  (let ((id (tabulated-list-get-id)))
+    (when (or (null id) (org-auto-scheduler--review-special-row-p id))
+      (user-error "Not on a task row"))
+    (if (member id org-auto-scheduler--review-marked-ids)
+        (setq org-auto-scheduler--review-marked-ids
+              (delete id org-auto-scheduler--review-marked-ids))
+      (push id org-auto-scheduler--review-marked-ids))
+    (org-auto-scheduler--review-refresh-mark-indicators)
+    (forward-line 1)))
+
+(defun org-auto-scheduler-review-mark-day (&optional day-str)
+  "Mark all tasks scheduled on DAY-STR for bulk operations."
+  (interactive)
+  (let* ((curr-day (org-auto-scheduler--review-get-task-day))
+         (dates nil))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (when (nth 1 tk)
+        (cl-pushnew (format-time-string "%Y-%m-%d" (nth 1 tk)) dates :test #'string=)))
+    (let ((choice (or day-str
+                      (completing-read (format "Mark all tasks on day (default %s): "
+                                               (or curr-day "today"))
+                                       (sort dates #'string<) nil t nil nil curr-day))))
+      (dolist (tk org-auto-scheduler-completed-tasks)
+        (when (and (nth 1 tk)
+                   (string= (format-time-string "%Y-%m-%d" (nth 1 tk)) choice))
+          (cl-pushnew (nth 0 tk) org-auto-scheduler--review-marked-ids :test #'equal)))
+      (org-auto-scheduler--review-refresh-mark-indicators)
+      (message "Marked %d tasks on %s" (length org-auto-scheduler--review-marked-ids) choice))))
+
+(defun org-auto-scheduler-review-mark-project-rows (&optional project)
+  "Mark all tasks in PROJECT with `★' for bulk operations."
+  (interactive)
+  (let ((projects nil))
+    (dolist (e tabulated-list-entries)
+      (let ((proj (aref (cadr e) 5)))
+        (when (and proj (not (string= proj "—")) (not (string= proj "")))
+          (cl-pushnew (substring-no-properties proj) projects :test #'string=))))
+    (if (null projects)
+        (message "No projects found")
+      (let ((choice (or project (completing-read "Select project rows: " projects nil t))))
+        (dolist (e tabulated-list-entries)
+          (let ((id (car e))
+                (vec (cadr e)))
+            (when (and (not (org-auto-scheduler--review-special-row-p id))
+                       (string= (substring-no-properties (aref vec 5)) choice))
+              (cl-pushnew id org-auto-scheduler--review-marked-ids :test #'equal))))
+        (org-auto-scheduler--review-refresh-mark-indicators)
+        (message "Selected %d tasks in project %s"
+                 (length org-auto-scheduler--review-marked-ids) choice)))))
+
+(defun org-auto-scheduler-review-unmark-selected-rows ()
+  "Clear all `★' selection marks in the review buffer."
+  (interactive)
+  (setq org-auto-scheduler--review-marked-ids nil)
+  (org-auto-scheduler--review-refresh-mark-indicators)
+  (message "Cleared all selection marks"))
+
+(defun org-auto-scheduler-review-defer-overflow-tasks ()
+  "Defer tasks on today that exceed daily workday capacity to the next day."
+  (interactive)
+  (org-auto-scheduler--review-push-undo)
+  (let* ((today-str (format-time-string "%Y-%m-%d"))
+         (tomorrow-str (format-time-string "%Y-%m-%d" (time-add (current-time) (days-to-time 1))))
+         (workday-mins (org-auto-scheduler-workday-duration-minutes))
+         (accum-mins 0)
+         (deferred 0))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (let ((tid (nth 0 tk))
+            (start (nth 1 tk))
+            (end (nth 2 tk))
+            (status (nth 9 tk)))
+        (when (and start end
+                   (not (memq status '(:failed :blocked :skipped)))
+                   (string= (format-time-string "%Y-%m-%d" start) today-str))
+          (let ((dur (round (/ (float-time (time-subtract end start)) 60.0))))
+            (setq accum-mins (+ accum-mins dur))
+            (when (> accum-mins workday-mins)
+              (let ((over (or (gethash tid org-auto-scheduler--review-overrides)
+                              (list :order nil :skipped nil))))
+                (puthash tid
+                         (plist-put (plist-put over :target-date tomorrow-str)
+                                    :pinned-date tomorrow-str)
+                         org-auto-scheduler--review-overrides)
+                (cl-incf deferred)))))))
+    (if (> deferred 0)
+        (progn
+          (org-auto-scheduler-review-recalculate)
+          (message "Deferred %d overflow task(s) to %s." deferred tomorrow-str))
+      (message "Today's schedule (%dm / %dm) is within capacity; no overflow tasks."
+               accum-mins workday-mins))))
 
 (defun org-auto-scheduler-review-edit-effort (new-effort)
   "Edit the estimated effort (in minutes) for the task at point (temporary override)."
@@ -4190,6 +4587,9 @@ Can be invoked from either the review table or the timegrid via `i'."
     (with-current-buffer standard-output
       (insert "Org Auto Scheduler Review & Timegrid Keybindings:\n\n")
       (insert "  RET, m       Toggle application of task at point/selected ([X] / [ ])\n")
+      (insert "  I            Inspect task at point (Why Is This Scheduled Here?)\n")
+      (insert "  A            Snapshot today's proposed schedule as baseline for adherence\n")
+      (insert "  G, C-c C-g   Open Project & Sibling Dependency Explorer for task at point\n")
       (insert "  TAB          Jump to task or event in Org file\n")
       (insert "  t            Set or change TODO state of task at point (all tasks & waiting)\n")
       (insert "  s            Toggle SPLITTABLE status on task at point/selected\n")
@@ -4226,15 +4626,478 @@ Can be invoked from either the review table or the timegrid via `i'."
       (insert "  S-<arrows>   Resize block duration / effort\n\n")
       (insert "Filters (prefix with 'f'):\n")
       (insert "  f t          Show only tasks scheduled for today\n")
+      (insert "  f d          Filter tasks by scheduled day\n")
       (insert "  f p          Filter tasks by project\n")
-      (insert "  f a          Clear active filter\n")
+      (insert "  f g          Filter tasks by Org tag\n")
+      (insert "  f c          Filter tasks by Org category\n")
+      (insert "  f s          Filter tasks by status (warnings, blocked, critical, pinned, waiting)\n")
+      (insert "  f #          Filter tasks by priority ([#A], [#B], [#C], none)\n")
+      (insert "  f a, f /     Clear active filter\n")
       (insert "  /            Filter by regexp match on headline\n\n")
-      (insert "Bulk Marks (prefix with '*'):\n")
-      (insert "  * a          Mark all tasks\n")
-      (insert "  * n          Unmark/clear all tasks\n")
-      (insert "  * t          Mark all tasks scheduled for today\n")
-      (insert "  * p          Mark all tasks in a project\n")
-      (insert "  * %          Mark all tasks matching a regexp\n"))))
+      (insert "Bulk Marks & Operations (prefix with '*'):\n")
+      (insert "  * m          Toggle selection mark (★) on task at point\n")
+      (insert "  * d          Select all tasks on a chosen day\n")
+      (insert "  * P          Select all tasks in a project\n")
+      (insert "  * u          Clear all selection marks (★)\n")
+      (insert "  * o          Defer today's overflow tasks (beyond capacity) to tomorrow\n")
+      (insert "  * a          Check [X] all tasks\n")
+      (insert "  * n          Uncheck [ ] all tasks\n")
+      (insert "  * t          Check [X] all tasks scheduled for today\n")
+      (insert "  * p          Check [X] all tasks in a project\n")
+      (insert "  * %          Check [X] all tasks matching a regexp\n"))))
+
+;;; Task Inspector ("Why Is This Scheduled Here?", bound to `I')
+
+(defvar org-auto-scheduler-inspector-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "I") #'quit-window)
+    map)
+  "Keymap for `org-auto-scheduler-inspector-mode'.")
+
+(define-derived-mode org-auto-scheduler-inspector-mode special-mode "AutoSch-Inspect"
+  "Major mode for inspecting score, duration, and placement trace of a scheduled task."
+  (setq buffer-read-only t))
+
+(defun org-auto-scheduler--render-task-inspector-buffer (task-id &optional no-select)
+  "Populate `*Org Auto Scheduler Task Inspector*' for TASK-ID."
+  (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
+         (marker (and task (nth 7 task)))
+         (headline (or (and task (nth 5 task)) "Untitled"))
+         (start (and task (nth 1 task)))
+         (end (and task (nth 2 task)))
+         (status (and task (nth 9 task)))
+         (proj (or (and marker (markerp marker) (marker-buffer marker)
+                        (org-auto-scheduler--get-project-name marker))
+                   "—"))
+         (score-res (and marker (markerp marker) (marker-buffer marker)
+                         (org-auto-scheduler-calculate-score marker)))
+         (base-score (or (car score-res) 0.0))
+         (comps (cdr score-res))
+         (float-hrs (and (fboundp 'org-auto-scheduler-task-float-hours)
+                         (org-auto-scheduler-task-float-hours task-id)))
+         (cpm-boost (cond
+                     ((null float-hrs) 0.0)
+                     ((<= float-hrs (or (bound-and-true-p org-auto-scheduler-critical-path-max-float-hours) 4.0))
+                      (float (or (bound-and-true-p org-auto-scheduler-critical-path-boost) 50.0)))
+                     (t 0.0)))
+         (total-score (+ base-score cpm-boost))
+         (trace (and (boundp 'org-auto-scheduler--placement-traces)
+                     (hash-table-p org-auto-scheduler--placement-traces)
+                     (gethash task-id org-auto-scheduler--placement-traces)))
+         (buf (get-buffer-create "*Org Auto Scheduler Task Inspector*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (org-auto-scheduler-inspector-mode)
+        (insert "══════════════════════════════════════════════════════════════════════\n")
+        (insert (propertize (format " 🔍 TASK INSPECTOR: %s\n" headline) 'face 'bold))
+        (insert (format " Project: %-22s │ ID: %s\n" proj task-id))
+        (insert (format " Status:  %-22s │ Slot: %s\n"
+                        (or status :scheduled)
+                        (if (and start end)
+                            (format "%s–%s"
+                                    (format-time-string "%a %Y-%m-%d %H:%M" start)
+                                    (format-time-string "%H:%M" end))
+                          "Unscheduled")))
+        (insert "══════════════════════════════════════════════════════════════════════\n\n")
+        ;; Section 1: Score Breakdown
+        (insert (propertize "1. PRIORITY SCORE BREAKDOWN\n" 'face 'bold))
+        (insert "   ───────────────────────────────────────────────────────────────\n")
+        (when comps
+          (insert (format "   • Effort Score:                  %+5.1f\n" (or (nth 0 comps) 0.0)))
+          (insert (format "   • Priority Score:                %+5.1f\n" (or (nth 1 comps) 0.0)))
+          (insert (format "   • Deadline Urgency Score:        %+5.1f\n" (or (nth 2 comps) 0.0)))
+          (insert (format "   • Category Priority Score:       %+5.1f\n" (or (nth 3 comps) 0.0)))
+          (insert (format "   • TODO State Weight:             %+5.1f\n" (or (nth 4 comps) 0.0)))
+          (when (> (or (nth 11 comps) 0.0) 0.0)
+            (insert (format "   • Tag Weight Score:              %+5.1f\n" (nth 11 comps))))
+          (when (> (or (nth 12 comps) 0.0) 0.0)
+            (insert (format "   • Urgent Days Boost:             %+5.1f\n" (nth 12 comps))))
+          (when (/= (or (nth 13 comps) 0.0) 0.0)
+            (insert (format "   • Large Task Weight:             %+5.1f\n" (nth 13 comps)))))
+        (if (numberp float-hrs)
+            (insert (format "   • CPM Total Float (%+.1fh):      +%5.1f%s\n"
+                            float-hrs cpm-boost
+                            (cond ((< float-hrs -0.01) "  ⛔ [DEADLINE INFEASIBLE!]")
+                                  ((<= float-hrs 0.01) "  ⚡ [CRITICAL PATH]")
+                                  (t ""))))
+          (insert "   • CPM Total Float:                 0.0  (Independent task)\n"))
+        (insert "   ───────────────────────────────────────────────────────────────\n")
+        (insert (propertize (format "   ★ Total Effective Score:         %6.1f\n\n" total-score) 'face 'bold))
+        ;; Section 2: Effort & Duration Calculation
+        (insert (propertize "2. EFFORT & DURATION CALCULATION\n" 'face 'bold))
+        (insert "   ───────────────────────────────────────────────────────────────\n")
+        (let* ((raw-eff (and marker (markerp marker) (marker-buffer marker)
+                             (org-with-point-at marker (org-entry-get nil "Effort"))))
+               (cat (and marker (markerp marker) (marker-buffer marker)
+                         (org-with-point-at marker (org-get-category))))
+               (mult (or (and cat (cdr (assoc cat org-auto-scheduler-historical-multipliers))) 1.0))
+               (clocked (or (and marker (markerp marker) (marker-buffer marker)
+                                 (org-with-point-at marker (org-clock-sum-current-item)))
+                            0))
+               (eff-mins (or (plist-get trace :remaining-effort)
+                             (and marker (markerp marker) (marker-buffer marker)
+                                  (org-auto-scheduler-get-effort marker))
+                             org-auto-scheduler-default-task-duration))
+               (splittable (org-auto-scheduler-task-splittable-p marker task-id))
+               (freeset (org-auto-scheduler-task-freeset-p marker task-id))
+               (pinned (org-auto-scheduler-task-pinned-p marker task-id)))
+          (insert (format "   • Explicit :Effort: Property:    %s\n" (or raw-eff "(none — using default/historical)")))
+          (insert (format "   • Category (%s) Multiplier:  %.2fx\n" (or cat "default") mult))
+          (insert (format "   • Already Clocked Time:          %dm\n" clocked))
+          (insert (format "   • Effective Scheduled Duration:  %dm\n" (round eff-mins)))
+          (insert (format "   • Modifiers:                     SPLITTABLE=%s  FREESET=%s  PINNED=%s\n\n"
+                          (if splittable "YES" "no")
+                          (if freeset "YES" "no")
+                          (if pinned "YES" "no"))))
+        ;; Section 3: Slot Placement Trace
+        (insert (propertize "3. SLOT PLACEMENT TRACE (Why This Day & Time?)\n" 'face 'bold))
+        (insert "   ───────────────────────────────────────────────────────────────\n")
+        (if (null trace)
+            (insert "   • No placement trace recorded for this task.\n")
+          (let ((earliest (plist-get trace :initial-search-time))
+                (not-before (plist-get trace :not-before))
+                (blocker-end (plist-get trace :blocker-end-time))
+                (time-block (plist-get trace :time-block))
+                (energy-block (plist-get trace :energy-block))
+                (backfilled (plist-get trace :backfilled))
+                (skipped (plist-get trace :skipped-slots))
+                (final-start (plist-get trace :selected-start))
+                (final-end (plist-get trace :selected-end)))
+            (when earliest
+              (insert (format "   • Search Cursor Floor:           %s%s\n"
+                              (format-time-string "%a %Y-%m-%d %H:%M" earliest)
+                              (if backfilled "  [Backfilled into earlier open gap!]" ""))))
+            (when not-before
+              (insert (format "   • NOT_BEFORE Constraint:         %s\n"
+                              (format-time-string "%a %Y-%m-%d %H:%M" not-before))))
+            (when blocker-end
+              (insert (format "   • Upstream Blocker Finish Floor: %s\n"
+                              (format-time-string "%a %Y-%m-%d %H:%M" blocker-end))))
+            (when time-block
+              (insert (format "   • Hard Time Block Constraint:    %s\n"
+                              (mapconcat (lambda (b) (format "%s–%s" (car b) (cdr b))) time-block ", "))))
+            (when energy-block
+              (insert (format "   • Soft Energy Block Preference:  %s (same-day fallback enabled)\n"
+                              (mapconcat (lambda (b) (format "%s–%s" (car b) (cdr b))) energy-block ", "))))
+            (when skipped
+              (insert "   • Skipped / Occupied Windows:\n")
+              (dolist (s skipped)
+                (if (and (listp s) (>= (length s) 3))
+                    (insert (format "       ✗ %s–%s: %s\n"
+                                    (format-time-string "%a %H:%M" (nth 0 s))
+                                    (format-time-string "%H:%M" (nth 1 s))
+                                    (nth 2 s)))
+                  (insert (format "       ✗ %s\n" s)))))
+            (when (and final-start final-end)
+              (insert (propertize
+                       (format "   ✓ Selected Slot:                 %s–%s\n"
+                               (format-time-string "%a %Y-%m-%d %H:%M" final-start)
+                               (format-time-string "%H:%M" final-end))
+                       'face 'success)))))
+        (insert "\nKeys: [I / q] Close Inspector  (Move cursor in Review Buffer to auto-update)\n"))
+      (goto-char (point-min)))
+    (unless no-select
+      (display-buffer buf))))
+
+(defun org-auto-scheduler-review-inspect-task ()
+  "Open or toggle the `*Org Auto Scheduler Task Inspector*' window for the task at point.
+Bound strictly to `I' in `org-auto-scheduler-review-mode'."
+  (interactive)
+  (let* ((id (tabulated-list-get-id))
+         (existing-win (get-buffer-window "*Org Auto Scheduler Task Inspector*")))
+    (if (or (null id) (org-auto-scheduler--review-special-row-p id))
+        (user-error "Not on a task row")
+      (if existing-win
+          (delete-window existing-win)
+        (org-auto-scheduler--render-task-inspector-buffer id)))))
+
+(defun org-auto-scheduler--review-maybe-update-inspector ()
+  "When `*Org Auto Scheduler Task Inspector*' is visible, update it as point moves in Review."
+  (when (and (derived-mode-p 'org-auto-scheduler-review-mode)
+             (get-buffer-window "*Org Auto Scheduler Task Inspector*"))
+    (let ((id (tabulated-list-get-id)))
+      (when (and id (not (org-auto-scheduler--review-special-row-p id))
+                 (assoc id org-auto-scheduler-completed-tasks))
+        (ignore-errors (org-auto-scheduler--render-task-inspector-buffer id t))))))
+
+;;; Interactive Project & Sibling Dependency Explorer (`org-auto-scheduler-explore-dependencies')
+
+(defvar-local org-auto-scheduler--dep-explorer-root-marker nil
+  "Root project marker for the active `*Org Auto Scheduler Dependencies*' buffer.")
+
+(defvar-local org-auto-scheduler--dep-explorer-focus-id nil
+  "Focused task ID for the active `*Org Auto Scheduler Dependencies*' buffer.")
+
+(defvar org-auto-scheduler-dependency-explorer-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "g") #'org-auto-scheduler-dep-explorer-refresh)
+    (define-key map (kbd "r") #'org-auto-scheduler-dep-explorer-refresh)
+    (define-key map (kbd "RET") #'org-auto-scheduler-dep-explorer-jump)
+    (define-key map (kbd "TAB") #'org-auto-scheduler-dep-explorer-jump)
+    (define-key map (kbd "i") #'org-auto-scheduler-dep-explorer-toggle-independent)
+    (define-key map (kbd "o") #'org-auto-scheduler-dep-explorer-toggle-ordered)
+    (define-key map (kbd "c") #'org-auto-scheduler-dep-explorer-clear-saved-order)
+    map)
+  "Keymap for `org-auto-scheduler-dependency-explorer-mode'.")
+
+(with-eval-after-load 'evil
+  (dolist (state '(normal motion))
+    (evil-define-key state org-auto-scheduler-dependency-explorer-mode-map
+      (kbd "q")   #'quit-window
+      (kbd "g")   #'org-auto-scheduler-dep-explorer-refresh
+      (kbd "r")   #'org-auto-scheduler-dep-explorer-refresh
+      (kbd "RET") #'org-auto-scheduler-dep-explorer-jump
+      (kbd "TAB") #'org-auto-scheduler-dep-explorer-jump
+      (kbd "i")   #'org-auto-scheduler-dep-explorer-toggle-independent
+      (kbd "o")   #'org-auto-scheduler-dep-explorer-toggle-ordered
+      (kbd "c")   #'org-auto-scheduler-dep-explorer-clear-saved-order)))
+
+(define-derived-mode org-auto-scheduler-dependency-explorer-mode special-mode "AutoSch-Deps"
+  "Major mode for exploring and editing project & sibling scheduling dependencies."
+  (setq buffer-read-only t))
+
+(defun org-auto-scheduler--find-project-root-marker (marker)
+  "Find the root project heading marker enclosing MARKER."
+  (when (and marker (markerp marker) (marker-buffer marker))
+    (org-with-point-at marker
+      (org-back-to-heading t)
+      (let ((best (point-marker)))
+        (while (org-up-heading-safe)
+          (setq best (point-marker))
+          (when (or (member "PROJECT" (org-get-tags nil t))
+                    (org-entry-get nil "PROJECT_PRIORITY"))
+            (setq best (point-marker))))
+        best))))
+
+(defun org-auto-scheduler-dep-explorer-jump ()
+  "Jump to the Org heading at point in the Dependency Explorer."
+  (interactive)
+  (let ((m (get-text-property (point) 'task-marker)))
+    (if (and m (markerp m) (marker-buffer m))
+        (progn
+          (pop-to-buffer (marker-buffer m))
+          (goto-char m)
+          (org-back-to-heading t)
+          (org-fold-show-context))
+      (user-error "No Org heading on this line"))))
+
+(defun org-auto-scheduler-dep-explorer-toggle-independent ()
+  "Toggle `:INDEPENDENT: t' on the sibling task at point in the Dependency Explorer."
+  (interactive)
+  (let ((m (get-text-property (point) 'task-marker)))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "Not on a task line"))
+    (org-with-point-at m
+      (org-back-to-heading t)
+      (let* ((curr (org-entry-get nil "INDEPENDENT"))
+             (is-ind (and curr (member (downcase curr) '("t" "yes" "true" "1"))))
+             (hl (org-get-heading t t t t)))
+        (if is-ind
+            (progn
+              (org-delete-property "INDEPENDENT")
+              (message "Removed :INDEPENDENT: from '%s' (now part of sibling chain)." hl))
+          (org-set-property "INDEPENDENT" "t")
+          (message "Set :INDEPENDENT: t on '%s' (detached from sibling chain)." hl))))
+    (org-auto-scheduler-dep-explorer-refresh)))
+
+(defun org-auto-scheduler-dep-explorer-toggle-ordered ()
+  "Toggle `:PARALLEL: t' vs `:ORDERED: t' on the parent heading of the task at point."
+  (interactive)
+  (let ((m (or (get-text-property (point) 'parent-marker)
+               (get-text-property (point) 'task-marker)
+               org-auto-scheduler--dep-explorer-root-marker)))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No parent project heading found"))
+    (org-with-point-at m
+      (org-back-to-heading t)
+      (let* ((seq-p (org-auto-scheduler--siblings-sequential-p))
+             (hl (org-get-heading t t t t)))
+        (if seq-p
+            (progn
+              (org-delete-property "ORDERED")
+              (org-set-property "PARALLEL" "t")
+              (message "Parent '%s' set to :PARALLEL: t (siblings schedule independently)." hl))
+          (org-delete-property "PARALLEL")
+          (org-set-property "ORDERED" "t")
+          (message "Parent '%s' set to :ORDERED: t (siblings schedule sequentially)." hl))))
+    (org-auto-scheduler-dep-explorer-refresh)))
+
+(defun org-auto-scheduler-dep-explorer-clear-saved-order ()
+  "Clear saved review `:order' decisions for all tasks in the current project."
+  (interactive)
+  (let ((root org-auto-scheduler--dep-explorer-root-marker)
+        (cleared 0))
+    (when (and root (markerp root) (marker-buffer root))
+      (org-with-point-at root
+        (org-back-to-heading t)
+        (let ((end (save-excursion (org-end-of-subtree t t) (point))))
+          (while (re-search-forward org-heading-regexp end t)
+            (let ((tid (org-id-get)))
+              (when tid
+                (let ((dec (assoc tid org-auto-scheduler--saved-review-decisions)))
+                  (when (and dec (plist-get (cdr dec) :order))
+                    (setcdr dec (plist-put (cdr dec) :order nil))
+                    (cl-incf cleared)))))))))
+    (org-auto-scheduler-save-review-decisions)
+    (org-auto-scheduler-dep-explorer-refresh)
+    (message "Cleared saved review order on %d task(s) in project." cleared)))
+
+(defun org-auto-scheduler-dep-explorer-refresh ()
+  "Refresh the `*Org Auto Scheduler Dependencies*' buffer."
+  (interactive)
+  (when (and org-auto-scheduler--dep-explorer-root-marker
+             (marker-buffer org-auto-scheduler--dep-explorer-root-marker))
+    (org-auto-scheduler--render-dependency-explorer
+     org-auto-scheduler--dep-explorer-root-marker
+     org-auto-scheduler--dep-explorer-focus-id)))
+
+(defun org-auto-scheduler--render-dependency-explorer (root-marker &optional focus-id)
+  "Render the project & sibling dependency tree starting at ROOT-MARKER."
+  (let ((buf (get-buffer-create "*Org Auto Scheduler Dependencies*"))
+        (badges ["①" "②" "③" "④" "⑤" "⑥" "⑦" "⑧" "⑨" "⑩" "⑪" "⑫" "⑬" "⑭" "⑮" "⑯" "⑰" "⑱" "⑲" "⑳"]))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (org-auto-scheduler-dependency-explorer-mode)
+        (setq-local org-auto-scheduler--dep-explorer-root-marker root-marker)
+        (setq-local org-auto-scheduler--dep-explorer-focus-id focus-id)
+        (cl-flet ((emit (str &optional m pm)
+                    (with-current-buffer buf
+                      (let ((inhibit-read-only t)
+                            (beg (point)))
+                        (insert str)
+                        (when m (put-text-property beg (point) 'task-marker m))
+                        (when pm (put-text-property beg (point) 'parent-marker pm))))))
+          (org-with-point-at root-marker
+            (org-back-to-heading t)
+            (let* ((root-m (point-marker))
+                   (root-hl (org-get-heading t t t t))
+                   (root-level (org-current-level))
+                   (root-seq-p (org-auto-scheduler--siblings-sequential-p))
+                   (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+                   (parent-counters (make-hash-table :test 'eql)))
+              (emit "══════════════════════════════════════════════════════════════════════════\n")
+              (emit (propertize " 🌲 PROJECT & SIBLING DEPENDENCY EXPLORER\n" 'face 'bold))
+              (emit (format " Root Project: * %s  [%s]\n"
+                            root-hl
+                            (if root-seq-p "Sequential Siblings: ON (:ORDERED:)"
+                              "Parallel Siblings: ON (:PARALLEL:)")))
+              (emit "══════════════════════════════════════════════════════════════════════════\n\n")
+              (emit (propertize (format " * %s  [%s]\n"
+                                        root-hl
+                                        (if root-seq-p "Sequential Siblings" "Parallel Siblings"))
+                                'face 'bold)
+                    root-m root-m)
+              (outline-next-heading)
+              (while (and (< (point) subtree-end) (not (eobp)))
+                (let* ((m (point-marker))
+                       (lvl (org-current-level))
+                       (rel-depth (max 1 (- lvl root-level)))
+                       (indent (make-string (* 3 (1- rel-depth)) ?\s))
+                       (parent-pos (save-excursion (if (org-up-heading-safe) (point) (marker-position root-m))))
+                       (parent-m (save-excursion (if (org-up-heading-safe) (point-marker) root-m)))
+                       (parent-seq (save-excursion
+                                     (if (org-up-heading-safe)
+                                         (org-auto-scheduler--siblings-sequential-p)
+                                       root-seq-p)))
+                       (todo (org-get-todo-state))
+                       (hl (org-get-heading t t t t))
+                       (tid (org-id-get))
+                       (ind-prop (org-entry-get nil "INDEPENDENT"))
+                       (is-ind (and ind-prop (member (downcase ind-prop) '("t" "yes" "true" "1"))))
+                       (idx (if (and parent-seq (not is-ind))
+                                (let ((c (gethash parent-pos parent-counters 0)))
+                                  (puthash parent-pos (1+ c) parent-counters)
+                                  c)
+                              nil))
+                       (badge (cond
+                               ((not parent-seq) "∥")
+                               (is-ind "∥")
+                               ((and idx (< idx (length badges))) (aref badges idx))
+                               (idx (format "(%d)" (1+ idx)))
+                               (t "•")))
+                       (sched-task (and tid (assoc tid org-auto-scheduler-completed-tasks)))
+                       (sched-str (cond
+                                   ((and sched-task (nth 1 sched-task))
+                                    (format "%s–%s"
+                                            (format-time-string "%a %b %d %H:%M" (nth 1 sched-task))
+                                            (format-time-string "%H:%M" (nth 2 sched-task))))
+                                   ((org-entry-get nil "SCHEDULED")
+                                    (org-entry-get nil "SCHEDULED"))
+                                   (t "Unscheduled")))
+                       (fl (and tid (fboundp 'org-auto-scheduler-task-float-hours)
+                                (org-auto-scheduler-task-float-hours tid)))
+                       (crit-tag (cond
+                                  ((and (numberp fl) (< fl -0.01))
+                                   (propertize (format " ⛔[Float %.1fh]" fl) 'face 'error))
+                                  ((and (numberp fl) (<= fl 0.01))
+                                   (propertize " ⚡[Crit]" 'face 'warning))
+                                  (t "")))
+                       (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid m)))
+                       (saved-ord (and saved-dec (plist-get saved-dec :order)))
+                       (blockers-info (org-auto-scheduler--get-task-blockers-info m))
+                       (focused (and focus-id tid (equal focus-id tid))))
+                  (when (and idx (> idx 0) (= rel-depth 1))
+                    (emit (propertize (format "%s   ⇩ (Sequential Sibling #%d → #%d)\n"
+                                              indent idx (1+ idx))
+                                      'face 'shadow)
+                          m parent-m))
+                  (emit (format "%s ├── %s%s [%s] %s — %s%s%s%s\n"
+                                indent
+                                (if focused "▶ " "")
+                                badge
+                                (or todo "—")
+                                (if focused (propertize hl 'face 'bold) hl)
+                                sched-str
+                                crit-tag
+                                (if is-ind " [:INDEPENDENT:]" "")
+                                (if saved-ord " [Saved Order]" ""))
+                        m parent-m)
+                  (when blockers-info
+                    (dolist (b blockers-info)
+                      (emit (propertize (format "%s       🔗 Explicit BLOCKER: %s %s\n"
+                                                indent (car b) (cdr b))
+                                        'face 'font-lock-doc-face)
+                            m parent-m))))
+                (outline-next-heading)))
+            (emit "\nKeys: [RET/TAB] Jump to heading  [i] Toggle :INDEPENDENT: on task\n")
+            (emit "      [o] Toggle Parent :ORDERED:/:PARALLEL:  [c] Clear saved order  [g] Refresh  [q] Quit\n")))
+        (goto-char (point-min))))
+    (pop-to-buffer buf)))
+
+;;;###autoload
+(defun org-auto-scheduler-explore-dependencies ()
+  "Open the Interactive Project & Sibling Dependency Explorer for the task at point.
+Works from `org-auto-scheduler-review-mode', `org-agenda-mode', or any `org-mode' buffer."
+  (interactive)
+  (let* ((focus-id nil)
+         (marker
+          (cond
+           ((derived-mode-p 'org-auto-scheduler-review-mode)
+            (let* ((id (tabulated-list-get-id))
+                   (tk (and id (assoc id org-auto-scheduler-completed-tasks))))
+              (setq focus-id id)
+              (or (and tk (nth 7 tk))
+                  (and id (not (org-auto-scheduler--review-special-row-p id))
+                       (org-id-find id t)))))
+           ((derived-mode-p 'org-agenda-mode)
+            (or (org-get-at-bol 'org-marker)
+                (org-get-at-bol 'org-hd-marker)))
+           ((derived-mode-p 'org-mode)
+            (setq focus-id (org-id-get))
+            (point-marker))
+           (t
+            (let ((tk (car org-auto-scheduler-completed-tasks)))
+              (and tk (nth 7 tk)))))))
+    (unless (and marker (markerp marker) (marker-buffer marker))
+      (user-error "Cannot locate an Org heading or project to explore"))
+    (let ((root (org-auto-scheduler--find-project-root-marker marker)))
+      (org-auto-scheduler--render-dependency-explorer root focus-id))))
 
 (defun org-auto-scheduler-schedule-today ()
   "Schedule tasks for the remainder of today only."

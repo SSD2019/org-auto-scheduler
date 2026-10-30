@@ -90,6 +90,12 @@
   :type 'integer
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-urgent-days-boost 0.0
+  "Additional score boost applied when a task has a deadline within `org-auto-scheduler-urgent-days'.
+Defaults to 0.0 to preserve baseline scoring unless explicitly customized."
+  :type 'float
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-hard-deadline-days 1
   "Number of days before a deadline when a task gets a massive priority boost."
   :type 'integer
@@ -103,6 +109,12 @@
 (defcustom org-auto-scheduler-large-task-minutes 12
   "Number of minutes above which a task is considered large."
   :type 'integer
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-large-task-weight 0.0
+  "Additional weight per minute for task effort exceeding `org-auto-scheduler-large-task-minutes'.
+Defaults to 0.0 to preserve baseline scoring unless explicitly customized."
+  :type 'float
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-default-task-duration 60
@@ -371,6 +383,38 @@ zero-float tasks."
 
 (defvar org-auto-scheduler--critical-tasks (make-hash-table :test 'equal)
   "Hash table mapping task-id to t for tasks currently identified on the critical path.")
+
+(defvar org-auto-scheduler--task-floats (make-hash-table :test 'equal)
+  "Hash table mapping task-id to its computed CPM Total Float in hours (may be negative when deadline-infeasible).")
+
+(defvar org-auto-scheduler--last-preds-map (make-hash-table :test 'equal)
+  "Hash table mapping task-id to its list of predecessor task-ids (explicit blockers + sequential siblings) from the last sort.")
+
+(defvar org-auto-scheduler--last-sorted-tasks-info nil
+  "List of `org-auto-scheduler-task-info' records produced by the most recent `org-auto-scheduler-sort-tasks' run.")
+
+(defvar org-auto-scheduler--placement-traces (make-hash-table :test 'equal)
+  "Hash table mapping task-id to a plist of slot placement trace details from the most recent scheduling run.")
+
+(cl-defstruct (org-auto-scheduler-task-info (:type list))
+  "List-backed structure representing a task's metadata and score in the scheduling pipeline.
+Preserves 100% compatibility with positional `(nth N task-info)' indexing."
+  marker             ; 0
+  score              ; 1
+  project-id         ; 2
+  project-priority   ; 3
+  position-info      ; 4
+  id                 ; 5
+  name               ; 6
+  tags               ; 7
+  scheduled          ; 8
+  allows-interleave  ; 9
+  not-before         ; 10
+  time-block         ; 11
+  effort             ; 12
+  score-components   ; 13
+  dependency-depth   ; 14
+  is-independent)    ; 15
 
 (defcustom org-auto-scheduler-siblings-sequential t
   "When non-nil (default), project subtasks under the same parent are scheduled sequentially
@@ -811,22 +855,29 @@ Defaults to `org-auto-scheduler-history.el` inside your Emacs directory."
 (org-auto-scheduler-load-history)
 
 
+(defvar org-state nil)
+
 (defun org-auto-scheduler-track-historical-effort ()
-  "Hook function to track historical effort when a task is marked DONE."
+  "Hook function to track historical effort when a task is marked DONE.
+Clamps single-task effort ratios to [0.5, 2.5] to prevent outliers from
+skewing future estimates, and blends new categories from a 1.0 neutral prior."
   (when (and org-auto-scheduler-enable-historical-tracking
-             (boundp 'org-state)
-             (string= org-state "DONE"))
+             (or (and (boundp 'org-state) (string= org-state "DONE"))
+                 (and (derived-mode-p 'org-mode) (equal (org-get-todo-state) "DONE"))))
     (let ((effort (org-auto-scheduler-get-effort (point-marker)))
           (clocked-time (org-auto-scheduler-get-clocked-time (point-marker)))
-          (category (org-get-category))
+          (category (or (cdr (assoc-string "CATEGORY" (org-entry-properties nil 'standard) t))
+                        (org-get-category)))
           (updated nil))
       (when (and effort clocked-time category (> effort 0) (> clocked-time 0))
-        (let* ((ratio (/ (float clocked-time) (float effort)))
+        (let* ((raw-ratio (/ (float clocked-time) (float effort)))
+               (ratio (min 2.5 (max 0.5 raw-ratio)))
                (existing (assoc category org-auto-scheduler-historical-multipliers)))
           (setq updated t)
           (if existing
               (setcdr existing (+ (* 0.8 (cdr existing)) (* 0.2 ratio)))
-            (push (cons category ratio) org-auto-scheduler-historical-multipliers))
+            (push (cons category (+ (* 0.8 1.0) (* 0.2 ratio)))
+                  org-auto-scheduler-historical-multipliers))
           ;; Auto-save immediately upon update to prevent data loss
           (when updated
             (org-auto-scheduler-save-history)))))))
@@ -838,7 +889,9 @@ Defaults to `org-auto-scheduler-history.el` inside your Emacs directory."
 Returns 1.0 if `org-auto-scheduler-apply-historical-multipliers' is nil."
   (if (not org-auto-scheduler-apply-historical-multipliers)
       1.0
-    (let* ((category (org-with-point-at marker (org-get-category)))
+    (let* ((category (org-with-point-at marker
+                       (or (cdr (assoc-string "CATEGORY" (org-entry-properties nil 'standard) t))
+                           (org-get-category))))
            (existing (assoc category org-auto-scheduler-historical-multipliers)))
       (if existing
           (cdr existing)
@@ -1334,6 +1387,16 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
             (setq inherited-priority (+ inherited-priority (string-to-number priority-value))))))
       inherited-priority)))
 
+(defun org-auto-scheduler-get-tag-score (marker)
+  "Calculate the total tag weight score for the task at MARKER using `org-auto-scheduler-tag-weights'."
+  (let ((tags (org-with-point-at marker (org-get-tags)))
+        (score 0.0))
+    (dolist (tag tags)
+      (let ((w (cdr (assoc tag org-auto-scheduler-tag-weights))))
+        (when (numberp w)
+          (setq score (+ score w)))))
+    score))
+
 (defun org-auto-scheduler-calculate-score (marker)
   "Calculate a score for a task at MARKER based on its properties and state.
 Returns a list containing the total score and individual score components."
@@ -1356,28 +1419,44 @@ Returns a list containing the total score and individual score components."
                                  30))
              (hard-deadline-score (if (and deadline (<= days-to-deadline org-auto-scheduler-hard-deadline-days))
                                       org-auto-scheduler-hard-deadline-boost 0))
+             (urgent-days-score (if (and deadline
+                                         (numberp org-auto-scheduler-urgent-days)
+                                         (<= days-to-deadline org-auto-scheduler-urgent-days)
+                                         (numberp org-auto-scheduler-urgent-days-boost))
+                                    org-auto-scheduler-urgent-days-boost
+                                  0.0))
              (urgency-factor (/ 1.0 (1+ days-to-deadline)))
              (category-weight (org-auto-scheduler-get-category-weight marker))
-             (effort-score (* effort org-auto-scheduler-effort-weight))
+             (tag-score (org-auto-scheduler-get-tag-score marker))
+             (large-task-score (if (and (numberp org-auto-scheduler-large-task-minutes)
+                                        (> effort org-auto-scheduler-large-task-minutes)
+                                        (numberp org-auto-scheduler-large-task-weight)
+                                        (not (zerop org-auto-scheduler-large-task-weight)))
+                                   (* (- effort org-auto-scheduler-large-task-minutes)
+                                      org-auto-scheduler-large-task-weight)
+                                 0.0))
+             (effort-score (+ (* effort org-auto-scheduler-effort-weight) large-task-score))
              (priority-total (* (+ priority-score inherited-priority) org-auto-scheduler-priority-weight))
-             (urgency-score (* urgency-factor org-auto-scheduler-urgency-weight))
+             (urgency-score (+ (* urgency-factor org-auto-scheduler-urgency-weight) urgent-days-score))
              (category-score (* category-weight 10))
              (total-score (+ effort-score
                              priority-total
                              urgency-score
                              category-score
                              state-weight
+                             tag-score
                              hard-deadline-score)))
         (org-auto-scheduler--log-debug "Calculating score for task %s"
                                        (org-with-point-at marker (or (org-id-get) "NO-ID")))
         (list total-score effort-score priority-total urgency-score category-score state-weight
-              effort priority-score inherited-priority days-to-deadline category-weight state))
+              effort priority-score inherited-priority days-to-deadline category-weight state
+              tag-score urgent-days-score large-task-score))
     (error
      (org-auto-scheduler--log-error "Error calculating score: %s\nMarker: %s\nBacktrace: %s"
                                     err
                                     marker
                                     (with-output-to-string (backtrace)))
-     (list 0 0 0 0 0 0 0 0 0 0 0 ""))))  ; Return all zeroes on error
+     (list 0 0 0 0 0 0 0 0 0 0 0 "" 0 0 0))))  ; Return all zeroes on error
 
 (defun org-auto-scheduler-get-parent-id (marker)
   "Get the ID of the parent heading for the task at MARKER."
@@ -1447,11 +1526,14 @@ Returns integer minutes or nil if invalid."
       (string-to-number (match-string 1 str)))
      (t nil))))
 
-(defun org-auto-scheduler--siblings-sequential-p (parent-node project-id)
+(defun org-auto-scheduler--siblings-sequential-p (&optional parent-node project-id)
   "Return non-nil if siblings under PARENT-NODE should be scheduled sequentially.
 Checks parent node properties (:ORDERED:, :PARALLEL:), tags (:PARALLEL:), then project properties
 (:PROJECT_ORDERED:, :PROJECT_PARALLEL:) and tags, falling back to `org-auto-scheduler-siblings-sequential`."
-  (let ((sequential-setting 'unset))
+  (let ((parent-node (or parent-node
+                         (and (derived-mode-p 'org-mode)
+                              (cons (current-buffer) (point)))))
+        (sequential-setting 'unset))
     ;; 1. Check parent node if it is an actual heading (not 'top)
     (when (and (consp parent-node)
                (buffer-live-p (car parent-node))
@@ -1580,27 +1662,101 @@ Checks parent node properties (:ORDERED:, :PARALLEL:), tags (:PARALLEL:), then p
 
      (t nil))))
 
+(defun org-auto-scheduler--working-minutes-until (deadline-str &optional from-time)
+  "Compute working-hour minutes available from FROM-TIME until DEADLINE-STR.
+If DEADLINE-STR has no explicit HH:MM time, uses `org-auto-scheduler-end-time' on the deadline date.
+Returns integer minutes (may be 0 or negative if the deadline has already passed)."
+  (when (and deadline-str (stringp deadline-str))
+    (condition-case nil
+        (let* ((from (or from-time (org-auto-scheduler-get-start-time)))
+               (has-time (string-match-p "[0-9]\\{1,2\\}:[0-9]\\{2\\}" deadline-str))
+               (dl-base (org-time-string-to-time deadline-str))
+               (dl-time (if has-time
+                            dl-base
+                          (org-auto-scheduler-time-with-time-string dl-base org-auto-scheduler-end-time)))
+               (start-mins-day (org-duration-to-minutes org-auto-scheduler-start-time))
+               (end-mins-day (org-duration-to-minutes org-auto-scheduler-end-time))
+               (daily-work-mins (max 60 (- end-mins-day start-mins-day))))
+          (if (not (time-less-p from dl-time))
+              (floor (/ (float-time (time-subtract dl-time from)) 60.0))
+            (let* ((from-days (time-to-days from))
+                   (dl-days (time-to-days dl-time))
+                   (day-diff (- dl-days from-days)))
+              (if (= day-diff 0)
+                  (let* ((day-start (org-auto-scheduler-time-with-time-string from org-auto-scheduler-start-time))
+                         (day-end (org-auto-scheduler-time-with-time-string from org-auto-scheduler-end-time))
+                         (eff-from (if (time-less-p from day-start) day-start from))
+                         (eff-to (if (time-less-p day-end dl-time) day-end dl-time)))
+                    (max 0 (floor (/ (float-time (time-subtract eff-to eff-from)) 60.0))))
+                ;; Multi-day span: remaining mins today + full intermediate working days + mins on deadline day
+                (let* ((today-start (org-auto-scheduler-time-with-time-string from org-auto-scheduler-start-time))
+                       (today-end (org-auto-scheduler-time-with-time-string from org-auto-scheduler-end-time))
+                       (today-dow (string-to-number (format-time-string "%w" from)))
+                       (today-rem (if (or (member today-dow org-auto-scheduler-excluded-days)
+                                          (not (time-less-p from today-end)))
+                                      0
+                                    (max 0 (floor (/ (float-time (time-subtract today-end
+                                                                                (if (time-less-p from today-start)
+                                                                                    today-start
+                                                                                  from)))
+                                                     60.0)))))
+                       (dl-day-start (org-auto-scheduler-time-with-time-string dl-time org-auto-scheduler-start-time))
+                       (dl-day-end (org-auto-scheduler-time-with-time-string dl-time org-auto-scheduler-end-time))
+                       (dl-dow (string-to-number (format-time-string "%w" dl-time)))
+                       (dl-day-mins (if (or (member dl-dow org-auto-scheduler-excluded-days)
+                                            (not (time-less-p dl-day-start dl-time)))
+                                        0
+                                      (max 0 (floor (/ (float-time (time-subtract (if (time-less-p dl-day-end dl-time)
+                                                                                      dl-day-end
+                                                                                    dl-time)
+                                                                                  dl-day-start))
+                                                       60.0)))))
+                       (mid-mins 0))
+                  (cl-loop for d from 1 below day-diff do
+                           (let* ((t-day (time-add from (days-to-time d)))
+                                  (dow (string-to-number (format-time-string "%w" t-day))))
+                             (unless (member dow org-auto-scheduler-excluded-days)
+                               (setq mid-mins (+ mid-mins daily-work-mins)))))
+                  (+ today-rem mid-mins dl-day-mins))))))
+      (error nil))))
+
+(defun org-auto-scheduler-task-float-hours (task-id)
+  "Return the computed CPM Total Float in hours for TASK-ID, or nil if not part of a dependency chain."
+  (and task-id
+       (hash-table-p org-auto-scheduler--task-floats)
+       (gethash task-id org-auto-scheduler--task-floats)))
+
 (defun org-auto-scheduler--compute-critical-path-floats (id-to-info adj-list preds-map pool-ids)
   "Compute Total Float (in hours) for tasks participating in dependencies.
 ID-TO-INFO maps task-id to its task info list.
 ADJ-LIST maps task-id to a list of its successor task-ids.
 PREDS-MAP maps task-id to a list of its predecessor task-ids.
 POOL-IDS is a hash table containing all task-ids in the current scheduling pool.
+Anchors Late Finish (LF) to working-hour minutes until DEADLINE when present,
+allowing negative float (< 0) detection when a dependency chain cannot meet its deadline.
 Returns a hash table mapping task-id to total float in hours."
   (let ((floats (make-hash-table :test 'equal))
         (es-table (make-hash-table :test 'equal))
         (ef-table (make-hash-table :test 'equal))
         (lf-table (make-hash-table :test 'equal))
         (durations (make-hash-table :test 'equal))
+        (deadline-mins-table (make-hash-table :test 'equal))
+        (start-ref (ignore-errors (org-auto-scheduler-get-start-time)))
         (dep-task-ids '()))
     ;; Identify all tasks that participate in a dependency relationship
     (maphash (lambda (id _)
                (when (or (gethash id adj-list) (gethash id preds-map))
                  (push id dep-task-ids)
                  (let* ((task (gethash id id-to-info))
+                        (marker (and task (nth 0 task)))
                         (eff (and task (nth 12 task)))
-                        (dur (max 1 (or eff org-auto-scheduler-default-task-duration 60))))
-                   (puthash id dur durations))))
+                        (dur (max 1 (or eff org-auto-scheduler-default-task-duration 60)))
+                        (dl-str (and marker (markerp marker) (marker-buffer marker)
+                                     (org-with-point-at marker (org-entry-get nil "DEADLINE"))))
+                        (dl-mins (and dl-str (org-auto-scheduler--working-minutes-until dl-str start-ref))))
+                   (puthash id dur durations)
+                   (when dl-mins
+                     (puthash id dl-mins deadline-mins-table)))))
              pool-ids)
     (when dep-task-ids
       ;; 1. Compute ES and EF via forward pass
@@ -1659,10 +1815,14 @@ Returns a hash table mapping task-id to total float in hours."
                                        (min-succ-ls
                                         (if succs
                                             (apply #'min (mapcar #'calc-ls succs))
-                                          t-max)))
+                                          t-max))
+                                       (dl-mins (gethash id deadline-mins-table))
+                                       (effective-lf (if dl-mins
+                                                         (min min-succ-ls dl-mins)
+                                                       min-succ-ls)))
                                   (puthash id nil visiting-bwd)
-                                  (puthash id min-succ-ls lf-table)
-                                  min-succ-ls))))
+                                  (puthash id effective-lf lf-table)
+                                  effective-lf))))
                         (calc-ls (id)
                           (let* ((lf (calc-lf id))
                                  (dur (gethash id durations 60)))
@@ -1670,9 +1830,10 @@ Returns a hash table mapping task-id to total float in hours."
               (dolist (id comp)
                 (let* ((ef (gethash id ef-table 0))
                        (lf (calc-lf id))
-                       (total-float-mins (max 0 (- lf ef)))
+                       (total-float-mins (- lf ef))
                        (total-float-hours (/ (float total-float-mins) 60.0)))
                   (puthash id total-float-hours floats))))))))
+    (setq org-auto-scheduler--task-floats floats)
     floats))
 
 (defun org-auto-scheduler-task-critical-p (task-id)
@@ -1682,9 +1843,46 @@ Returns a hash table mapping task-id to total float in hours."
        (hash-table-p org-auto-scheduler--critical-tasks)
        (gethash task-id org-auto-scheduler--critical-tasks)))
 
+(defun org-auto-scheduler--populate-parent-sibling-positions (parent-node cache)
+  "Populate CACHE with 1-based sibling positions for all direct child headings under PARENT-NODE.
+Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backward walks."
+  (let ((buf (car parent-node))
+        (parent-pt (cdr parent-node)))
+    (when (and (buffer-live-p buf)
+               (not (gethash parent-node cache)))
+      (puthash parent-node t cache)
+      (with-current-buffer buf
+        (save-excursion
+          (if (integerp parent-pt)
+              (progn
+                (goto-char parent-pt)
+                (when (org-goto-first-child)
+                  (let ((idx 1))
+                    (puthash (cons buf (point)) idx cache)
+                    (while (org-get-next-sibling)
+                      (setq idx (1+ idx))
+                      (puthash (cons buf (point)) idx cache)))))
+            ;; Top-level headings
+            (goto-char (point-min))
+            (unless (org-at-heading-p)
+              (outline-next-heading))
+            (when (org-at-heading-p)
+              (let ((idx 1))
+                (puthash (cons buf (point)) idx cache)
+                (while (org-get-next-sibling)
+                  (setq idx (1+ idx))
+                  (puthash (cons buf (point)) idx cache))))))))))
+
 (defun org-auto-scheduler-sort-tasks (tasks)
   "Sort TASKS based on their project, scheduled date, calculated scores, and position using Kahn's Topological Sort."
-  (let* ((tasks-with-info
+  ;; Ensure all task and project headings have IDs upfront so buffer positions
+  ;; do not shift while caching parent-node and sibling positions.
+  (dolist (marker tasks)
+    (when (and (markerp marker) (marker-buffer marker))
+      (org-with-point-at marker
+        (or (org-id-get) (org-id-get-create)))))
+  (let* ((sibling-pos-cache (make-hash-table :test 'equal))
+         (tasks-with-info
           (mapcar (lambda (marker)
                     (let* ((task-id (org-with-point-at marker
                                       (or (org-id-get)
@@ -1698,18 +1896,25 @@ Returns a hash table mapping task-id to total float in hours."
                            (project-id (org-auto-scheduler-get-project-id marker))
                            (project-priority (org-auto-scheduler-get-project-priority marker))
                            (allows-interleave (org-auto-scheduler-project-allows-interleave marker))
-                           (task-position (org-auto-scheduler-get-task-position marker))
-                           (scheduled (org-with-point-at marker
-                                        (org-entry-get nil "SCHEDULED")))
-                           (not-before (org-auto-scheduler-get-not-before marker))
-                           (time-block (org-auto-scheduler-get-task-tag-block marker))
-                           (effort (org-auto-scheduler-get-effort marker))
                            (parent-node (save-excursion
                                           (with-current-buffer (marker-buffer marker)
                                             (goto-char (marker-position marker))
                                             (if (org-up-heading-safe)
                                                 (cons (current-buffer) (point))
                                               (cons (current-buffer) 'top)))))
+                           (_ (org-auto-scheduler--populate-parent-sibling-positions parent-node sibling-pos-cache))
+                           (heading-pt (save-excursion
+                                         (with-current-buffer (marker-buffer marker)
+                                           (goto-char (marker-position marker))
+                                           (org-back-to-heading t)
+                                           (point))))
+                           (task-position (or (gethash (cons (marker-buffer marker) heading-pt) sibling-pos-cache)
+                                              (org-auto-scheduler-get-task-position marker)))
+                           (scheduled (org-with-point-at marker
+                                        (org-entry-get nil "SCHEDULED")))
+                           (not-before (org-auto-scheduler-get-not-before marker))
+                           (time-block (org-auto-scheduler-get-task-tag-block marker))
+                           (effort (org-auto-scheduler-get-effort marker))
                            (position-info (cons parent-node task-position))
                            (dependency-depth 0) ; Overwritten during Topological Sort
                            (is-independent (org-auto-scheduler-task-independent-p marker)))
@@ -1882,6 +2087,9 @@ Returns a hash table mapping task-id to total float in hours."
         (when cycle-tasks
           (setq cycle-tasks (sort cycle-tasks (lambda (a b) (org-auto-scheduler--complex-sort-predicate a b project-max-scores))))
           (setq sorted-tasks (append sorted-tasks cycle-tasks))))
+
+      (setq org-auto-scheduler--last-preds-map preds-map)
+      (setq org-auto-scheduler--last-sorted-tasks-info sorted-tasks)
 
       (dolist (task sorted-tasks)
         (org-auto-scheduler--log-debug
@@ -2119,12 +2327,13 @@ If no slot is found within blocks after max-days-to-check, returns nil."
       (let ((day-start (time-add original-time (days-to-time days-checked))))
         (dolist (block blocks)
           (let* ((block-start (org-auto-scheduler-time-with-time-string day-start (car block)))
-                 (block-end (org-auto-scheduler-time-with-time-string day-start (cdr block))))
-            (when (and (time-less-p current-time block-end)
-                       (org-auto-scheduler-time-fits-block-p block-start block-end remaining-effort))
-              (setq found-time (if (time-less-p current-time block-start)
-                                   block-start
-                                 current-time))))))
+                 (block-end (org-auto-scheduler-time-with-time-string day-start (cdr block)))
+                 (cand-start (if (time-less-p current-time block-start)
+                                 block-start
+                               current-time)))
+            (when (and (time-less-p cand-start block-end)
+                       (org-auto-scheduler-time-fits-block-p cand-start block-end remaining-effort))
+              (setq found-time cand-start)))))
 
       ;; Move to the next day
       (setq days-checked (1+ days-checked)))
@@ -2561,6 +2770,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
           (org-auto-scheduler-validate-config)              ; Validate config at runtime
           (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
           (setq org-auto-scheduler--pomodoro-continuous-minutes 0)
+          (unless (hash-table-p org-auto-scheduler--placement-traces)
+            (setq org-auto-scheduler--placement-traces (make-hash-table :test 'equal)))
+          (clrhash org-auto-scheduler--placement-traces)
           (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
           (unless org-auto-scheduler--preview-mode
             (org-auto-scheduler-create-report-buffer))      ; Create the report buffer
@@ -2869,7 +3081,19 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
 
             ;; 5. Schedule tasks in final-schedule-list
             (let ((reporter (unless org-auto-scheduler-silent-mode
-                              (make-progress-reporter "Scheduling tasks..." 0 total-tasks))))
+                              (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
+                  (task-finish-times (make-hash-table :test 'equal))
+                  (open-gap-floor nil)
+                  (prev-ordered-finish nil)
+                  (last-non-interleave-proj nil)
+                  (last-non-interleave-finish nil))
+              ;; Seed task-finish-times with preserved entries
+              (dolist (e preserved-entries)
+                (let ((tid (plist-get e :task-id))
+                      (et (plist-get e :end-time)))
+                  (when (and tid et)
+                    (puthash tid (time-add et (seconds-to-time (* 60 org-auto-scheduler-task-gap)))
+                             task-finish-times))))
               (dolist (task-info final-schedule-list)
                 ;; Cooperative yield if running in a background worker thread
                 (when (and (fboundp 'thread-yield)
@@ -2886,7 +3110,71 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                (org-auto-scheduler-task-pinned-p marker task-id))
                       (org-auto-scheduler-task-set-pinned-time
                        marker task-id (format-time-string "%Y-%m-%d %H:%M" current-time)))
-                    (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
+                    ;; Determine search start: support Free-Interval Gap Backfilling when an earlier task
+                    ;; jumped over an obstacle, while strictly respecting all predecessor finish times.
+                    (let* ((preds (and task-id
+                                       (hash-table-p org-auto-scheduler--last-preds-map)
+                                       (gethash task-id org-auto-scheduler--last-preds-map)))
+                           (dep-floor nil)
+                           (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
+                           (has-saved-order (and saved-dec (not (plist-get saved-dec :is-new)) (plist-get saved-dec :order)))
+                           (proj-id (nth 2 task-info))
+                           (allows-interleave (nth 9 task-info)))
+                      (dolist (p-id preds)
+                        (let ((pf (gethash p-id task-finish-times)))
+                          (when (and pf (or (null dep-floor) (time-less-p dep-floor pf)))
+                            (setq dep-floor pf))))
+                      (when (and has-saved-order prev-ordered-finish
+                                 (or (null dep-floor) (time-less-p dep-floor prev-ordered-finish)))
+                        (setq dep-floor prev-ordered-finish))
+                      (when (and last-non-interleave-finish
+                                 (not (equal proj-id last-non-interleave-proj))
+                                 (or (null dep-floor) (time-less-p dep-floor last-non-interleave-finish)))
+                        (setq dep-floor last-non-interleave-finish))
+                      (let* ((can-backfill (and open-gap-floor
+                                                (not has-r-trigger)
+                                                (not (bound-and-true-p org-auto-scheduler--reordering-p))))
+                             (search-start
+                              (if can-backfill
+                                  (let ((cand (if (and dep-floor (time-less-p open-gap-floor dep-floor))
+                                                  dep-floor
+                                                open-gap-floor)))
+                                    (if (time-less-p cand current-time) cand current-time))
+                                current-time))
+                             (next-t (org-auto-scheduler-schedule-single-task marker search-start (nth 14 task-info)))
+                             (newly-scheduled (> (length org-auto-scheduler-completed-tasks) prev-completed-count))
+                             (top-entry (and newly-scheduled (car org-auto-scheduler-completed-tasks)))
+                             (top-status (and top-entry (nth 9 top-entry)))
+                             (actual-start (and top-entry
+                                                (not (memq top-status '(:failed :blocked :skipped)))
+                                                (nth 1 top-entry))))
+                        (when (and task-id next-t)
+                          (puthash task-id next-t task-finish-times))
+                        (when has-saved-order
+                          (setq prev-ordered-finish next-t))
+                        (when (and proj-id (not allows-interleave))
+                          (setq last-non-interleave-proj proj-id)
+                          (setq last-non-interleave-finish next-t))
+                        ;; Record backfilled status in placement trace if placed before current-time
+                        (when (and actual-start (time-less-p actual-start current-time)
+                                   (hash-table-p org-auto-scheduler--placement-traces))
+                          (let ((tr (gethash task-id org-auto-scheduler--placement-traces)))
+                            (when tr
+                              (puthash task-id (plist-put tr :backfilled t) org-auto-scheduler--placement-traces))))
+                        ;; Track skipped gap if task jumped forward by >= 10 minutes
+                        (when (and actual-start
+                                   (>= (float-time (time-subtract actual-start search-start)) 600))
+                          (setq open-gap-floor
+                                (if (and open-gap-floor (time-less-p open-gap-floor search-start))
+                                    open-gap-floor
+                                  search-start)))
+                        ;; If task filled the start of open-gap-floor, advance open-gap-floor
+                        (when (and open-gap-floor actual-start
+                                   (<= (abs (float-time (time-subtract actual-start open-gap-floor))) 60))
+                          (setq open-gap-floor
+                                (if (time-less-p next-t current-time) next-t nil)))
+                        (when (time-less-p current-time next-t)
+                          (setq current-time next-t))))
                     (when (nth 2 task-info)
                       (setq org-auto-scheduler--last-scheduled-project-id (nth 2 task-info)))
                     (unless org-auto-scheduler--preview-mode
@@ -2935,10 +3223,17 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
 (defun org-auto-scheduler--set-scheduled (schedule-str)
   "Safely set SCHEDULED planning info on current heading to SCHEDULE-STR.
 Uses `org-schedule` directly to avoid `org-entry-put` advancing to the next
-heading when the current heading does not yet have a planning line."
+heading when the current heading does not yet have a planning line.
+Suppresses redundant buffer mutations if SCHEDULED already matches SCHEDULE-STR."
   (org-back-to-heading t)
-  (let ((inhibit-message (or inhibit-message (bound-and-true-p org-auto-scheduler-silent-mode))))
-    (org-schedule nil schedule-str)))
+  (let ((existing (org-entry-get nil "SCHEDULED")))
+    (unless (and existing
+                 schedule-str
+                 (string-match-p "^<" schedule-str)
+                 (fboundp 'org-auto-scheduler--timestamps-equal-p)
+                 (org-auto-scheduler--timestamps-equal-p existing schedule-str))
+      (let ((inhibit-message (or inhibit-message (bound-and-true-p org-auto-scheduler-silent-mode))))
+        (org-schedule nil schedule-str)))))
 
 (defun org-auto-scheduler-get-schedulable-tasks ()
   "Get a list of markers for schedulable tasks from the agenda files, including recurring task instances."
@@ -4040,7 +4335,8 @@ TASK is the task info list, SCHEDULED is the scheduled timestamp."
                (urgency-score (nth 2 score-components))
                (category-score (nth 3 score-components))
                (state-weight (nth 4 score-components))
-               (state (nth 11 score-components))
+               (state (let ((s (nth 10 score-components)))
+                        (if (stringp s) s nil)))
                (score (nth 1 task))
                (task-id (nth 5 task))
                (is-crit (org-auto-scheduler-task-critical-p task-id))
@@ -4067,18 +4363,98 @@ TASK is the task info list, SCHEDULED is the scheduled timestamp."
                   (format "%.2f" category-score) " | "
                   (or state "None") " |\n"))))))
 
+(defun org-auto-scheduler--describe-slot-conflict (start-time duration &optional ignore-id proposed-tags)
+  "Return a human-readable reason why [START-TIME, START-TIME + DURATION] is occupied."
+  (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
+         (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
+         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time))
+         (agenda-items (org-auto-scheduler-get-agenda-items start-time))
+         (reason nil))
+    (cond
+     ((time-less-p start-time day-start)
+      (format "Before workday start (%s)" org-auto-scheduler-start-time))
+     ((time-less-p day-end end-time)
+      (format "Exceeds workday end (%s, need %dm)" org-auto-scheduler-end-time duration))
+     (t
+      (when org-auto-scheduler-daily-catchup-block
+        (let* ((c-start-str (car org-auto-scheduler-daily-catchup-block))
+               (c-end-str (if (consp (cdr org-auto-scheduler-daily-catchup-block))
+                              (cadr org-auto-scheduler-daily-catchup-block)
+                            (cdr org-auto-scheduler-daily-catchup-block)))
+               (c-start (org-auto-scheduler-time-with-time-string start-time c-start-str))
+               (c-end (org-auto-scheduler-time-with-time-string start-time c-end-str)))
+          (when (and c-start c-end
+                     (time-less-p start-time c-end)
+                     (time-less-p c-start end-time))
+            (setq reason (format "Reserved catch-up block (%s-%s)" c-start-str c-end-str)))))
+      (unless reason
+        (dolist (item agenda-items)
+          (unless reason
+            (let* ((item-id (nth 0 item))
+                   (task-start (nth 1 item))
+                   (task-end (nth 2 item))
+                   (tags (nth 3 item))
+                   (consider-for-conflicts (nth 4 item))
+                   (task-name (nth 5 item))
+                   (has-time (nth 6 item))
+                   (marker (nth 7 item))
+                   (is-autosch (member "AUTOSCH" tags))
+                   (is-non-blocking (or (null consider-for-conflicts)
+                                        (org-auto-scheduler-task-non-blocking-p item-id marker task-name)))
+                   (needs-buffer (or (member "buffertime" tags) (member "buffertime" proposed-tags)))
+                   (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
+                   (task-start-with-gap (and task-start (time-subtract task-start (seconds-to-time (* 60 active-gap)))))
+                   (task-end-with-gap (and task-end (time-add task-end (seconds-to-time (* 60 active-gap))))))
+              (when (and task-start task-end
+                         (not (equal item-id ignore-id))
+                         (not (and (not is-autosch) is-non-blocking))
+                         (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                         has-time
+                         (time-less-p start-time task-end-with-gap)
+                         (time-less-p task-start-with-gap end-time))
+                (setq reason (format "Occupied by '%s' (%s-%s)"
+                                     (or task-name "event")
+                                     (format-time-string "%H:%M" task-start)
+                                     (format-time-string "%H:%M" task-end))))))))
+      (or reason "Slot occupied")))))
+
+(defun org-auto-scheduler-find-slot-in-energy-block-same-day (day-time energy-blocks duration &optional task-id proposed-tags)
+  "Try to find an available slot of DURATION minutes within ENERGY-BLOCKS on DAY-TIME's calendar day.
+Returns the slot start time if found on the same calendar day, or nil if the energy blocks
+on that day are full or already past (allowing soft fallback to normal working hours on the same day)."
+  (when (and day-time energy-blocks (> duration 0))
+    (let ((day-of-week (string-to-number (format-time-string "%w" day-time)))
+          (found nil))
+      (unless (member day-of-week org-auto-scheduler-excluded-days)
+        (dolist (block energy-blocks)
+          (unless found
+            (let* ((b-start (org-auto-scheduler-time-with-time-string day-time (car block)))
+                   (b-end (org-auto-scheduler-time-with-time-string day-time (cdr block)))
+                   (cand (if (time-less-p day-time b-start) b-start day-time))
+                   (guard 0))
+              (while (and (not found)
+                          (< guard 50)
+                          (not (time-less-p b-end (time-add cand (seconds-to-time (* 60 duration))))))
+                (setq guard (1+ guard))
+                (let ((occ (org-auto-scheduler-time-slot-occupied-p cand duration task-id proposed-tags)))
+                  (if occ
+                      (setq cand occ)
+                    (setq found cand))))))))
+      found)))
+
 (defun org-auto-scheduler-schedule-single-task (marker current-time &optional topo-depth)
   "Schedule a single task at MARKER, starting from CURRENT-TIME.
 This function attempts to find an available time slot for the task,
-respecting time blocks if specified, and avoiding conflicts with
-existing scheduled tasks. If no available time slot is found within
-the time block, it schedules the task outside the time block.
+respecting hard time blocks (`org-auto-scheduler-time-blocks') and soft energy
+preferences (`org-auto-scheduler-energy-blocks'), while avoiding conflicts with
+existing scheduled tasks.
 TOPO-DEPTH represents Kahn's Topological Sort computed depth."
   (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Attempting to schedule task at marker %s" marker)
   (when (markerp marker)
     (org-with-point-at marker
       (let* ((headline (org-get-heading t t t t))
              (task-id (org-id-get))
+             (category (org-get-category))
              (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
              (is-saved-skipped (and saved-dec
                                     (not (bound-and-true-p org-auto-scheduler--ignore-saved-skips-p))
@@ -4091,6 +4467,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                    10  ; Set to 10 minutes if clocked time exceeds total effort
                                  (max 10 (- total-effort clocked-time))))  ; Ensure minimum of 10 minutes
              (time-block (org-auto-scheduler-get-task-tag-block marker))
+             (energy-block (and (null time-block) (org-auto-scheduler-get-task-energy-block marker)))
              (not-before (org-auto-scheduler-get-not-before marker))
              (blocked-result (org-auto-scheduler--evaluate-blockers marker))
              (all-blockers-met (car blocked-result))
@@ -4104,6 +4481,8 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
              (available-time (if time-block
                                  (org-auto-scheduler-next-available-time-in-block start-time time-block remaining-effort)
                                start-time))
+             (energy-slot-used nil)
+             (skipped-trace '())
              (end-time nil)
              (attempts 0)
              (max-attempts (* 7 24 60)) ; 7 days in minutes
@@ -4136,6 +4515,11 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                              (format "Blocked by WAITING: '%s'" (or first-waiting-title "task"))
                            "Blocked by unmet dependencies")))
             (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is %s. %s." headline status-str reason)
+            (when (and task-id (hash-table-p org-auto-scheduler--placement-traces))
+              (puthash task-id (list :base-effort base-effort :multiplier multiplier :total-effort total-effort
+                                     :clocked-time clocked-time :remaining-effort remaining-effort :category category
+                                     :status status-str :reason reason)
+                       org-auto-scheduler--placement-traces))
             ;; Record blocked tasks so they appear in the review buffer
             (when org-auto-scheduler--preview-mode
               (push (list task-id current-time current-time '("AUTOSCH") nil headline
@@ -4172,6 +4556,21 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                  (is-pomodoro (not (null pomo-spec)))
                  (pomo-work (and pomo-spec (plist-get pomo-spec :work)))
                  (pomo-break (and pomo-spec (plist-get pomo-spec :break))))
+            ;; Soft energy block preference: try energy window on start-time's day first
+            (when (and energy-block available-time (not is-pinned))
+              (let* ((init-chunk (if (and is-pomodoro (> remaining-effort pomo-work))
+                                     pomo-work
+                                   remaining-effort))
+                     (e-slot (org-auto-scheduler-find-slot-in-energy-block-same-day
+                              available-time energy-block init-chunk task-id tags)))
+                (if e-slot
+                    (progn
+                      (setq available-time e-slot)
+                      (setq energy-slot-used t))
+                  (push (list available-time available-time
+                              (format "Preferred energy window %s full/past today; using same-day fallback"
+                                      energy-block))
+                        skipped-trace))))
             (cond
              ;; -------------------------------------------------------------
              ;; PINNED task or FREESET reordered task path:
@@ -4201,10 +4600,16 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                           (push (list eff-id eff-start end-time '("AUTOSCH") t headline schedule-string marker topo-depth)
                                 org-auto-scheduler-completed-tasks)
                         (org-auto-scheduler--set-scheduled schedule-string)
-                        (org-set-property org-auto-scheduler-scheduled-property "t")
+                        (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
+                          (org-set-property org-auto-scheduler-scheduled-property "t"))
                         (org-auto-scheduler--cleanup-task-placeholders marker origin-id)
                         (push (list eff-id eff-start end-time '("AUTOSCH") t headline schedule-string nil topo-depth)
                               org-auto-scheduler-completed-tasks))
+                      (when (and eff-id (hash-table-p org-auto-scheduler--placement-traces))
+                        (puthash eff-id (list :base-effort base-effort :multiplier multiplier :total-effort total-effort
+                                              :clocked-time clocked-time :remaining-effort remaining-effort :category category
+                                              :pinned t :selected-start eff-start :selected-end end-time)
+                                 org-auto-scheduler--placement-traces))
                       (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled PINNABLE task '%s' from %s to %s (Effort: %dm)"
                                                     headline
                                                     (format-time-string "%Y-%m-%d %H:%M" eff-start)
@@ -4228,7 +4633,8 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                         (push (list eff-id eff-start today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
                               org-auto-scheduler-completed-tasks)
                       (org-auto-scheduler--set-scheduled schedule-string)
-                      (org-set-property org-auto-scheduler-scheduled-property "t")
+                      (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
+                        (org-set-property org-auto-scheduler-scheduled-property "t"))
                       (push (list eff-id eff-start today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
                             org-auto-scheduler-completed-tasks))
                     ;; Place remaining effort on subsequent days starting from next day start
@@ -4253,6 +4659,10 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                          (occupied-result (org-auto-scheduler-time-slot-occupied-p available-time work-chunk task-id tags)))
                     (if occupied-result
                         (progn
+                          (when (< (length skipped-trace) 10)
+                            (push (list available-time occupied-result
+                                        (org-auto-scheduler--describe-slot-conflict available-time work-chunk task-id tags))
+                                  skipped-trace))
                           (setq end-time nil)
                           ;; If splittable (and NOT pomodoro), check if we can take the available slot right now
                           (let ((avail-now (cond
@@ -4283,7 +4693,8 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                       (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
                                             org-auto-scheduler-completed-tasks)
                                     (org-auto-scheduler--set-scheduled schedule-string)
-                                    (org-set-property org-auto-scheduler-scheduled-property "t")
+                                    (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
+                                      (org-set-property org-auto-scheduler-scheduled-property "t"))
                                     (org-auto-scheduler--cleanup-task-placeholders marker origin-id)
                                     (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
                                           org-auto-scheduler-completed-tasks))
@@ -4297,9 +4708,19 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                     (setq split-result (time-add last-end (seconds-to-time (* 60 active-gap))))))
 
                               ;; Cannot split: advance normally
-                              (setq available-time (if time-block
-                                                       (org-auto-scheduler-next-available-time-in-block occupied-result time-block work-chunk)
-                                                     (org-auto-scheduler-next-available-time occupied-result work-chunk tags))))))
+                              (let ((prev-day (format-time-string "%Y-%m-%d" available-time))
+                                    (next-cand (if time-block
+                                                   (org-auto-scheduler-next-available-time-in-block occupied-result time-block work-chunk)
+                                                 (org-auto-scheduler-next-available-time occupied-result work-chunk tags))))
+                                ;; If we rolled onto a new calendar day and task has a soft energy-block, try energy block on that new day
+                                (when (and next-cand energy-block
+                                           (not (string= prev-day (format-time-string "%Y-%m-%d" next-cand))))
+                                  (let ((e-slot (org-auto-scheduler-find-slot-in-energy-block-same-day
+                                                 next-cand energy-block work-chunk task-id tags)))
+                                    (when e-slot
+                                      (setq next-cand e-slot)
+                                      (setq energy-slot-used t))))
+                                (setq available-time next-cand)))))
 
                       ;; Slot is available!
                       (if (and is-pomodoro (> remaining-effort pomo-work))
@@ -4324,7 +4745,8 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                 (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :pomodoro-parent nil)
                                       org-auto-scheduler-completed-tasks)
                               (org-auto-scheduler--set-scheduled schedule-string)
-                              (org-set-property org-auto-scheduler-scheduled-property "t")
+                              (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
+                                (org-set-property org-auto-scheduler-scheduled-property "t"))
                               (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :pomodoro-parent nil)
                                     org-auto-scheduler-completed-tasks))
                             (let ((last-end (org-auto-scheduler--place-pomodoro-placeholders
@@ -4338,6 +4760,24 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                               (setq split-result (time-add last-end (seconds-to-time (* 60 (max active-gap pomo-break)))))))
                         ;; Entire task fits (or remaining-effort <= pomo-work)
                         (setq end-time candidate-end))))))
+              (when (and task-id (hash-table-p org-auto-scheduler--placement-traces))
+                (puthash task-id
+                         (list :base-effort base-effort
+                               :multiplier multiplier
+                               :total-effort total-effort
+                               :clocked-time clocked-time
+                               :remaining-effort remaining-effort
+                               :category category
+                               :not-before not-before
+                               :blocker-end-time blocker-end-time
+                               :time-block time-block
+                               :energy-block energy-block
+                               :energy-slot-used energy-slot-used
+                               :initial-search-time start-time
+                               :selected-start available-time
+                               :selected-end (or end-time split-result)
+                               :skipped-slots (nreverse skipped-trace))
+                         org-auto-scheduler--placement-traces))
               (cond
                (split-result
                 split-result)
@@ -4356,7 +4796,8 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                   (if org-auto-scheduler--preview-mode
                       (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string marker topo-depth) org-auto-scheduler-completed-tasks)
                     (org-auto-scheduler--set-scheduled schedule-string)
-                    (org-set-property org-auto-scheduler-scheduled-property "t")
+                    (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
+                      (org-set-property org-auto-scheduler-scheduled-property "t"))
                     (org-auto-scheduler--cleanup-task-placeholders marker (or task-id origin-id))
                     (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string nil topo-depth) org-auto-scheduler-completed-tasks))
                   (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled task '%s' from %s to %s (Remaining effort: %d minutes, Gap: %dm)"
@@ -4441,14 +4882,35 @@ is the maximum end time of any blocker scheduled (or nil if none)."
   "Convert minutes since midnight to a time string (H:MM or HH:MM)."
   (format "%d:%02d" (/ minutes 60) (mod minutes 60)))
 
+(defun org-auto-scheduler--normalize-block-list (raw-block)
+  "Normalize RAW-BLOCK into a list of (START . END) time-string cons cells."
+  (cond
+   ((null raw-block) nil)
+   ((and (consp raw-block) (stringp (car raw-block)) (stringp (cdr raw-block)))
+    (list raw-block))
+   ((and (consp raw-block) (stringp (car raw-block)) (consp (cdr raw-block)) (stringp (cadr raw-block)))
+    (list (cons (car raw-block) (cadr raw-block))))
+   ((listp raw-block) raw-block)
+   (t nil)))
+
 (defun org-auto-scheduler-get-task-tag-block (marker)
-  "Get the time block for the task at MARKER based on its tags."
+  "Get the hard time block for the task at MARKER based on its tags (`org-auto-scheduler-time-blocks')."
   (let* ((tags (org-get-tags marker))
          (matching-block nil))
-    (dolist (tag-block (append org-auto-scheduler-time-blocks org-auto-scheduler-energy-blocks))
+    (dolist (tag-block org-auto-scheduler-time-blocks)
       (when (and (not matching-block)
                  (member (car tag-block) tags))
-        (setq matching-block (cdr tag-block))))
+        (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
+    matching-block))
+
+(defun org-auto-scheduler-get-task-energy-block (marker)
+  "Get the soft preferred energy block for the task at MARKER based on its tags (`org-auto-scheduler-energy-blocks')."
+  (let* ((tags (org-get-tags marker))
+         (matching-block nil))
+    (dolist (tag-block org-auto-scheduler-energy-blocks)
+      (when (and (not matching-block)
+                 (member (car tag-block) tags))
+        (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
     matching-block))
 
 (defun org-auto-scheduler-time-fits-block-p (block-start block-end remaining-effort)
@@ -4805,12 +5267,16 @@ Uses `transient` if available, otherwise falls back to a simple prompt."
                            " [e] Extend Current Task\n"
                            " [N] Toggle Non-Blocking\n"
                            " [k] Cleanup Placeholders\n"
+                           " [E] End-of-Day Wrap-Up\n"
+                           " [D] Explore Dependencies\n"
                            " [W] Weekly Retrospective\n"
                            "Choice: ")
-                   '(?s ?r ?t ?f ?F ?S ?M ?C ?c ?a ?b ?e ?N ?n ?k ?W ?w))))
+                   '(?s ?r ?t ?f ?F ?S ?M ?C ?c ?a ?b ?e ?E ?D ?N ?n ?k ?W ?w))))
       (cond
        ((memq choice '(?f ?F)) (call-interactively 'org-auto-scheduler-focus))
        ((eq choice ?e) (call-interactively 'org-auto-scheduler-extend-current-task))
+       ((eq choice ?E) (call-interactively 'org-auto-scheduler-eod-review))
+       ((eq choice ?D) (call-interactively 'org-auto-scheduler-explore-dependencies))
        ((eq choice ?s) (call-interactively 'org-auto-scheduler-schedule-tasks))
        ((eq choice ?r) (call-interactively 'org-auto-scheduler-review-and-apply))
        ((eq choice ?t) (call-interactively 'org-auto-scheduler-schedule-today))
@@ -4837,11 +5303,13 @@ Uses `transient` if available, otherwise falls back to a simple prompt."
       ("C" "Clear saved decisions"     org-auto-scheduler-clear-saved-decisions)]
     ["Adherence & Analytics"
       ("A" "Snapshot schedule"       org-auto-scheduler-snapshot-schedule)
+      ("E" "End-of-day wrap-up"      org-auto-scheduler-eod-review)
       ("c" "Score adherence"         org-auto-scheduler-score-schedule)
       ("a" "Adherence report"        org-auto-scheduler-adherence-report)
       ("W" "Weekly retrospective"    org-auto-scheduler-weekly-retrospective)]
     ["Tools"
       ("f" "Focus HUD Cockpit"       org-auto-scheduler-focus)
+      ("D" "Explore dependencies"    org-auto-scheduler-explore-dependencies)
       ("b" "Bump agenda"             org-auto-scheduler-bump-agenda)
       ("e" "Extend current task"     org-auto-scheduler-extend-current-task)
       ("N" "Toggle non-blocking"     org-auto-scheduler-toggle-non-blocking)

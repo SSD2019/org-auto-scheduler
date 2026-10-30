@@ -10,5 +10,7 @@ implementation_plan.md
 
 # Emacs backup / lock files
 *~
+*.~undo-tree~
 \#*\#
 .\#*
+.org-auto-scheduler-lease.el

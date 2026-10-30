@@ -65,6 +65,18 @@ Prunes snapshots older than 30 days to prevent excessive file growth."
 
 ;;; Schedule Adherence Tracking & Scoring
 
+(defun org-auto-scheduler--has-snapshot-for-date-p (&optional date-str)
+  "Return non-nil if an adherence snapshot exists for DATE-STR (default today)."
+  (let ((target (or date-str (format-time-string "%Y-%m-%d"))))
+    (not (null (assoc target org-auto-scheduler--adherence-snapshots)))))
+
+(defun org-auto-scheduler--snapshot-count-for-date (&optional date-str)
+  "Return the number of tasks in the adherence snapshot for DATE-STR (default today), or nil if none."
+  (let* ((target (or date-str (format-time-string "%Y-%m-%d")))
+         (entry (assoc target org-auto-scheduler--adherence-snapshots)))
+    (when entry
+      (length (cdr entry)))))
+
 (defun org-auto-scheduler-snapshot-schedule ()
   "Record a snapshot of today's scheduled tasks for adherence tracking.
 Only records tasks that have a SCHEDULED property matching today's date."
@@ -846,45 +858,43 @@ Clocked intervals are extracted from the org files."
 
     (insert (propertize " 📊 Daily Timeline \n" 'face 'org-level-1))
     (insert (make-string 30 ?-) "\n")
-    (when (and (null planned-intervals) (null clocked-intervals))
-      (insert "No timeline data available.\n\n")
-      (cl-return-from org-auto-scheduler--render-compact-gantt nil))
-
-    ;; Render chunk by chunk (Explicitly 06:00 - 12:00, 12:00 - 18:00, 18:00 - 24:00)
-    (let ((chunks '((360 720) (720 1080) (1080 1440))))
-      (dolist (chunk chunks)
-        (let ((chunk-start (car chunk))
-              (chunk-end (cadr chunk)))
-          ;; Header with hour markers
-          (org-auto-scheduler--render-timeline-header chunk-start chunk-end chars-per-min)
-          ;; Planned row
-          (org-auto-scheduler--render-gantt-row "Planned" planned-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
-          ;; Actual row
-          (org-auto-scheduler--render-gantt-row "Actual" clocked-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
-          (insert "\n"))))
-    (insert "\n")
-    ;; Render Legend
-    (when legend-list
-      (insert (propertize " Timeline Legend \n" 'face 'org-level-2))
-      (insert (make-string 30 ?-) "\n")
-      (dolist (item legend-list)
-        (let* ((legend-id (nth 0 item))
-               (heading (nth 1 item))
-               (id (nth 2 item))
-               (color (nth 3 item))
-               ;; Since color is a face symbol (e.g., 'font-lock-keyword-face), we use it directly
-               (fmt-legend-id (if color (propertize (format " [%2s] " legend-id) 'face color)
-                                (format " [%2s] " legend-id))))
-          (insert fmt-legend-id)
-          (if id
-              (let ((start (point)))
-                (insert (propertize heading
-                                    'org-id id
-                                    'face (if color `(:inherit ,color :underline t) 'link)
-                                    'mouse-face 'highlight)))
-            (insert (if color (propertize heading 'face color) heading)))
-          (insert "\n")))
-      (insert "\n"))))
+    (if (and (null planned-intervals) (null clocked-intervals))
+        (insert "No timeline data available.\n\n")
+      ;; Render chunk by chunk (Explicitly 06:00 - 12:00, 12:00 - 18:00, 18:00 - 24:00)
+      (let ((chunks '((360 720) (720 1080) (1080 1440))))
+        (dolist (chunk chunks)
+          (let ((chunk-start (car chunk))
+                (chunk-end (cadr chunk)))
+            ;; Header with hour markers
+            (org-auto-scheduler--render-timeline-header chunk-start chunk-end chars-per-min)
+            ;; Planned row
+            (org-auto-scheduler--render-gantt-row "Planned" planned-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
+            ;; Actual row
+            (org-auto-scheduler--render-gantt-row "Actual" clocked-intervals chunk-start chunk-end chars-per-min date-str legend-hash)
+            (insert "\n"))))
+      (insert "\n")
+      ;; Render Legend
+      (when legend-list
+        (insert (propertize " Timeline Legend \n" 'face 'org-level-2))
+        (insert (make-string 30 ?-) "\n")
+        (dolist (item legend-list)
+          (let* ((legend-id (nth 0 item))
+                 (heading (nth 1 item))
+                 (id (nth 2 item))
+                 (color (nth 3 item))
+                 ;; Since color is a face symbol (e.g., 'font-lock-keyword-face), we use it directly
+                 (fmt-legend-id (if color (propertize (format " [%2s] " legend-id) 'face color)
+                                  (format " [%2s] " legend-id))))
+            (insert fmt-legend-id)
+            (if id
+                (let ((start (point)))
+                  (insert (propertize heading
+                                      'org-id id
+                                      'face (if color `(:inherit ,color :underline t) 'link)
+                                      'mouse-face 'highlight)))
+              (insert (if color (propertize heading 'face color) heading)))
+            (insert "\n")))
+        (insert "\n")))))
 
 ;;; Adherence Report
 
@@ -1095,6 +1105,227 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
 ;; Auto-enable overrun mode line indicator if enabled
 (when org-auto-scheduler-overrun-mode-line-enabled
   (org-auto-scheduler-overrun-mode-line-enable))
+
+;;; ============================================================================
+;;; End-of-Day Wrap-Up Wizard (`M-x org-auto-scheduler-eod-review')
+;;; ============================================================================
+
+(defvar-local org-auto-scheduler--eod-date nil
+  "Target date string (YYYY-MM-DD) for the active End-of-Day Wrap-Up buffer.")
+
+(defvar org-auto-scheduler-eod-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "g") #'org-auto-scheduler-eod-refresh)
+    (define-key map (kbd "r") #'org-auto-scheduler-eod-refresh)
+    (define-key map (kbd "d") #'org-auto-scheduler-eod-mark-done)
+    (define-key map (kbd "c") #'org-auto-scheduler-eod-mark-dropped)
+    (define-key map (kbd ">") #'org-auto-scheduler-eod-roll-tomorrow)
+    (define-key map (kbd "w") #'org-auto-scheduler-eod-mark-waiting)
+    (define-key map (kbd "x") #'org-auto-scheduler-eod-roll-all-remaining)
+    (define-key map (kbd "RET") #'org-auto-scheduler-report-jump-to-task)
+    (define-key map (kbd "TAB") #'org-auto-scheduler-report-jump-to-task)
+    map)
+  "Keymap for `org-auto-scheduler-eod-mode'.")
+
+(define-derived-mode org-auto-scheduler-eod-mode special-mode "AutoSch-EOD"
+  "Major mode for the End-of-Day Wrap-Up Wizard."
+  (setq buffer-read-only t))
+
+(when (fboundp 'evil-define-key*)
+  (evil-define-key* '(normal motion) org-auto-scheduler-eod-mode-map
+    (kbd "q") #'quit-window
+    (kbd "g") #'org-auto-scheduler-eod-refresh
+    (kbd "r") #'org-auto-scheduler-eod-refresh
+    (kbd "d") #'org-auto-scheduler-eod-mark-done
+    (kbd "c") #'org-auto-scheduler-eod-mark-dropped
+    (kbd ">") #'org-auto-scheduler-eod-roll-tomorrow
+    (kbd "w") #'org-auto-scheduler-eod-mark-waiting
+    (kbd "x") #'org-auto-scheduler-eod-roll-all-remaining
+    (kbd "RET") #'org-auto-scheduler-report-jump-to-task
+    (kbd "TAB") #'org-auto-scheduler-report-jump-to-task))
+
+(defun org-auto-scheduler--eod-task-at-point ()
+  "Return the (:id ID :marker MARKER :effort EFFORT :clocked CLOCKED) plist at point in EOD buffer."
+  (get-text-property (line-beginning-position) 'org-auto-scheduler-eod-task))
+
+(defun org-auto-scheduler-eod-mark-done ()
+  "Mark the unfinished task at point as DONE in the End-of-Day Wrap-Up buffer."
+  (interactive)
+  (let* ((tk (org-auto-scheduler--eod-task-at-point))
+         (m (and tk (plist-get tk :marker))))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No unfinished task on this line"))
+    (org-with-point-at m
+      (org-auto-scheduler--set-todo-state (or (car org-done-keywords) "DONE"))
+      (save-buffer))
+    (org-auto-scheduler-eod-refresh)
+    (message "Marked '%s' DONE." (plist-get tk :headline))))
+
+(defun org-auto-scheduler-eod-mark-dropped ()
+  "Mark the unfinished task at point as DROPPED/CANCELLED in the End-of-Day Wrap-Up buffer."
+  (interactive)
+  (let* ((tk (org-auto-scheduler--eod-task-at-point))
+         (m (and tk (plist-get tk :marker)))
+         (kill-state (or (bound-and-true-p org-auto-scheduler-kill-todo-state) "DROPPED")))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No unfinished task on this line"))
+    (org-with-point-at m
+      (org-auto-scheduler--set-todo-state kill-state)
+      (save-buffer))
+    (org-auto-scheduler-eod-refresh)
+    (message "Marked '%s' %s." (plist-get tk :headline) kill-state)))
+
+(defun org-auto-scheduler-eod-mark-waiting ()
+  "Move the unfinished task at point to WAITING state in the End-of-Day Wrap-Up buffer."
+  (interactive)
+  (let* ((tk (org-auto-scheduler--eod-task-at-point))
+         (m (and tk (plist-get tk :marker)))
+         (wait-state (or (car (bound-and-true-p org-auto-scheduler-waiting-states)) "WAITING")))
+    (unless (and m (markerp m) (marker-buffer m))
+      (user-error "No unfinished task on this line"))
+    (org-with-point-at m
+      (org-auto-scheduler--set-todo-state wait-state)
+      (save-buffer))
+    (org-auto-scheduler-eod-refresh)
+    (message "Moved '%s' to %s." (plist-get tk :headline) wait-state)))
+
+(defun org-auto-scheduler--roll-task-to-tomorrow (tk tomorrow-str)
+  "Roll task plist TK to TOMORROW-STR, updating Effort to remaining effort if partially clocked."
+  (let* ((m (plist-get tk :marker))
+         (effort (or (plist-get tk :effort) 60))
+         (clocked (or (plist-get tk :clocked) 0))
+         (rem-effort (if (> clocked 0) (max 10 (- effort clocked)) effort)))
+    (when (and m (markerp m) (marker-buffer m))
+      (org-with-point-at m
+        (org-back-to-heading t)
+        (when (and (> clocked 0) (< rem-effort effort))
+          (org-set-property "Effort" (org-auto-scheduler-minutes-to-time rem-effort)))
+        (org-set-property "NOT_BEFORE" (format "[%s]" tomorrow-str))
+        (org-auto-scheduler--set-scheduled (format "<%s %s>" tomorrow-str org-auto-scheduler-start-time))
+        (save-buffer)))))
+
+(defun org-auto-scheduler-eod-roll-tomorrow ()
+  "Roll the unfinished task at point to tomorrow, adjusting Effort for any clocked time."
+  (interactive)
+  (let* ((tk (org-auto-scheduler--eod-task-at-point))
+         (date-str (or org-auto-scheduler--eod-date (format-time-string "%Y-%m-%d")))
+         (base-t (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
+         (tomorrow-str (format-time-string "%Y-%m-%d" (time-add base-t (days-to-time 1)))))
+    (unless tk
+      (user-error "No unfinished task on this line"))
+    (org-auto-scheduler--roll-task-to-tomorrow tk tomorrow-str)
+    (org-auto-scheduler-eod-refresh)
+    (message "Rolled '%s' to %s." (plist-get tk :headline) tomorrow-str)))
+
+(defun org-auto-scheduler-eod-roll-all-remaining ()
+  "Roll all remaining unfinished tasks for today to tomorrow and refresh."
+  (interactive)
+  (let* ((date-str (or org-auto-scheduler--eod-date (format-time-string "%Y-%m-%d")))
+         (base-t (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
+         (tomorrow-str (format-time-string "%Y-%m-%d" (time-add base-t (days-to-time 1))))
+         (today-tasks (org-auto-scheduler-get-today-scheduled-tasks date-str))
+         (unfinished (cl-remove-if (lambda (t-pl) (plist-get t-pl :is-done)) today-tasks))
+         (count 0))
+    (dolist (tk unfinished)
+      (let* ((m (plist-get tk :marker))
+             (clk (if (and m (markerp m) (marker-buffer m))
+                      (org-auto-scheduler-get-clocked-time m)
+                    0)))
+        (plist-put tk :clocked clk)
+        (org-auto-scheduler--roll-task-to-tomorrow tk tomorrow-str)
+        (cl-incf count)))
+    (org-auto-scheduler-eod-refresh)
+    (message "Rolled %d unfinished task(s) to %s." count tomorrow-str)))
+
+(defun org-auto-scheduler-eod-refresh ()
+  "Refresh the current End-of-Day Wrap-Up buffer."
+  (interactive)
+  (org-auto-scheduler-eod-review (or org-auto-scheduler--eod-date (format-time-string "%Y-%m-%d"))))
+
+;;;###autoload
+(defun org-auto-scheduler-eod-review (&optional date-str)
+  "Open the End-of-Day Wrap-Up Wizard for DATE-STR (default today).
+Displays today's Adherence Score, Planned vs. Actual Clocked Gantt timeline,
+and an interactive triage list of unfinished tasks scheduled for today."
+  (interactive
+   (list (when current-prefix-arg
+           (let ((prompt-date (org-read-date nil nil nil "End-of-day wrap-up for date: ")))
+             (when prompt-date
+               (format-time-string "%Y-%m-%d" (org-time-string-to-time prompt-date)))))))
+  (let* ((target-date (or date-str (format-time-string "%Y-%m-%d")))
+         (snapshot (cdr (assoc target-date org-auto-scheduler--adherence-snapshots)))
+         (today-tasks (org-auto-scheduler-get-today-scheduled-tasks target-date))
+         (done-tasks (cl-remove-if-not (lambda (tk) (plist-get tk :is-done)) today-tasks))
+         (unfinished (cl-remove-if (lambda (tk) (plist-get tk :is-done)) today-tasks))
+         (buf (get-buffer-create "*Org Auto Scheduler End-of-Day*")))
+    (when snapshot
+      (ignore-errors (org-auto-scheduler-score-schedule target-date t)))
+    (let* ((hist-entry (cdr (assoc target-date org-auto-scheduler--adherence-history)))
+           (adh-score (and hist-entry (plist-get hist-entry :score)))
+           (streak (org-auto-scheduler-get-adherence-streak)))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t)
+              (saved-line (line-number-at-pos)))
+          (erase-buffer)
+          (org-auto-scheduler-eod-mode)
+          (setq-local org-auto-scheduler--eod-date target-date)
+          (insert "════════════════════════════════════════════════════════════════════════════════\n")
+          (insert (propertize (format " 🌙 End-of-Day Wrap-Up — %s\n" target-date) 'face 'bold))
+          (insert "════════════════════════════════════════════════════════════════════════════════\n\n")
+          (insert (format " • Planned Tasks Today: %d (%d completed, %d remaining)\n"
+                          (length today-tasks) (length done-tasks) (length unfinished)))
+          (if adh-score
+              (insert (format " • Adherence Score:     %.1f%% (Streak: %d day%s)\n\n"
+                              adh-score streak (if (= streak 1) "" "s")))
+            (insert " • Adherence Snapshot:  Not recorded for this date (press `A' in Review Mode tomorrow morning)\n\n"))
+
+          ;; Render Compact Gantt Timeline (using snapshot if available, or today's tasks as planned)
+          (let ((gantt-snap (or snapshot
+                                (mapcar (lambda (tk)
+                                          (list :id (plist-get tk :id)
+                                                :heading (plist-get tk :headline)
+                                                :effort (plist-get tk :effort)
+                                                :scheduled (when (plist-get tk :start)
+                                                             (format-time-string "<%Y-%m-%d %a %H:%M>" (plist-get tk :start)))))
+                                        today-tasks))))
+            (org-auto-scheduler--render-compact-gantt target-date gantt-snap))
+
+          (insert (propertize " 📋 Unfinished Tasks Scheduled for Today \n" 'face 'org-level-1))
+          (insert (make-string 72 ?─) "\n")
+          (if (null unfinished)
+              (insert (propertize " 🎉 All scheduled tasks for today are completed!\n\n" 'face 'success))
+            (insert " Keys: [d] Mark DONE  [>] Roll remaining to tomorrow  [w] WAITING  [c] Drop  [x] Roll ALL remaining\n\n")
+            (dolist (tk unfinished)
+              (let* ((m (plist-get tk :marker))
+                     (tid (plist-get tk :id))
+                     (hl (plist-get tk :headline))
+                     (st (plist-get tk :start))
+                     (et (plist-get tk :end))
+                     (eff (or (plist-get tk :effort) 60))
+                     (clk (if (and m (markerp m) (marker-buffer m))
+                              (org-auto-scheduler-get-clocked-time m)
+                            0))
+                     (rem (max 10 (- eff clk)))
+                     (slot-str (if (and st et)
+                                   (format "%s-%s"
+                                           (format-time-string "%H:%M" st)
+                                           (format-time-string "%H:%M" et))
+                                 "today"))
+                     (task-data (list :id tid :marker m :headline hl :effort eff :clocked clk))
+                     (line-start (point)))
+                (insert (format "  • [%s] %-38s  Effort: %3dm | Clocked: %3dm | Rem: %3dm\n"
+                                slot-str
+                                (truncate-string-to-width (or hl "Task") 38 nil nil "…")
+                                eff clk rem))
+                (add-text-properties line-start (line-end-position 0)
+                                     (list 'org-auto-scheduler-eod-task task-data
+                                           'org-id tid)))))
+          (insert "\n Keys: [RET/TAB] Jump to task  [g/r] Refresh  [q] Quit\n")
+          (goto-char (point-min))
+          (forward-line (max 0 (1- saved-line)))))
+      (pop-to-buffer buf))))
 
 (provide 'org-auto-scheduler-analytics)
 
