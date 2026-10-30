@@ -2661,7 +2661,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                           (org-auto-scheduler--task-scheduled-today-p marker today-str))))
                          (lapsed-kind (and sched-times replan-lapsed
                                            (cond ((org-auto-scheduler--task-clocked-p marker) 'clocked)
-                                                 ((time-less-p (cdr sched-times) now) 'lapsed))))
+                                                 ((time-less-p (car sched-times) now) 'lapsed))))
                          (_ (when lapsed-kind (puthash task-id lapsed-kind lapsed-ids))))
                     (if (and sched-times (not lapsed-kind))
                         (let* ((start-t (car sched-times))
@@ -2739,7 +2739,11 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                    (has-unscheduled
                     (and preserve-today
                          (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule)))
-                   (has-priority-reorder (or has-priority-or-indep-trigger has-unscheduled))
+                   (has-lapsed
+                    (> (hash-table-count lapsed-ids) 0))
+                   (has-priority-reorder (or has-priority-or-indep-trigger
+                                             has-unscheduled
+                                             has-lapsed))
                    (preserved-entries '())
                    (final-schedule-list '()))
 
@@ -2803,6 +2807,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                (or (plist-get e :lapsed-or-current)
                                    (plist-get e :pinned)
                                    (and org-auto-scheduler-preserve-future-scheduled
+                                        (not has-lapsed)
                                         (not (plist-get e :is-today)))))
                           (push e preserved-entries)
                         ;; Upcoming unpinned task for today OR conflicting task: mark as eligible for rescheduling
