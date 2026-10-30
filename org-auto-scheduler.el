@@ -663,6 +663,15 @@ title marker (such as -r- or -r-all-) or `force-replan'."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-manual-reschedule-lapsed t
+  "When non-nil, manual runs reschedule uncompleted tasks whose slot has elapsed.
+This also covers the currently clocked task (scheduled for its remaining effort,
+starting after the running clock) and pinned tasks (their pinned time is moved
+to the new slot).  Background runs never do this automatically; they only
+replan today's upcoming tasks when a new overlap or unscheduled task appears."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
 (defcustom org-auto-scheduler-title-marker-regex
   (let ((token "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciwRSFPXCIW]\\)"))
     (format "\\(?:(\\s-*\\)?-\\(%s\\(?:-?%s\\)*\\)-\\(?:\\s-*)\\)?" token token))
@@ -2584,7 +2593,12 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                  (preserve-today (and org-auto-scheduler-preserve-today-scheduled
                                       (not force-replan)))
                  (today-scheduled '()) ; list of entries for today
-                 (tasks-to-schedule '())) ; tasks that need scheduling slots
+                 (tasks-to-schedule '()) ; tasks that need scheduling slots
+                 ;; Manual runs (not the background daemon) replan lapsed/clocked tasks
+                 (replan-lapsed (and org-auto-scheduler-manual-reschedule-lapsed
+                                     (not (memq org-auto-scheduler--current-run-type
+                                                '(background-async background-sync)))))
+                 (lapsed-ids (make-hash-table :test 'equal))) ; task-id -> 'clocked / 'lapsed
 
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
             (maphash
@@ -2641,11 +2655,15 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d")))
                            (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
                       (setf (nth 10 task-info) (org-auto-scheduler-parse-time-string not-before-time))))
-                  (let ((sched-times (when preserve-today
-                                       (if org-auto-scheduler-preserve-future-scheduled
-                                           (org-auto-scheduler--task-scheduled-time marker today-str)
-                                         (org-auto-scheduler--task-scheduled-today-p marker today-str)))))
-                    (if sched-times
+                  (let* ((sched-times (when preserve-today
+                                        (if org-auto-scheduler-preserve-future-scheduled
+                                            (org-auto-scheduler--task-scheduled-time marker today-str)
+                                          (org-auto-scheduler--task-scheduled-today-p marker today-str))))
+                         (lapsed-kind (and sched-times replan-lapsed
+                                           (cond ((org-auto-scheduler--task-clocked-p marker) 'clocked)
+                                                 ((time-less-p (cdr sched-times) now) 'lapsed))))
+                         (_ (when lapsed-kind (puthash task-id lapsed-kind lapsed-ids))))
+                    (if (and sched-times (not lapsed-kind))
                         (let* ((start-t (car sched-times))
                                (end-t (cdr sched-times))
                                (is-pin (org-auto-scheduler-task-pinned-p marker task-id))
@@ -2835,6 +2853,15 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                   (org-auto-scheduler-add-to-report t-info st))
                 (setq tasks-scheduled (1+ tasks-scheduled))))
 
+            ;; Clocked task first so it gets the slot starting right after the running clock
+            (when (> (hash-table-count lapsed-ids) 0)
+              (let ((clocked-first '()) (others '()))
+                (dolist (ti final-schedule-list)
+                  (if (eq (gethash (nth 5 ti) lapsed-ids) 'clocked)
+                      (push ti clocked-first)
+                    (push ti others)))
+                (setq final-schedule-list (append (nreverse clocked-first) (nreverse others)))))
+
             ;; 5. Schedule tasks in final-schedule-list
             (let ((reporter (unless org-auto-scheduler-silent-mode
                               (make-progress-reporter "Scheduling tasks..." 0 total-tasks))))
@@ -2849,6 +2876,11 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                        (raw-marker (car task-info))
                        (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id)))
                   (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
+                    ;; Lapsed pinned task: move its pin to the next free slot (now)
+                    (when (and (gethash task-id lapsed-ids)
+                               (org-auto-scheduler-task-pinned-p marker task-id))
+                      (org-auto-scheduler-task-set-pinned-time
+                       marker task-id (format-time-string "%Y-%m-%d %H:%M" current-time)))
                     (setq current-time (org-auto-scheduler-schedule-single-task marker current-time (nth 14 task-info)))
                     (when (nth 2 task-info)
                       (setq org-auto-scheduler--last-scheduled-project-id (nth 2 task-info)))
