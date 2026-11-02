@@ -2956,6 +2956,16 @@ SCHEDULED: <%s %s 16:26-18:26>\n\
                    "Test 26.7c: Task Inspector contains Priority Score Breakdown")
       (assert-true (string-match-p "SLOT PLACEMENT TRACE" (buffer-string))
                    "Test 26.7d: Task Inspector contains Slot Placement Trace"))
+    ;; Follow mode: moving across tasks updates the inspector
+    (org-auto-scheduler--review-goto-task "ui-task-2")
+    (org-auto-scheduler--review-maybe-update-inspector)
+    (with-current-buffer "*Org Auto Scheduler Task Inspector*"
+      (assert-true (string-match-p "Implement Token Refresh" (buffer-string))
+                   "Test 26.7d2: Task Inspector follow mode updates for task under point"))
+    ;; Toggle 'I' on task row closes the inspector side window
+    (org-auto-scheduler-review-inspect-task)
+    (assert-true (null (get-buffer-window "*Org Auto Scheduler Task Inspector*" t))
+                 "Test 26.7d3: Pressing 'I' again closes Task Inspector window")
     ;; Snapshot schedule via 'A' command
     (org-auto-scheduler-review-snapshot-schedule)
     (assert-true (org-auto-scheduler--has-snapshot-for-date-p (format-time-string "%Y-%m-%d"))

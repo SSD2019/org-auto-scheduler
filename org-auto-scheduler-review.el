@@ -1541,6 +1541,7 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
   (setq-local org-auto-scheduler--review-marked-ids nil)
   (setq-local tabulated-list-printer #'org-auto-scheduler--tabulated-list-printer)
   (add-hook 'kill-buffer-hook #'org-auto-scheduler--review-cancel-recalc-timer nil t)
+  (add-hook 'kill-buffer-hook #'org-auto-scheduler--review-close-inspector nil t)
   (add-hook 'post-command-hook #'org-auto-scheduler--review-maybe-update-inspector nil t)
   (tabulated-list-init-header))
 
@@ -4648,6 +4649,30 @@ Can be invoked from either the review table or the timegrid via `i'."
 
 ;;; Task Inspector ("Why Is This Scheduled Here?", bound to `I')
 
+(defcustom org-auto-scheduler-review-inspector-side 'right
+  "Side where the Task Inspector window should appear.
+Can be `right', `left', `above' (or `top'), or `below' (or `bottom')."
+  :type '(choice (const :tag "Right (Side-by-side)" right)
+                 (const :tag "Left" left)
+                 (const :tag "Above / Top" above)
+                 (const :tag "Below / Bottom" below))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-review-inspector-width 0.45
+  "Width of the Task Inspector window when opened on the side.
+Can be a float (fraction of the frame, e.g. 0.45) or an integer (number of columns, e.g. 80)."
+  :type '(choice (float :tag "Fraction of frame" 0.45)
+                 (integer :tag "Columns" 80))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-review-inspector-follow t
+  "If non-nil, automatically update the Task Inspector side window as point moves across tasks in Review."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defvar-local org-auto-scheduler--inspector-last-task-id nil
+  "Last inspected task ID in this review buffer to prevent redundant redraws.")
+
 (defvar org-auto-scheduler-inspector-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -4660,14 +4685,49 @@ Can be invoked from either the review table or the timegrid via `i'."
   "Major mode for inspecting score, duration, and placement trace of a scheduled task."
   (setq buffer-read-only t))
 
+(defun org-auto-scheduler--display-task-inspector-buffer (buf)
+  "Display the Task Inspector BUF on the configured side."
+  (let* ((side (or (and (boundp 'org-auto-scheduler-review-inspector-side)
+                        org-auto-scheduler-review-inspector-side)
+                   'right))
+         (side-sym (cond ((eq side 'above) 'top)
+                         ((eq side 'below) 'bottom)
+                         (t side)))
+         (width (or (and (boundp 'org-auto-scheduler-review-inspector-width)
+                         org-auto-scheduler-review-inspector-width)
+                    0.45))
+         (action
+          `((display-buffer-reuse-window
+             display-buffer-in-side-window)
+            (side . ,side-sym)
+            (slot . 1)
+            (window-width . ,width)
+            (window-height . 0.4))))
+    (or (condition-case nil
+            (display-buffer buf action)
+          (error nil))
+        (display-buffer buf))))
+
 (defun org-auto-scheduler--render-task-inspector-buffer (task-id &optional no-select)
   "Populate `*Org Auto Scheduler Task Inspector*' for TASK-ID."
-  (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
-         (marker (and task (nth 7 task)))
-         (headline (or (and task (nth 5 task)) "Untitled"))
-         (start (and task (nth 1 task)))
-         (end (and task (nth 2 task)))
-         (status (and task (nth 9 task)))
+  (let* ((task (and task-id (assoc task-id org-auto-scheduler-completed-tasks)))
+         (marker (or (and task (nth 7 task))
+                     (get-text-property (point) 'task-marker)
+                     (and (stringp task-id) (not (string= task-id ""))
+                          (org-id-find task-id t))))
+         (headline (or (and task (nth 5 task))
+                       (and marker (markerp marker) (marker-buffer marker)
+                            (org-with-point-at marker (org-get-heading t t t t)))
+                       "Untitled"))
+         (start (or (and task (nth 1 task))
+                    (and marker (markerp marker) (marker-buffer marker)
+                         (org-auto-scheduler-get-scheduled-time marker))))
+         (end (or (and task (nth 2 task))
+                  (and start
+                       (let ((eff (or (and marker (org-auto-scheduler-get-effort marker)) 60)))
+                         (time-add start (seconds-to-time (* eff 60)))))))
+         (status (or (and task (nth 9 task))
+                     (if start :scheduled :unscheduled)))
          (proj (or (and marker (markerp marker) (marker-buffer marker)
                         (org-auto-scheduler--get-project-name marker))
                    "—"))
@@ -4690,10 +4750,11 @@ Can be invoked from either the review table or the timegrid via `i'."
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (org-auto-scheduler-inspector-mode)
+        (unless (derived-mode-p 'org-auto-scheduler-inspector-mode)
+          (org-auto-scheduler-inspector-mode))
         (insert "══════════════════════════════════════════════════════════════════════\n")
         (insert (propertize (format " 🔍 TASK INSPECTOR: %s\n" headline) 'face 'bold))
-        (insert (format " Project: %-22s │ ID: %s\n" proj task-id))
+        (insert (format " Project: %-22s │ ID: %s\n" proj (or task-id "—")))
         (insert (format " Status:  %-22s │ Slot: %s\n"
                         (or status :scheduled)
                         (if (and start end)
@@ -4797,31 +4858,55 @@ Can be invoked from either the review table or the timegrid via `i'."
                                (format-time-string "%a %Y-%m-%d %H:%M" final-start)
                                (format-time-string "%H:%M" final-end))
                        'face 'success)))))
-        (insert "\nKeys: [I / q] Close Inspector  (Move cursor in Review Buffer to auto-update)\n"))
+        (insert "\nKeys: [I / q] Close Inspector  (Follow mode: move cursor in Review Buffer to inspect tasks)\n"))
       (goto-char (point-min)))
+    (let ((win (get-buffer-window buf t)))
+      (when (window-live-p win)
+        (set-window-point win (point-min))
+        (set-window-start win (point-min))))
     (unless no-select
-      (display-buffer buf))))
+      (org-auto-scheduler--display-task-inspector-buffer buf))))
 
 (defun org-auto-scheduler-review-inspect-task ()
-  "Open or toggle the `*Org Auto Scheduler Task Inspector*' window for the task at point.
+  "Open or toggle the `*Org Auto Scheduler Task Inspector*' side window for the task at point.
+Enables follow mode: moving point across tasks in the review buffer updates the inspector.
 Bound strictly to `I' in `org-auto-scheduler-review-mode'."
   (interactive)
   (let* ((id (tabulated-list-get-id))
-         (existing-win (get-buffer-window "*Org Auto Scheduler Task Inspector*")))
+         (existing-win (get-buffer-window "*Org Auto Scheduler Task Inspector*" t)))
     (if (or (null id) (org-auto-scheduler--review-special-row-p id))
         (user-error "Not on a task row")
       (if existing-win
-          (delete-window existing-win)
-        (org-auto-scheduler--render-task-inspector-buffer id)))))
+          (progn
+            (delete-window existing-win)
+            (setq org-auto-scheduler--inspector-last-task-id nil)
+            (message "Task Inspector closed"))
+        (setq org-auto-scheduler--inspector-last-task-id id)
+        (org-auto-scheduler--render-task-inspector-buffer id)
+        (message "Task Inspector opened on %s (follow mode active)"
+                 (or (and (boundp 'org-auto-scheduler-review-inspector-side)
+                          org-auto-scheduler-review-inspector-side)
+                     'right))))))
 
 (defun org-auto-scheduler--review-maybe-update-inspector ()
   "When `*Org Auto Scheduler Task Inspector*' is visible, update it as point moves in Review."
-  (when (and (derived-mode-p 'org-auto-scheduler-review-mode)
-             (get-buffer-window "*Org Auto Scheduler Task Inspector*"))
+  (when (and (bound-and-true-p org-auto-scheduler-review-inspector-follow)
+             (derived-mode-p 'org-auto-scheduler-review-mode)
+             (get-buffer-window "*Org Auto Scheduler Task Inspector*" t))
     (let ((id (tabulated-list-get-id)))
       (when (and id (not (org-auto-scheduler--review-special-row-p id))
-                 (assoc id org-auto-scheduler-completed-tasks))
+                 (not (equal id org-auto-scheduler--inspector-last-task-id)))
+        (setq org-auto-scheduler--inspector-last-task-id id)
         (ignore-errors (org-auto-scheduler--render-task-inspector-buffer id t))))))
+
+(defun org-auto-scheduler--review-close-inspector ()
+  "Close the Task Inspector window and buffer when the review buffer is killed."
+  (let ((win (get-buffer-window "*Org Auto Scheduler Task Inspector*" t)))
+    (when (window-live-p win)
+      (ignore-errors (delete-window win))))
+  (let ((buf (get-buffer "*Org Auto Scheduler Task Inspector*")))
+    (when (buffer-live-p buf)
+      (kill-buffer buf))))
 
 ;;; Interactive Project & Sibling Dependency Explorer (`org-auto-scheduler-explore-dependencies')
 
