@@ -2193,7 +2193,8 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                 (task-end-with-gap (time-add task-end (seconds-to-time (* 60 active-gap)))))
            (when (and task-start  ; guard against nil timestamps from bad cache entries
                       task-end
-                      (not (equal task-id ignore-id))
+                      ;; Without IGNORE-ID, (equal nil nil) would skip every event lacking an ID
+                      (not (and ignore-id (equal task-id ignore-id)))
                       (not (and (not is-autosch) is-non-blocking))
                       (or (not is-autosch) (and is-autosch consider-for-conflicts))
                       has-time
@@ -4082,12 +4083,14 @@ Returns the end-time of the last Pomodoro chunk."
     last-end))
 
 (defun org-auto-scheduler-get-min-chunk (marker)
-  "Return the minimum chunk duration in minutes for task at MARKER."
-  (let ((prop (and marker (markerp marker) (marker-buffer marker)
-                   (org-with-point-at marker
-                     (org-entry-get nil org-auto-scheduler-min-chunk-property)))))
-    (if (and prop (string-match-p "^[0-9]+$" (string-trim prop)))
-        (string-to-number (string-trim prop))
+  "Return the minimum chunk duration in minutes for task at MARKER.
+Accepts plain minutes (\"10\") or any Org duration (\"0:10\", \"1h\"), like Effort."
+  (let* ((prop (and marker (markerp marker) (marker-buffer marker)
+                    (org-with-point-at marker
+                      (org-entry-get nil org-auto-scheduler-min-chunk-property))))
+         (minutes (and prop (ignore-errors (org-duration-to-minutes (string-trim prop))))))
+    (if minutes
+        (round minutes)
       org-auto-scheduler-split-min-chunk)))
 
 (defun org-auto-scheduler--available-duration-at (start-time max-needed &optional proposed-tags)
@@ -4707,11 +4710,25 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                                                   (format-time-string "%H:%M" available-time))
                                     (setq split-result (time-add last-end (seconds-to-time (* 60 active-gap))))))
 
-                              ;; Cannot split: advance normally
-                              (let ((prev-day (format-time-string "%Y-%m-%d" available-time))
-                                    (next-cand (if time-block
-                                                   (org-auto-scheduler-next-available-time-in-block occupied-result time-block work-chunk)
-                                                 (org-auto-scheduler-next-available-time occupied-result work-chunk tags))))
+                              ;; Cannot split: advance normally.  Splittable tasks only need a
+                              ;; MIN-CHUNK gap to start, so search from here for the first such gap.
+                              ;; OCCUPIED-RESULT is the end of the *last* conflict in the full-effort
+                              ;; window, so jumping there would skip every gap a split could use.
+                              ;; The time-block search ignores conflicts, so it must still jump past them,
+                              ;; as must a gap search that fails to move forward.
+                              (let* ((prev-day (format-time-string "%Y-%m-%d" available-time))
+                                     (should-seek-split-gap (and is-splittable (not is-pomodoro)))
+                                     (advance-duration (if should-seek-split-gap min-chunk work-chunk))
+                                     (split-gap-time (and should-seek-split-gap
+                                                          (not time-block)
+                                                          (org-auto-scheduler-next-available-time available-time advance-duration tags)))
+                                     (has-split-gap-ahead (and split-gap-time (time-less-p available-time split-gap-time)))
+                                     (next-cand (cond
+                                                 (has-split-gap-ahead split-gap-time)
+                                                 (time-block
+                                                  (org-auto-scheduler-next-available-time-in-block occupied-result time-block advance-duration))
+                                                 (t
+                                                  (org-auto-scheduler-next-available-time occupied-result advance-duration tags)))))
                                 ;; If we rolled onto a new calendar day and task has a soft energy-block, try energy block on that new day
                                 (when (and next-cand energy-block
                                            (not (string= prev-day (format-time-string "%Y-%m-%d" next-cand))))
