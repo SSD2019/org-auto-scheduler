@@ -15,6 +15,9 @@
 (require 'cl-lib)
 (require 'tabulated-list)
 (require 'color)
+
+(declare-function org-auto-scheduler--score-signature "org-auto-scheduler")
+(declare-function org-auto-scheduler--score-signature-changed-p "org-auto-scheduler")
 (eval-when-compile (require 'evil nil t))
 
 (declare-function org-auto-scheduler--call-with-caldav-session "org-auto-scheduler" (fn))
@@ -194,7 +197,9 @@ the ordering, skipping, and target-date decisions for subsequent runs."
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-review-order-on-score-change 'reset-task
-  "How saved review ordering behaves when a task's base score changes.
+  "How saved review ordering behaves when a task's score inputs change.
+Score inputs are priority, effort weight, TODO state, tags/category and the
+DEADLINE date; the daily growth of deadline urgency does not count.
 Values can be:
   `reset-task' - Clear saved `:order' only for the task(s) whose score changed,
                  re-ranking them by their new score while preserving relative
@@ -567,7 +572,7 @@ the task's Org properties."
                                        (let ((p (org-entry-get nil "PINNED")))
                                          (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p))))
                  (is-new (plist-get entry :is-new))
-                 (saved-score (plist-get entry :saved-score))
+                 (saved-sig (plist-get entry :saved-sig))
                  (reranked-from (plist-get entry :reranked-from))
                  (order (cond ((or is-new reranked-from org-auto-scheduler--reranked-tasks
                                    (and entry (null (plist-get entry :order))))
@@ -590,7 +595,7 @@ the task's Org properties."
                  (pinned-time (or prop-pinned-time (plist-get entry :pinned-time))))
             (list :order order :skipped skipped :target-date target-date
                   :freeset freeset :pinnable freeset :pinned pinned :pinned-time pinned-time
-                  :is-new is-new :saved-score saved-score :reranked-from reranked-from)))
+                  :is-new is-new :saved-sig saved-sig :reranked-from reranked-from)))
       entry)))
 
 (defun org-auto-scheduler-review-save-decisions (&optional silent)
@@ -629,8 +634,8 @@ When SILENT is non-nil, suppress confirmation message."
                  (freeset (or (plist-get override :freeset) (plist-get override :pinnable)))
                  (pinned (plist-get override :pinned))
                  (pinned-time (plist-get override :pinned-time))
-                 (live-score (and marker (markerp marker) (marker-buffer marker)
-                                  (car (org-auto-scheduler-calculate-score marker))))
+                 (live-sig (and marker (markerp marker) (marker-buffer marker)
+                                (org-auto-scheduler--score-signature marker)))
                  (decision (list :order order-rank
                                  :skipped skipped
                                  :target-date target-date
@@ -640,7 +645,7 @@ When SILENT is non-nil, suppress confirmation message."
                                  :pinned-time pinned-time
                                  :headline (or headline "task")
                                  :is-new nil
-                                 :saved-score (or live-score (and prev-dec (plist-get prev-dec :saved-score)))
+                                 :saved-sig (or live-sig (and prev-dec (plist-get prev-dec :saved-sig)))
                                  :reranked-from nil
                                  :updated-at (current-time))))
             (setq saved-count (1+ saved-count))
@@ -813,6 +818,7 @@ Returns a plist (:pruned N :new N :kept N)."
                              :headline headline
                              :todo todo
                              :score (or score 0.0)
+                             :sig (org-auto-scheduler--score-signature m)
                              :project proj
                              :parent parent-node
                              :position pos
@@ -834,28 +840,31 @@ Returns a plist (:pruned N :new N :kept N)."
             (setq pruned-count (1+ pruned-count)))))
       (setq org-auto-scheduler--saved-review-decisions (nreverse remaining)))
 
-    ;; 2.5 Check for base score changes on tasks with saved review ordering
+    ;; 2.5 Check for edit-driven score changes on tasks with saved review ordering.
+    ;; Uses a drift-free signature (see `org-auto-scheduler--score-signature') so the
+    ;; daily deadline-urgency growth does not invalidate manual ordering.
     (let ((reranked-ids (make-hash-table :test 'equal))
           (any-score-changed nil))
       (dolist (entry org-auto-scheduler--saved-review-decisions)
         (let* ((tid (car entry))
                (dec (cdr entry))
                (info (gethash tid live-map))
-               (live-score (and info (plist-get info :score)))
-               (saved-score (plist-get dec :saved-score))
+               (live-sig (and info (plist-get info :sig)))
+               (saved-sig (plist-get dec :saved-sig))
                (prev-reranked (plist-get dec :reranked-from))
                (has-saved-order (and (not (plist-get dec :is-new))
                                      (or (plist-get dec :order) prev-reranked))))
-          (when (and info live-score has-saved-order)
+          (when (and info live-sig has-saved-order)
             (cond
-             ((or (and prev-reranked (numberp prev-reranked)
-                       (> (abs (- live-score prev-reranked)) 0.001))
-                  (and saved-score (numberp saved-score)
-                       (> (abs (- live-score saved-score)) 0.001)))
-              (let ((old-score (or prev-reranked saved-score)))
+             ;; No signature recorded yet (older state file): record it silently.
+             ((null saved-sig)
+              (setcdr entry (plist-put dec :saved-sig live-sig)))
+             ((org-auto-scheduler--score-signature-changed-p saved-sig live-sig)
+              (let ((old-score (car saved-sig))
+                    (new-score (car live-sig)))
                 (pcase org-auto-scheduler-review-order-on-score-change
                   ('keep
-                   (setcdr entry (plist-put dec :saved-score live-score)))
+                   (setcdr entry (plist-put dec :saved-sig live-sig)))
                   ((or 'reset-task 'reset-all)
                    (setq any-score-changed t)
                    (puthash tid t reranked-ids)
@@ -863,14 +872,12 @@ Returns a plist (:pruned N :new N :kept N)."
                                :task-id tid
                                :headline (or (plist-get info :headline) (plist-get dec :headline) "Task")
                                :old-score old-score
-                               :new-score live-score)
+                               :new-score new-score)
                          org-auto-scheduler--reranked-tasks)
                    (setq dec (plist-put dec :order nil))
                    (setq dec (plist-put dec :reranked-from old-score))
-                   (setq dec (plist-put dec :saved-score live-score))
-                   (setcdr entry dec)))))
-             ((null saved-score)
-              (setcdr entry (plist-put dec :saved-score live-score)))))))
+                   (setq dec (plist-put dec :saved-sig live-sig))
+                   (setcdr entry dec)))))))))
       (setq org-auto-scheduler--reranked-tasks (nreverse org-auto-scheduler--reranked-tasks))
       (when (and any-score-changed
                  (eq org-auto-scheduler-review-order-on-score-change 'reset-all))
@@ -883,6 +890,7 @@ Returns a plist (:pruned N :new N :kept N)."
       ;; 3. Identify new tasks (tasks without a saved :order) and separate reranked tasks
       (let ((new-task-infos '())
             (reranked-infos '())
+            (score-slot-new-infos '())
             (parent-groups (make-hash-table :test 'equal)))
         (maphash (lambda (_tid info)
                    (let* ((tid (plist-get info :id))
@@ -895,15 +903,22 @@ Returns a plist (:pruned N :new N :kept N)."
                        (setq info (plist-put info :order (float order))))
                       ((gethash tid reranked-ids)
                        (push info reranked-infos))
+                      ;; New task in a parallel (non-sequential) group: slot it by score so an
+                      ;; urgent new task is not buried behind older, lower-priority tasks.
+                      ((not (org-auto-scheduler--siblings-sequential-p
+                             (plist-get info :parent) (plist-get info :project)))
+                       (push info score-slot-new-infos))
+                      ;; New task in a sequential group: keep outline (sibling) anchoring.
                       (t
                        (push info new-task-infos)))
                      (puthash parent (cons info (gethash parent parent-groups)) parent-groups)))
                  live-map)
 
-        ;; 3.5 Re-slot score-changed (reranked) tasks by their new live score
-        (when reranked-infos
+        ;; 3.5 Re-slot score-changed (reranked) tasks, and new tasks of parallel groups,
+        ;; by their live score: each goes before the first ranked task with a lower score.
+        (when (or reranked-infos score-slot-new-infos)
           (setq reranked-infos
-                (sort reranked-infos
+                (sort (append reranked-infos score-slot-new-infos)
                       (lambda (a b)
                         (let ((sa (plist-get a :score))
                               (sb (plist-get b :score)))
@@ -941,7 +956,8 @@ Returns a plist (:pruned N :new N :kept N)."
                   (setq max-rank new-ord))
                 (setq r-info (plist-put r-info :order new-ord))
                 (plist-put (gethash r-tid live-map) :order new-ord)
-                (when (and (not (bound-and-true-p org-auto-scheduler--preview-mode))
+                (when (and (gethash r-tid reranked-ids)
+                           (not (bound-and-true-p org-auto-scheduler--preview-mode))
                            (memq org-auto-scheduler-review-persistence-backend '(org-properties both)))
                   (let ((m (plist-get r-info :marker)))
                     (when (and m (markerp m) (marker-buffer m))
@@ -1032,8 +1048,8 @@ Returns a plist (:pruned N :new N :kept N)."
                                                      (plist-get existing-dec :pinnable))))
                           (pinned (and existing (plist-get existing-dec :pinned)))
                           (pinned-time (and existing (plist-get existing-dec :pinned-time)))
-                          (saved-score (or (and existing (plist-get existing-dec :saved-score))
-                                           (plist-get info :score)))
+                          (saved-sig (or (and existing (plist-get existing-dec :saved-sig))
+                                         (plist-get info :sig)))
                           (reranked-from (and existing (plist-get existing-dec :reranked-from)))
                           (decision (list :order (or order (setq max-rank (+ max-rank 100.0)))
                                           :skipped skipped
@@ -1044,7 +1060,7 @@ Returns a plist (:pruned N :new N :kept N)."
                                           :pinned-time pinned-time
                                           :headline (plist-get info :headline)
                                           :is-new is-new
-                                          :saved-score saved-score
+                                          :saved-sig saved-sig
                                           :reranked-from reranked-from
                                           :updated-at (current-time))))
                      (if existing
