@@ -299,7 +299,7 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
               (when (and mtime-snapshot
                          (org-auto-scheduler--acquire-or-refresh-host-lease))
                 ;; On first background run of the day, optionally reschedule uncompleted past tasks
-                (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-past-tasks)
+                (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-yesterday-tasks-once)
                            is-first-run-of-day
                            (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
                   (setq resched-past-count
@@ -585,7 +585,19 @@ Returns a list of change plists."
             (when (plist-get m-res :independent)
               (push "Marked independent (-i-)" marker-actions))
             (when (plist-get m-res :remove-independent)
-              (push "Removed independent status (-\i-)" marker-actions)))
+              (push "Removed independent status (-\i-)" marker-actions))
+            (when (plist-get m-res :clockin)
+              (push (format "Clocked in (-ci-) at %s" (plist-get m-res :clockin)) marker-actions))
+            (when (plist-get m-res :clockout)
+              (push (format "Clocked out (-co-) at %s" (plist-get m-res :clockout)) marker-actions)))
+          (when (bound-and-true-p org-auto-scheduler--reranked-tasks)
+            (let ((rr (cl-find-if (lambda (r) (equal (plist-get r :id) tid))
+                                  org-auto-scheduler--reranked-tasks)))
+              (when rr
+                (push (format "Reset saved review order (score %.1f -> %.1f)"
+                              (plist-get rr :old-score)
+                              (plist-get rr :new-score))
+                      marker-actions))))
           ;; If anything changed (schedule, markers, split), record it
           (when (or sched-changed marker-actions split-today)
             (push (list :task-id tid
@@ -631,6 +643,10 @@ Returns a list of change plists."
                (push "Marked independent (-i-)" marker-actions))
              (when (plist-get m-res :remove-independent)
                (push "Removed independent status (-\i-)" marker-actions))
+             (when (plist-get m-res :clockin)
+               (push (format "Clocked in (-ci-) at %s" (plist-get m-res :clockin)) marker-actions))
+             (when (plist-get m-res :clockout)
+               (push (format "Clocked out (-co-) at %s" (plist-get m-res :clockout)) marker-actions))
              (when marker-actions
                (push (list :task-id tid
                            :headline (or (plist-get m-res :title) orig-hd "Task")

@@ -664,13 +664,21 @@ Older entries beyond this limit are pruned to prevent unbounded growth."
   :type 'boolean
   :group 'org-auto-scheduler)
 
-(defcustom org-auto-scheduler-background-reschedule-past-tasks nil
-  "When non-nil, automatically reschedule uncompleted TODO-state AUTOSCH tasks of previous days to today on the first background run of the day."
+(defcustom org-auto-scheduler-background-reschedule-yesterday-tasks-once nil
+  "When non-nil, automatically reschedule uncompleted TODO-state AUTOSCH tasks
+from previous days to today once on the first background run of the day."
   :type 'boolean
   :group 'org-auto-scheduler)
 
-(defvaralias 'org-auto-scheduler-background-reschedule-past-tasks-first-run
-  'org-auto-scheduler-background-reschedule-past-tasks)
+(defvaralias 'org-auto-scheduler-background-reschedule-past-tasks
+  'org-auto-scheduler-background-reschedule-yesterday-tasks-once)
+
+;; Remove legacy/aliased variable names from Customize group so `M-x customize-group'
+;; only displays `org-auto-scheduler-background-reschedule-yesterday-tasks-once'.
+(dolist (old-sym '(org-auto-scheduler-background-reschedule-past-tasks
+                   org-auto-scheduler-background-reschedule-past-tasks-first-run))
+  (put 'org-auto-scheduler 'custom-group
+       (assq-delete-all old-sym (get 'org-auto-scheduler 'custom-group))))
 
 (defvar org-auto-scheduler--last-background-run-date nil
   "Date string (YYYY-MM-DD) of the most recent background scheduler run.")
@@ -700,6 +708,57 @@ rescheduling is triggered by a title marker (such as -r- or -r-all-)."
   :type 'boolean
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-background-preserve-today-mode 'all
+  "Which of today's scheduled tasks to keep in place on background scheduling runs.
+When `org-auto-scheduler-preserve-today-scheduled' is nil, this has no effect
+\(all of today's tasks are replanned from scratch).
+`all'          Keep all of today's scheduled tasks in their slots unless
+               displaced by a new task, calendar conflict, or title marker
+               (safe for mobile/CalDAV users who do not clock in on every task).
+`clocked-only' Keep only the clocked-in task, pinned tasks, and overdue tasks
+               still within `org-auto-scheduler-background-lapse-grace-minutes'; re-plan
+               all other today tasks by score whenever task scores/priorities
+               change, a task lapses past the grace period, or a calendar
+               conflict occurs."
+  :type '(choice (const :tag "All of today's scheduled tasks" all)
+                 (const :tag "Only clocked-in and pinned tasks" clocked-only))
+  :group 'org-auto-scheduler)
+
+(defvaralias 'org-auto-scheduler-preserve-today-mode
+  'org-auto-scheduler-background-preserve-today-mode)
+
+(defcustom org-auto-scheduler-background-lapse-grace-minutes 30
+  "Minutes before an unclocked task scheduled for today counts as lapsed
+when `org-auto-scheduler-background-preserve-today-mode' is `clocked-only'."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defvaralias 'org-auto-scheduler-lapse-grace-minutes
+  'org-auto-scheduler-background-lapse-grace-minutes)
+
+(defcustom org-auto-scheduler-background-lapse-reference 'start-or-end
+  "Reference point for `org-auto-scheduler-background-lapse-grace-minutes' in `clocked-only' mode.
+`start-or-end' Lapse at min(start + grace, end) — a task lapses after the grace
+               period from its start OR as soon as its scheduled slot ends,
+               whichever comes first (default).
+`start'        Lapse when now > start + grace (strict clock-in workflow).
+`end'          Lapse when now > end + grace (lenient unclocked workflow)."
+  :type '(choice (const :tag "Earlier of (start + grace) or slot end" start-or-end)
+                 (const :tag "After scheduled start time + grace" start)
+                 (const :tag "After scheduled end time + grace" end))
+  :group 'org-auto-scheduler)
+
+(defvaralias 'org-auto-scheduler-lapse-reference
+  'org-auto-scheduler-background-lapse-reference)
+
+(defvar org-auto-scheduler--last-task-fingerprints nil
+  "Hash table mapping task-id to its scheduling input fingerprint from the last run.
+Used in `clocked-only' mode to detect score/property edits without false-positive
+intraday drift from CPM float or gap backfilling.")
+
+(defvar org-auto-scheduler--backfilled-task-slots nil
+  "Hash table mapping task-id to the SCHEDULED string where it was backfilled.")
+
 (defcustom org-auto-scheduler-preserve-future-scheduled t
   "When non-nil, tasks already scheduled for future days with a specific time
 are preserved during scheduling runs, unless rescheduling is triggered by a
@@ -711,19 +770,21 @@ title marker (such as -r- or -r-all-) or `force-replan'."
   "When non-nil, manual runs reschedule uncompleted tasks whose slot has elapsed.
 This also covers the currently clocked task (scheduled for its remaining effort,
 starting after the running clock) and pinned tasks (their pinned time is moved
-to the new slot).  Background runs never do this automatically; they only
-replan today's upcoming tasks when a new overlap or unscheduled task appears."
+to the new slot).  Background runs never do this automatically unless
+`org-auto-scheduler-background-preserve-today-mode' is `clocked-only'."
   :type 'boolean
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-title-marker-regex
-  (let ((token "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciwRSFPXCIW]\\)"))
+  (let* ((clk-time "\\(?:[0-9]\\{1,2\\}\\(?::[0-9]\\{2\\}\\)?\\(?:am\\|pm\\|AM\\|PM\\)?\\)?")
+         (clk-tok (format "\\(?:clockin\\|CLOCKIN\\|clockout\\|CLOCKOUT\\|ci\\|CI\\|co\\|CO\\)%s" clk-time))
+         (token (concat "\\(?:" clk-tok "\\|r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciwRSFPXCIW]\\)")))
     (format "\\(?:(\\s-*\\)?-\\(%s\\(?:-?%s\\)*\\)-\\(?:\\s-*)\\)?" token token))
   "Regular expression matching title markers for task scheduling modifiers.
 Matches patterns like (-r-), -r-, (-s-), (-f-), (-p-), (-\\s-), (-\\f-), (-\\p-), (-rsf-),
 (-rp-), (-r\\p-), (-r-all-), (-x-), (-done-), (-kill-), (-drop-), (-c-), (-e30m-), (-e1h-),
 (-e1:30-), (-+1d-), (-defer-), (-#A-), (-#a-), (-#B-), (-pri-a-), (-!a-), (-i-), (-indep-),
-(-\\i-), (-\\indep-), etc."
+(-\\i-), (-\\indep-), (-ci-), (-ci10:15am-), (-co-), (-co2:30pm-), etc."
   :type 'string
   :group 'org-auto-scheduler)
 
@@ -1616,8 +1677,6 @@ Checks parent node properties (:ORDERED:, :PARALLEL:), tags (:PARALLEL:), then p
      ;; 0. Saved review order (explicit user sequence decisions)
      ((and order-a order-b (not (= order-a order-b)))
       (< order-a order-b))
-     ((and order-a (null order-b)) t)
-     ((and (null order-a) order-b) nil)
 
      ;; 1. Explicit project priority
      ((not (= project-priority-a project-priority-b))
@@ -1996,8 +2055,6 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
                                     (cond
                                      ((and order-a order-b (not (= order-a order-b)))
                                       (< order-a order-b))
-                                     (order-a t)
-                                     (order-b nil)
                                      (t (< (cdr (nth 4 a)) (cdr (nth 4 b))))))))))
                      (let ((prev-id nil))
                        (dolist (info sorted-group)
@@ -2420,16 +2477,47 @@ If POM is nil, use the current point."
              (t base))))
       (format-time-string "%Y-%m-%d" base))))
 
+(defun org-auto-scheduler--parse-clock-marker-time (time-str &optional base-time)
+  "Parse a clock marker time string TIME-STR into an Emacs time on BASE-TIME's date.
+Supports 24-hour (`14:30', `09:05'), 12-hour with minutes (`10:15am', `10:15pm',
+`12:30pm', `12:00am'), and 12-hour hour-only (`2pm', `9am').
+Returns nil if TIME-STR is nil or empty."
+  (when (and (stringp time-str) (not (string-empty-p time-str)))
+    (let ((s (downcase (string-trim time-str))))
+      (when (string-match "^\\([0-9]\\{1,2\\}\\)\\(?::\\([0-9]\\{2\\}\\)\\)?\\(am\\|pm\\)?$" s)
+        (let* ((raw-hour (string-to-number (match-string 1 s)))
+               (minute (if (match-string 2 s) (string-to-number (match-string 2 s)) 0))
+               (ampm (match-string 3 s))
+               (hour (cond
+                      ((null ampm) raw-hour)
+                      ((string= ampm "am") (if (= raw-hour 12) 0 raw-hour))
+                      ((string= ampm "pm") (if (= raw-hour 12) 12 (+ raw-hour 12)))
+                      (t raw-hour)))
+               (decoded (decode-time (or base-time (current-time)))))
+          (when (and (>= hour 0) (< hour 24) (>= minute 0) (< minute 60))
+            (encode-time 0 minute hour
+                         (nth 3 decoded) (nth 4 decoded) (nth 5 decoded))))))))
+
+(defun org-auto-scheduler--format-clock-line (start-time end-time)
+  "Format an Org LOGBOOK CLOCK line for interval [START-TIME, END-TIME]."
+  (let* ((dur-mins (max 0 (floor (/ (float-time (time-subtract end-time start-time)) 60))))
+         (h (/ dur-mins 60))
+         (m (% dur-mins 60)))
+    (format "CLOCK: [%s]--[%s] => %2d:%02d"
+            (format-time-string "%Y-%m-%d %a %H:%M" start-time)
+            (format-time-string "%Y-%m-%d %a %H:%M" end-time)
+            h m)))
+
 (defun org-auto-scheduler--process-title-markers (marker)
   "Process title markers (e.g. -r-, -s-, -f-, -p-, -\\s-, -\\f-, -\\p-, -rsf-, -r-all-,
 -x-, -done-, -kill-, -drop-, -c-, -e30m-, -e1h-, -+1d-, -defer-, -#A-, -#B-, -#C-,
--pri-a-, -!a-, -i-, -indep-, -\\i-, -\\indep-) at MARKER.
+-pri-a-, -!a-, -i-, -indep-, -\\i-, -\\indep-, -ci-, -clockin-, -co-, -clockout-) at MARKER.
 Strips markers from the headline, sets or deletes SPLITTABLE/FREESET/PINNED/INDEPENDENT properties
-and tags, updates priority and TODO state and Effort, and returns a plist:
+and tags, updates priority and TODO state and Effort, processes clock-in/clock-out, and returns a plist:
 (:reschedule BOOL :reschedule-all BOOL :splittable BOOL :freeset BOOL :pinned BOOL
  :remove-splittable BOOL :remove-freeset BOOL :remove-pinned BOOL
  :done BOOL :kill BOOL :defer BOOL :effort INT :priority STR :remove-priority BOOL
- :independent BOOL :remove-independent BOOL :title STR)"
+ :independent BOOL :remove-independent BOOL :clockin STR :clockout STR :title STR)"
   (when (and marker (markerp marker) (marker-buffer marker))
     (org-with-point-at marker
       (let* ((heading (org-get-heading t t t t))
@@ -2442,6 +2530,11 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
               (setq pos (match-end 0)))
             (let* ((match-grp (mapconcat #'identity (nreverse all-grps) " "))
                    (task-id (or (org-id-get) (when (buffer-file-name) (org-id-get-create))))
+                   (old-score (car (org-auto-scheduler-calculate-score marker)))
+                   (has-clockin (string-match "\\(?:^\\|[^a-z]\\)\\(?:clockin\\|ci\\)\\([0-9]\\{1,2\\}\\(?::[0-9]\\{2\\}\\)?\\(?:am\\|pm\\)?\\)?" match-grp))
+                   (clockin-time-str (and has-clockin (match-string 1 match-grp)))
+                   (has-clockout (string-match "\\(?:^\\|[^a-z]\\)\\(?:clockout\\|co\\)\\([0-9]\\{1,2\\}\\(?::[0-9]\\{2\\}\\)?\\(?:am\\|pm\\)?\\)?" match-grp))
+                   (clockout-time-str (and has-clockout (match-string 1 match-grp)))
                    (is-r-all (string-match-p "r-all" match-grp))
                    (is-defer (and (not (string-match-p "\\(?:w\\|wait\\)\\+" match-grp))
                                   (or (string-match-p "\\+[0-9]+d" match-grp)
@@ -2461,7 +2554,8 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                    (is-pri-off (or (string-match-p "\\\\#" match-grp)
                                    (string-match-p "pri-none" match-grp)
                                    (string-match-p "\\\\!" match-grp)))
-                   (regex-strip "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\)")
+                   (clk-strip "\\(?:clockin\\|clockout\\|ci\\|co\\)\\(?:[0-9]\\{1,2\\}\\(?::[0-9]\\{2\\}\\)?\\(?:am\\|pm\\)?\\)?")
+                   (regex-strip (concat "\\(?:" clk-strip "\\|r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\)"))
                    (clean-match (replace-regexp-in-string regex-strip "" match-grp))
                    (is-wait (or (string-match-p "wait" match-grp)
                                 (not (null wait-dur-str))
@@ -2493,9 +2587,85 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                                    is-wait))
                    (cleaned-title (string-trim (replace-regexp-in-string
                                                 "[ \t]+" " "
-                                                (replace-regexp-in-string regex "" heading)))))
+                                                (replace-regexp-in-string regex "" heading))))
+                   (clockin-desc nil)
+                   (clockout-desc nil))
+              ;; Seed :saved-score on existing non-new review decision if not yet recorded
+              (when (and task-id (boundp 'org-auto-scheduler--saved-review-decisions))
+                (let ((existing (assoc task-id org-auto-scheduler--saved-review-decisions)))
+                  (when (and existing
+                             (not (plist-get (cdr existing) :is-new))
+                             (null (plist-get (cdr existing) :saved-score)))
+                    (setcdr existing (plist-put (cdr existing) :saved-score old-score)))))
+
               ;; Update headline in buffer
               (org-edit-headline cleaned-title)
+
+              ;; Process clock-in / clock-out markers before TODO/SCHEDULED changes
+              (when (or has-clockin has-clockout)
+                (require 'org-clock)
+                (let* ((now (current-time))
+                       (cur-sched-str (org-entry-get nil "SCHEDULED"))
+                       (has-sched-time (and cur-sched-str (string-match-p "[0-9]\\{2\\}:[0-9]\\{2\\}" cur-sched-str)))
+                       (sched-start (and has-sched-time (org-time-string-to-time cur-sched-str)))
+                       (sched-end (and has-sched-time (org-auto-scheduler-calculate-task-end-time (point))))
+                       (base-date-time (or sched-start now)))
+                  (cond
+                   ;; Both -ci- and -co- on the same heading: log a closed CLOCK interval
+                   ((and has-clockin has-clockout)
+                    (let* ((ci-t (or (org-auto-scheduler--parse-clock-marker-time clockin-time-str base-date-time)
+                                     sched-start
+                                     now))
+                           (co-t (or (org-auto-scheduler--parse-clock-marker-time clockout-time-str base-date-time)
+                                     sched-end
+                                     now)))
+                      (when (time-less-p ci-t co-t)
+                        (org-auto-scheduler--insert-clock-entries
+                         (list (org-auto-scheduler--format-clock-line ci-t co-t)))
+                        (setq clockin-desc (format-time-string "%H:%M" ci-t))
+                        (setq clockout-desc (format-time-string "%H:%M" co-t)))))
+                   ;; Only -ci-: start running clock on this task
+                   (has-clockin
+                    (let* ((ci-t (or (org-auto-scheduler--parse-clock-marker-time clockin-time-str now)
+                                     (if (and sched-start sched-end
+                                              (not (time-less-p now sched-start))
+                                              (time-less-p now sched-end))
+                                         sched-start
+                                       now)))
+                           (org-clock-in-resume nil)
+                           (org-clock-auto-clock-resolution nil))
+                      (org-clock-in nil ci-t)
+                      (setq clockin-desc (format-time-string "%H:%M" ci-t))))
+                   ;; Only -co-: clock out if active, or log retroactive CLOCK interval
+                   (has-clockout
+                    (if (org-auto-scheduler--task-clocked-p marker)
+                        (let* ((co-t (or (org-auto-scheduler--parse-clock-marker-time clockout-time-str now)
+                                         now))
+                               (org-clock-out-remove-zero-time-clocks nil)
+                               (org-log-note-clock-out nil))
+                          (org-clock-out nil t co-t)
+                          (setq clockout-desc (format-time-string "%H:%M" co-t)))
+                      (let* ((co-t (or (org-auto-scheduler--parse-clock-marker-time clockout-time-str base-date-time)
+                                       (if (and sched-start sched-end
+                                                (time-less-p sched-start now)
+                                                (time-less-p now sched-end))
+                                           now
+                                         (or sched-end now))))
+                             (eff-mins (or effort-minutes (org-auto-scheduler-get-effort marker) 30))
+                             (ci-t (or sched-start
+                                       (time-subtract co-t (seconds-to-time (* 60 eff-mins))))))
+                        (when (time-less-p ci-t co-t)
+                          (org-auto-scheduler--insert-clock-entries
+                           (list (org-auto-scheduler--format-clock-line ci-t co-t)))
+                          (setq clockout-desc (format-time-string "%H:%M" co-t)))))))))
+
+              ;; Ensure existing saved review decision has its pre-marker :saved-score recorded
+              (when (and task-id old-score
+                         (or priority-char is-pri-off effort-minutes)
+                         (boundp 'org-auto-scheduler--saved-review-decisions))
+                (let ((entry (assoc task-id org-auto-scheduler--saved-review-decisions)))
+                  (when (and entry (null (plist-get (cdr entry) :saved-score)))
+                    (setcdr entry (plist-put (cdr entry) :saved-score old-score)))))
 
               ;; Update priority if specified
               (cond
@@ -2621,6 +2791,8 @@ and tags, updates priority and TODO state and Effort, and returns a plist:
                     :remove-priority (and is-pri-off t)
                     :independent (and is-indep-on t)
                     :remove-independent (and is-indep-off t)
+                    :clockin clockin-desc
+                    :clockout clockout-desc
                     :title cleaned-title))))))))
 
 (defun org-auto-scheduler--task-scheduled-time (marker &optional min-date-str)
@@ -2701,6 +2873,148 @@ is for today or in the past without a specific time (HH:MM)."
                        (match-string 1 sched))))
         (or (null date)
             (not (string> date today-str))))))))
+
+(defun org-auto-scheduler--task-lapsed-p (start-time end-time now &optional marker)
+  "Return non-nil if an unclocked task with slot [START-TIME, END-TIME] has lapsed at NOW.
+Uses `org-auto-scheduler-background-lapse-grace-minutes' (default 30) and
+`org-auto-scheduler-background-lapse-reference' (default `start-or-end').
+When MARKER is provided and the task has prior clocked time, effective slot end
+is capped at START-TIME + remaining effort."
+  (when (and start-time end-time)
+    (let* ((grace-secs (* 60 (max 0 (or org-auto-scheduler-background-lapse-grace-minutes 30))))
+           (start-plus-grace (time-add start-time (seconds-to-time grace-secs)))
+           (eff-end
+            (if (and marker (markerp marker) (marker-buffer marker))
+                (let* ((tot-eff (or (org-auto-scheduler-get-effort marker) 60))
+                       (clk (org-auto-scheduler-get-clocked-time marker)))
+                  (if (> clk 0)
+                      (let ((rem-end (time-add start-time (seconds-to-time (* 60 (max 10 (- tot-eff clk)))))))
+                        (if (time-less-p rem-end end-time) rem-end end-time))
+                    end-time))
+              end-time))
+           (threshold
+            (pcase org-auto-scheduler-background-lapse-reference
+              ('start start-plus-grace)
+              ('end (time-add eff-end (seconds-to-time grace-secs)))
+              (_ ; 'start-or-end (default)
+               (if (time-less-p eff-end start-plus-grace)
+                   eff-end
+                 start-plus-grace)))))
+      (time-less-p threshold now))))
+
+(defun org-auto-scheduler--task-info-base-score (ti)
+  "Extract the drift-free base score from task-info tuple TI in O(1) without buffer visits."
+  (let* ((tid (nth 5 ti))
+         (score (or (nth 1 ti) 0.0)))
+    (if (and tid
+             org-auto-scheduler-critical-path-enabled
+             (hash-table-p org-auto-scheduler--critical-tasks)
+             (gethash tid org-auto-scheduler--critical-tasks))
+        (- score org-auto-scheduler-critical-path-boost)
+      score)))
+
+(defun org-auto-scheduler--compute-task-fingerprints (sorted-tasks-info)
+  "Compute a hash table mapping task-id to its scheduling input fingerprint.
+Operates purely on in-memory SORTED-TASKS-INFO tuples (zero buffer visits),
+using base score (excluding intraday CPM float boost) so time passing during
+the day does not cause false-positive fingerprint changes."
+  (let ((fp (make-hash-table :test 'equal)))
+    (dolist (ti sorted-tasks-info)
+      (let* ((tid (nth 5 ti))
+             (base-score (org-auto-scheduler--task-info-base-score ti))
+             (score-comps (nth 13 ti))
+             (todo (and (listp score-comps) (nth 10 score-comps)))
+             (tags (sort (copy-sequence (or (nth 7 ti) '())) #'string<))
+             (nb (and (nth 10 ti) (float-time (nth 10 ti))))
+             (dec (and tid (boundp 'org-auto-scheduler--saved-review-decisions)
+                       (cdr (assoc tid org-auto-scheduler--saved-review-decisions))))
+             (saved-ord (and dec (plist-get dec :order)))
+             (preds (and tid (hash-table-p org-auto-scheduler--last-preds-map)
+                         (sort (copy-sequence (gethash tid org-auto-scheduler--last-preds-map)) #'string<))))
+        (when tid
+          (puthash tid
+                   (list :base-score (round (* (or base-score 0.0) 1000))
+                         :effort (nth 12 ti)
+                         :todo todo
+                         :tags tags
+                         :not-before nb
+                         :project-id (nth 2 ti)
+                         :project-priority (nth 3 ti)
+                         :is-independent (nth 15 ti)
+                         :saved-order saved-ord
+                         :preds preds)
+                   fp))))
+    fp))
+
+(defun org-auto-scheduler--fingerprints-changed-p (new-fp old-fp)
+  "Return non-nil if NEW-FP differs from OLD-FP."
+  (when (and (hash-table-p new-fp) (hash-table-p old-fp))
+    (or (not (= (hash-table-count new-fp) (hash-table-count old-fp)))
+        (let ((diff nil))
+          (maphash (lambda (tid val)
+                     (unless diff
+                       (unless (equal val (gethash tid old-fp))
+                         (setq diff t))))
+                   new-fp)
+          diff))))
+
+(defun org-auto-scheduler--today-schedule-out-of-order-p (today-scheduled sorted-tasks-info)
+  "Return non-nil if unconstrained, unpinned, unclocked today tasks in TODAY-SCHEDULED
+are out of order relative to SORTED-TASKS-INFO.
+Excludes tasks with hard time blocks, soft energy blocks, NOT_BEFORE constraints,
+or tasks that were placed earlier via Free-Interval Gap Backfilling."
+  (let ((rank-map (make-hash-table :test 'equal))
+        (base-score-map (make-hash-table :test 'equal))
+        (idx 0)
+        (eligible '())
+        (out-of-order nil))
+    (dolist (ti sorted-tasks-info)
+      (let* ((tid (nth 5 ti))
+             (bs (org-auto-scheduler--task-info-base-score ti)))
+        (when tid
+          (puthash tid idx rank-map)
+          (puthash tid (or bs 0.0) base-score-map)
+          (setq idx (1+ idx)))))
+    (dolist (e today-scheduled)
+      (let* ((tid (plist-get e :task-id))
+             (m (plist-get e :marker))
+             (ti (plist-get e :task-info))
+             (is-today (plist-get e :is-today))
+             (is-pin (plist-get e :pinned))
+             (is-clocked (plist-get e :clocked))
+             (has-tb (and ti (nth 11 ti)))
+             (has-nb (and ti (nth 10 ti)))
+             (has-eb (and m (markerp m) (marker-buffer m)
+                          (org-auto-scheduler-get-task-energy-block m)))
+             (cur-sched (and m (markerp m) (marker-buffer m)
+                             (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
+             (bf-sched (and tid (hash-table-p org-auto-scheduler--backfilled-task-slots)
+                            (gethash tid org-auto-scheduler--backfilled-task-slots)))
+             (is-backfilled (and bf-sched cur-sched
+                                 (org-auto-scheduler--timestamps-equal-p bf-sched cur-sched))))
+        (when (and is-today (not is-pin) (not is-clocked)
+                   (not has-tb) (not has-nb) (not has-eb)
+                   (not is-backfilled))
+          (push e eligible))))
+    (setq eligible (nreverse eligible))
+    (while (and (cdr eligible) (not out-of-order))
+      (let* ((e-prev (car eligible))
+             (tid-prev (plist-get e-prev :task-id))
+             (r-prev (gethash tid-prev rank-map))
+             (s-prev (gethash tid-prev base-score-map 0.0))
+             (preds-prev (and (hash-table-p org-auto-scheduler--last-preds-map)
+                              (gethash tid-prev org-auto-scheduler--last-preds-map))))
+        (dolist (e-curr (cdr eligible))
+          (unless out-of-order
+            (let* ((tid-curr (plist-get e-curr :task-id))
+                   (r-curr (gethash tid-curr rank-map))
+                   (s-curr (gethash tid-curr base-score-map 0.0)))
+              (when (and r-prev r-curr (> r-prev r-curr)
+                         (or (>= (abs (- s-prev s-curr)) 0.001)
+                             (member tid-curr preds-prev)))
+                (setq out-of-order t))))))
+      (setq eligible (cdr eligible)))
+    out-of-order))
 
 (defun org-auto-scheduler-get-start-time ()
   "Get the starting time for scheduling tasks.
@@ -2804,13 +3118,17 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                  (today-str (format-time-string "%Y-%m-%d" now))
                  (preserve-today (and org-auto-scheduler-preserve-today-scheduled
                                       (not force-replan)))
+                 (clocked-only-mode (and preserve-today
+                                         (eq org-auto-scheduler-background-preserve-today-mode 'clocked-only)))
                  (today-scheduled '()) ; list of entries for today
                  (tasks-to-schedule '()) ; tasks that need scheduling slots
                  ;; Manual runs (not the background daemon) replan lapsed/clocked tasks
                  (replan-lapsed (and org-auto-scheduler-manual-reschedule-lapsed
+                                     (not clocked-only-mode)
                                      (not (memq org-auto-scheduler--current-run-type
                                                 '(background-async background-sync)))))
-                 (lapsed-ids (make-hash-table :test 'equal))) ; task-id -> 'clocked / 'lapsed
+                 (lapsed-ids (make-hash-table :test 'equal)) ; task-id -> 'clocked / 'lapsed
+                 (run-backfilled-slots (make-hash-table :test 'equal)))
 
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
             (maphash
@@ -2871,9 +3189,21 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                         (if org-auto-scheduler-preserve-future-scheduled
                                             (org-auto-scheduler--task-scheduled-time marker today-str)
                                           (org-auto-scheduler--task-scheduled-today-p marker today-str))))
-                         (lapsed-kind (and sched-times replan-lapsed
-                                           (cond ((org-auto-scheduler--task-clocked-p marker) 'clocked)
-                                                 ((time-less-p (car sched-times) now) 'lapsed))))
+                         (lapsed-kind
+                          (when sched-times
+                            (let* ((st (car sched-times))
+                                   (et (cdr sched-times))
+                                   (is-td (string= (format-time-string "%Y-%m-%d" st) today-str))
+                                   (is-clk (org-auto-scheduler--task-clocked-p marker))
+                                   (is-pn (org-auto-scheduler-task-pinned-p marker task-id)))
+                              (cond
+                               (clocked-only-mode
+                                (when (and is-td (not is-clk) (not is-pn)
+                                           (org-auto-scheduler--task-lapsed-p st et now marker))
+                                  'lapsed))
+                               (replan-lapsed
+                                (cond (is-clk 'clocked)
+                                      ((time-less-p st now) 'lapsed)))))))
                          (_ (when lapsed-kind (puthash task-id lapsed-kind lapsed-ids))))
                     (if (and sched-times (not lapsed-kind))
                         (let* ((start-t (car sched-times))
@@ -2910,8 +3240,12 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
             ;;    - has-priority-or-indep-trigger: priority (-#A-) or independent (-i-) marker set on task
             ;;    - has-r-trigger: user added -r- or -r-all- (cascade from trigger point in previous order)
             ;;    - has-unscheduled: user added new unscheduled AUTOSCH tasks (displace upcoming unpinned tasks automatically)
+            ;;    - in `clocked-only' mode: Check 1 (fingerprint/score-order change), Check 2 (lapsed past grace), Check 3 (calendar conflict)
             ;;    - neither: preserve all today-scheduled tasks
-            (let* ((has-priority-or-indep-trigger
+            (let* ((current-fingerprints
+                    (when clocked-only-mode
+                      (org-auto-scheduler--compute-task-fingerprints sorted-tasks-info)))
+                   (has-priority-or-indep-trigger
                     (cl-some (lambda (e)
                                (let ((m (gethash (plist-get e :task-id) marker-data)))
                                  (and m (or (plist-get m :priority)
@@ -2921,6 +3255,29 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                             (plist-get m :effort)
                                             (plist-get m :defer)))))
                              today-scheduled))
+                   (has-clocked-only-order-trigger
+                    (and clocked-only-mode
+                         (or (org-auto-scheduler--fingerprints-changed-p
+                              current-fingerprints
+                              org-auto-scheduler--last-task-fingerprints)
+                             (org-auto-scheduler--today-schedule-out-of-order-p
+                              today-scheduled
+                              sorted-tasks-info))))
+                   (has-clocked-only-conflict
+                    (and clocked-only-mode
+                         (cl-some (lambda (e)
+                                    (let* ((tid (plist-get e :task-id))
+                                           (st (plist-get e :start-time))
+                                           (et (plist-get e :end-time))
+                                           (t-info (plist-get e :task-info))
+                                           (tags (nth 7 t-info)))
+                                      (and (plist-get e :is-today)
+                                           (not (plist-get e :pinned))
+                                           (not (plist-get e :clocked))
+                                           st et
+                                           (time-less-p now et)
+                                           (org-auto-scheduler--task-has-agenda-conflict-p st et tid tags))))
+                                  today-scheduled)))
                    (has-r-trigger
                     (and (not has-priority-or-indep-trigger)
                          (cond
@@ -2944,7 +3301,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                                (plist-get m :remove-splittable)
                                                (plist-get m :freeset)
                                                (plist-get m :remove-freeset)))
-                                    (and st et
+                                    (and (not clocked-only-mode)
+                                         st et
                                          (time-less-p now et)
                                          (org-auto-scheduler--task-has-agenda-conflict-p st et tid tags)))))
                             today-scheduled)))))
@@ -2955,7 +3313,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (> (hash-table-count lapsed-ids) 0))
                    (has-priority-reorder (or has-priority-or-indep-trigger
                                              has-unscheduled
-                                             has-lapsed))
+                                             has-lapsed
+                                             has-clocked-only-order-trigger
+                                             has-clocked-only-conflict))
                    (preserved-entries '())
                    (final-schedule-list '()))
 
@@ -2998,10 +3358,12 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                   (setq final-schedule-list (append unpinned-cascade tasks-to-schedule))))
 
                ;; -------------------------------------------------------------
-               ;; CASE 2: Priority/independence marker OR newly added unscheduled tasks!
-               ;; Preserved: lapsed-or-current tasks and pinned tasks.
-               ;; Upcoming unpinned tasks + unscheduled tasks are scheduled together
-               ;; according to priority/score (sorted-tasks-info order).
+               ;; CASE 2: Priority/independence marker, newly added unscheduled tasks,
+               ;; or `clocked-only' replan trigger!
+               ;; Preserved: in `all' mode, lapsed-or-current tasks and pinned tasks;
+               ;; in `clocked-only' mode, only clocked-in tasks and pinned tasks.
+               ;; Upcoming unpinned tasks + unscheduled/lapsed tasks are scheduled
+               ;; together according to priority/score (sorted-tasks-info order).
                ;; -------------------------------------------------------------
                (has-priority-reorder
                 (let ((reschedule-task-ids (make-hash-table :test 'equal)))
@@ -3016,7 +3378,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                               (time-less-p now et)
                                               (org-auto-scheduler--task-has-agenda-conflict-p st et tid tags))))
                       (if (and (not has-conflict)
-                               (or (plist-get e :lapsed-or-current)
+                               (or (if clocked-only-mode
+                                       (plist-get e :clocked)
+                                     (plist-get e :lapsed-or-current))
                                    (plist-get e :pinned)
                                    (and org-auto-scheduler-preserve-future-scheduled
                                         (not has-lapsed)
@@ -3044,157 +3408,289 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                 (setq preserved-entries today-scheduled)
                 (setq final-schedule-list tasks-to-schedule)))
 
-            ;; 4. Register preserved tasks into completed-tasks so they occupy their slots
-            (dolist (e preserved-entries)
-              (let* ((t-info (plist-get e :task-info))
-                     (tid (plist-get e :task-id))
-                     (m (plist-get e :marker))
-                     (st (plist-get e :start-time))
-                     (et (plist-get e :end-time))
-                     (hd (nth 6 t-info))
-                     (tags (nth 7 t-info))
-                     (td (nth 14 t-info))
-                     (is-pin (plist-get e :pinned))
-                     (sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
-                ;; Ensure pinned tasks have their SCHEDULED line properly synchronized to PINNED_TIME
-                (when (and is-pin
-                           (or (gethash tid marker-data)
-                               (let ((pt (org-auto-scheduler-task-pinned-time m tid)))
-                                 (and pt (not (string-prefix-p (format-time-string "%Y-%m-%d %H:%M" pt)
-                                                               (or sched-str "")))))))
-                  (org-auto-scheduler-schedule-single-task m current-time td)
-                  (setq sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
-                (push (list tid st et (or tags '("AUTOSCH")) t hd sched-str m td)
-                      org-auto-scheduler-completed-tasks)
-                (unless org-auto-scheduler--preview-mode
-                  (org-auto-scheduler-add-to-report t-info st))
-                (setq tasks-scheduled (1+ tasks-scheduled))))
+              ;; Validate preserved-entries across all modes:
+              ;; Evict any unpinned, unclocked preserved entry that:
+              ;; (a) overlaps an earlier preserved entry on the same calendar day, or
+              ;; (b) starts before one of its unfinished explicit BLOCKERs finishes
+              ;;     (or whose blocker is unscheduled / being rescheduled).
+              (when preserved-entries
+                (let ((evicted-ids (make-hash-table :test 'equal))
+                      (changed t))
+                  (while changed
+                    (setq changed nil)
+                    (let ((pres-map (make-hash-table :test 'equal))
+                          (sched-set (make-hash-table :test 'equal))
+                          (prev-day nil)
+                          (prev-end nil)
+                          (valid-entries '()))
+                      (dolist (pe preserved-entries)
+                        (puthash (plist-get pe :task-id) pe pres-map))
+                      (dolist (ti final-schedule-list)
+                        (puthash (nth 5 ti) t sched-set))
+                      (dolist (pe preserved-entries)
+                        (let* ((tid (plist-get pe :task-id))
+                               (m (plist-get pe :marker))
+                               (st (plist-get pe :start-time))
+                               (et (plist-get pe :end-time))
+                               (day (and st (format-time-string "%Y-%m-%d" st)))
+                               (protected (or (plist-get pe :pinned)
+                                              (plist-get pe :clocked)))
+                               (overlaps-prev (and (not protected)
+                                                   st prev-end
+                                                   (equal day prev-day)
+                                                   (time-less-p st prev-end)))
+                               (blocker-invalid
+                                (and (not protected)
+                                     m (markerp m) (marker-buffer m)
+                                     (let ((blockers (org-auto-scheduler-get-blockers m))
+                                           (inv nil))
+                                       (dolist (bm blockers)
+                                         (unless inv
+                                           (let* ((bid (org-with-point-at bm (org-id-get)))
+                                                  (b-pres (and bid (gethash bid pres-map)))
+                                                  (b-in-sched (and bid (gethash bid sched-set))))
+                                             (cond
+                                              (b-in-sched
+                                               (setq inv t))
+                                              (b-pres
+                                               (let ((b-et (plist-get b-pres :end-time)))
+                                                 (when (and b-et st (time-less-p st b-et))
+                                                   (setq inv t))))
+                                              (t
+                                               (let ((b-et (org-auto-scheduler-calculate-task-end-time bm)))
+                                                 (when (or (null b-et) (and st (time-less-p st b-et)))
+                                                   (setq inv t))))))))
+                                       inv))))
+                          (if (or overlaps-prev blocker-invalid)
+                              (progn
+                                (puthash tid t evicted-ids)
+                                (setq changed t))
+                            (push pe valid-entries)
+                            (when (and day et)
+                              (if (equal day prev-day)
+                                  (when (time-less-p prev-end et)
+                                    (setq prev-end et))
+                                (setq prev-day day)
+                                (setq prev-end et))))))
+                      (setq preserved-entries (nreverse valid-entries))))
+                  (when (> (hash-table-count evicted-ids) 0)
+                    (let ((already-in-final (make-hash-table :test 'equal)))
+                      (dolist (ti final-schedule-list)
+                        (puthash (nth 5 ti) t already-in-final))
+                      (if has-r-trigger
+                          (dolist (ti sorted-tasks-info)
+                            (let ((tid (nth 5 ti)))
+                              (when (and (gethash tid evicted-ids)
+                                         (not (gethash tid already-in-final)))
+                                (setq final-schedule-list (append final-schedule-list (list ti))))))
+                        (let ((new-final '()))
+                          (dolist (ti sorted-tasks-info)
+                            (let ((tid (nth 5 ti)))
+                              (when (or (gethash tid evicted-ids)
+                                        (gethash tid already-in-final))
+                                (push ti new-final))))
+                          (setq final-schedule-list (nreverse new-final))))))))
 
-            ;; Clocked task first so it gets the slot starting right after the running clock
-            (when (> (hash-table-count lapsed-ids) 0)
-              (let ((clocked-first '()) (others '()))
-                (dolist (ti final-schedule-list)
-                  (if (eq (gethash (nth 5 ti) lapsed-ids) 'clocked)
-                      (push ti clocked-first)
-                    (push ti others)))
-                (setq final-schedule-list (append (nreverse clocked-first) (nreverse others)))))
-
-            ;; 5. Schedule tasks in final-schedule-list
-            (let ((reporter (unless org-auto-scheduler-silent-mode
-                              (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
-                  (task-finish-times (make-hash-table :test 'equal))
-                  (open-gap-floor nil)
-                  (prev-ordered-finish nil)
-                  (last-non-interleave-proj nil)
-                  (last-non-interleave-finish nil))
-              ;; Seed task-finish-times with preserved entries
+              ;; 4. Register preserved tasks into completed-tasks so they occupy their slots
               (dolist (e preserved-entries)
-                (let ((tid (plist-get e :task-id))
-                      (et (plist-get e :end-time)))
-                  (when (and tid et)
-                    (puthash tid (time-add et (seconds-to-time (* 60 org-auto-scheduler-task-gap)))
-                             task-finish-times))))
-              (dolist (task-info final-schedule-list)
-                ;; Cooperative yield if running in a background worker thread
-                (when (and (fboundp 'thread-yield)
-                           (fboundp 'current-thread)
-                           (fboundp 'main-thread)
-                           (not (eq (current-thread) (main-thread))))
-                  (thread-yield))
-                (let* ((task-id (nth 5 task-info))
-                       (raw-marker (car task-info))
-                       (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id)))
-                  (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
-                    ;; Lapsed pinned task: move its pin to the next free slot (now)
-                    (when (and (gethash task-id lapsed-ids)
-                               (org-auto-scheduler-task-pinned-p marker task-id))
-                      (org-auto-scheduler-task-set-pinned-time
-                       marker task-id (format-time-string "%Y-%m-%d %H:%M" current-time)))
-                    ;; Determine search start: support Free-Interval Gap Backfilling when an earlier task
-                    ;; jumped over an obstacle, while strictly respecting all predecessor finish times.
-                    (let* ((preds (and task-id
-                                       (hash-table-p org-auto-scheduler--last-preds-map)
-                                       (gethash task-id org-auto-scheduler--last-preds-map)))
-                           (dep-floor nil)
-                           (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
-                           (has-saved-order (and saved-dec (not (plist-get saved-dec :is-new)) (plist-get saved-dec :order)))
-                           (proj-id (nth 2 task-info))
-                           (allows-interleave (nth 9 task-info)))
-                      (dolist (p-id preds)
-                        (let ((pf (gethash p-id task-finish-times)))
-                          (when (and pf (or (null dep-floor) (time-less-p dep-floor pf)))
-                            (setq dep-floor pf))))
-                      (when (and has-saved-order prev-ordered-finish
-                                 (or (null dep-floor) (time-less-p dep-floor prev-ordered-finish)))
-                        (setq dep-floor prev-ordered-finish))
-                      (when (and last-non-interleave-finish
-                                 (not (equal proj-id last-non-interleave-proj))
-                                 (or (null dep-floor) (time-less-p dep-floor last-non-interleave-finish)))
-                        (setq dep-floor last-non-interleave-finish))
-                      (let* ((can-backfill (and open-gap-floor
-                                                (not has-r-trigger)
-                                                (not (bound-and-true-p org-auto-scheduler--reordering-p))))
-                             (search-start
-                              (if can-backfill
-                                  (let ((cand (if (and dep-floor (time-less-p open-gap-floor dep-floor))
-                                                  dep-floor
-                                                open-gap-floor)))
-                                    (if (time-less-p cand current-time) cand current-time))
-                                current-time))
-                             (next-t (org-auto-scheduler-schedule-single-task marker search-start (nth 14 task-info)))
-                             (newly-scheduled (> (length org-auto-scheduler-completed-tasks) prev-completed-count))
-                             (top-entry (and newly-scheduled (car org-auto-scheduler-completed-tasks)))
-                             (top-status (and top-entry (nth 9 top-entry)))
-                             (actual-start (and top-entry
-                                                (not (memq top-status '(:failed :blocked :skipped)))
-                                                (nth 1 top-entry))))
-                        (when (and task-id next-t)
-                          (puthash task-id next-t task-finish-times))
-                        (when has-saved-order
-                          (setq prev-ordered-finish next-t))
-                        (when (and proj-id (not allows-interleave))
-                          (setq last-non-interleave-proj proj-id)
-                          (setq last-non-interleave-finish next-t))
-                        ;; Record backfilled status in placement trace if placed before current-time
-                        (when (and actual-start (time-less-p actual-start current-time)
-                                   (hash-table-p org-auto-scheduler--placement-traces))
-                          (let ((tr (gethash task-id org-auto-scheduler--placement-traces)))
-                            (when tr
-                              (puthash task-id (plist-put tr :backfilled t) org-auto-scheduler--placement-traces))))
-                        ;; Track skipped gap if task jumped forward by >= 10 minutes
-                        (when (and actual-start
-                                   (>= (float-time (time-subtract actual-start search-start)) 600))
-                          (setq open-gap-floor
-                                (if (and open-gap-floor (time-less-p open-gap-floor search-start))
-                                    open-gap-floor
-                                  search-start)))
-                        ;; If task filled the start of open-gap-floor, advance open-gap-floor
-                        (when (and open-gap-floor actual-start
-                                   (<= (abs (float-time (time-subtract actual-start open-gap-floor))) 60))
-                          (setq open-gap-floor
-                                (if (time-less-p next-t current-time) next-t nil)))
-                        (when (time-less-p current-time next-t)
-                          (setq current-time next-t))))
-                    (when (nth 2 task-info)
-                      (setq org-auto-scheduler--last-scheduled-project-id (nth 2 task-info)))
-                    (unless org-auto-scheduler--preview-mode
-                      (let ((scheduled-start
-                             (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
-                               (nth 1 (car org-auto-scheduler-completed-tasks)))))
-                        (org-auto-scheduler-add-to-report task-info scheduled-start))))
-                  (setq tasks-scheduled (1+ tasks-scheduled))
-                  (when reporter
-                    (progress-reporter-update reporter tasks-scheduled))))
-              (when reporter
-                (progress-reporter-done reporter))))
+                (let* ((t-info (plist-get e :task-info))
+                       (tid (plist-get e :task-id))
+                       (m (plist-get e :marker))
+                       (st (plist-get e :start-time))
+                       (et (plist-get e :end-time))
+                       (eff-et
+                        (if (and (plist-get e :clocked)
+                                 st et
+                                 (time-less-p et now)
+                                 m (markerp m) (marker-buffer m))
+                            (let* ((base-eff (or (org-auto-scheduler-get-effort m) 60))
+                                   (mult (org-auto-scheduler-get-effort-multiplier m))
+                                   (tot-eff (round (* base-eff mult)))
+                                   (clk (org-auto-scheduler-get-clocked-time m))
+                                   (rem (max 10 (- tot-eff clk))))
+                              (time-add now (seconds-to-time (* 60 rem))))
+                          et))
+                       (hd (nth 6 t-info))
+                       (tags (nth 7 t-info))
+                       (td (nth 14 t-info))
+                       (is-pin (plist-get e :pinned))
+                       (sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
+                  ;; Carry forward backfilled slot record for preserved entries
+                  (when (and tid sched-str
+                             (hash-table-p org-auto-scheduler--backfilled-task-slots))
+                    (let ((prev-bf (gethash tid org-auto-scheduler--backfilled-task-slots)))
+                      (when (and prev-bf (org-auto-scheduler--timestamps-equal-p prev-bf sched-str))
+                        (puthash tid sched-str run-backfilled-slots))))
+                  ;; Ensure pinned tasks have their SCHEDULED line properly synchronized to PINNED_TIME
+                  (when (and is-pin
+                             (or (gethash tid marker-data)
+                                 (let ((pt (org-auto-scheduler-task-pinned-time m tid)))
+                                   (and pt (not (string-prefix-p (format-time-string "%Y-%m-%d %H:%M" pt)
+                                                                 (or sched-str "")))))))
+                    (org-auto-scheduler-schedule-single-task m current-time td)
+                    (setq sched-str (org-with-point-at m (org-entry-get nil "SCHEDULED"))))
+                  (push (list tid st eff-et (or tags '("AUTOSCH")) t hd sched-str m td)
+                        org-auto-scheduler-completed-tasks)
+                  (unless org-auto-scheduler--preview-mode
+                    (org-auto-scheduler-add-to-report t-info st))
+                  (setq tasks-scheduled (1+ tasks-scheduled))))
 
-          ;; Normalize completed-tasks to chronological order (built via push)
-          (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
-          ;; Detect and record changes
-          (setq org-auto-scheduler--last-run-changes
-                (org-auto-scheduler--detect-task-changes initial-snapshot
-                                                        org-auto-scheduler-completed-tasks
-                                                        marker-data))
+              ;; Clocked task first so it gets the slot starting right after the running clock
+              (when (> (hash-table-count lapsed-ids) 0)
+                (let ((clocked-first '()) (others '()))
+                  (dolist (ti final-schedule-list)
+                    (if (eq (gethash (nth 5 ti) lapsed-ids) 'clocked)
+                        (push ti clocked-first)
+                      (push ti others)))
+                  (setq final-schedule-list (append (nreverse clocked-first) (nreverse others)))))
+
+              ;; 5. Schedule tasks in final-schedule-list
+              (let ((reporter (unless org-auto-scheduler-silent-mode
+                                (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
+                    (task-finish-times (make-hash-table :test 'equal))
+                    (open-gap-floor nil)
+                    (prev-ordered-finish nil)
+                    (last-non-interleave-proj nil)
+                    (last-non-interleave-finish nil))
+                ;; Seed task-finish-times with preserved entries
+                (dolist (e preserved-entries)
+                  (let* ((tid (plist-get e :task-id))
+                         (m (plist-get e :marker))
+                         (st (plist-get e :start-time))
+                         (et (plist-get e :end-time))
+                         (eff-et
+                          (if (and (plist-get e :clocked)
+                                   st et
+                                   (time-less-p et now)
+                                   m (markerp m) (marker-buffer m))
+                              (let* ((base-eff (or (org-auto-scheduler-get-effort m) 60))
+                                     (mult (org-auto-scheduler-get-effort-multiplier m))
+                                     (tot-eff (round (* base-eff mult)))
+                                     (clk (org-auto-scheduler-get-clocked-time m))
+                                     (rem (max 10 (- tot-eff clk))))
+                                (time-add now (seconds-to-time (* 60 rem))))
+                            et)))
+                    (when (and tid eff-et)
+                      (puthash tid (time-add eff-et (seconds-to-time (* 60 org-auto-scheduler-task-gap)))
+                               task-finish-times))))
+                (dolist (task-info final-schedule-list)
+                  ;; Cooperative yield if running in a background worker thread
+                  (when (and (fboundp 'thread-yield)
+                             (fboundp 'current-thread)
+                             (fboundp 'main-thread)
+                             (not (eq (current-thread) (main-thread))))
+                    (thread-yield))
+                  (let* ((task-id (nth 5 task-info))
+                         (raw-marker (car task-info))
+                         (marker (org-auto-scheduler--resolve-task-marker raw-marker task-id)))
+                    (let ((prev-completed-count (length org-auto-scheduler-completed-tasks)))
+                      ;; Lapsed pinned task: move its pin to the next free slot (now)
+                      (when (and (gethash task-id lapsed-ids)
+                                 (org-auto-scheduler-task-pinned-p marker task-id))
+                        (org-auto-scheduler-task-set-pinned-time
+                         marker task-id (format-time-string "%Y-%m-%d %H:%M" current-time)))
+                      ;; Determine search start: support Free-Interval Gap Backfilling when an earlier task
+                      ;; jumped over an obstacle, while strictly respecting all predecessor finish times.
+                      (let* ((preds (and task-id
+                                         (hash-table-p org-auto-scheduler--last-preds-map)
+                                         (gethash task-id org-auto-scheduler--last-preds-map)))
+                             (dep-floor nil)
+                             (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
+                             (has-saved-order (and saved-dec (not (plist-get saved-dec :is-new)) (plist-get saved-dec :order)))
+                             (proj-id (nth 2 task-info))
+                             (allows-interleave (nth 9 task-info)))
+                        (dolist (p-id preds)
+                          (let ((pf (gethash p-id task-finish-times)))
+                            (when (and pf (or (null dep-floor) (time-less-p dep-floor pf)))
+                              (setq dep-floor pf))))
+                        (when (and has-saved-order prev-ordered-finish
+                                   (or (null dep-floor) (time-less-p dep-floor prev-ordered-finish)))
+                          (setq dep-floor prev-ordered-finish))
+                        (when (and last-non-interleave-finish
+                                   (not (equal proj-id last-non-interleave-proj))
+                                   (or (null dep-floor) (time-less-p dep-floor last-non-interleave-finish)))
+                          (setq dep-floor last-non-interleave-finish))
+                        (let* ((can-backfill (and open-gap-floor
+                                                  (not has-r-trigger)
+                                                  (not (bound-and-true-p org-auto-scheduler--reordering-p))))
+                               (search-start
+                                (if can-backfill
+                                    (let ((cand (if (and dep-floor (time-less-p open-gap-floor dep-floor))
+                                                    dep-floor
+                                                  open-gap-floor)))
+                                      (if (time-less-p cand current-time) cand current-time))
+                                  current-time))
+                               (next-t (org-auto-scheduler-schedule-single-task marker search-start (nth 14 task-info)))
+                               (newly-scheduled (> (length org-auto-scheduler-completed-tasks) prev-completed-count))
+                               (top-entry (and newly-scheduled (car org-auto-scheduler-completed-tasks)))
+                               (top-status (and top-entry (nth 9 top-entry)))
+                               (actual-start (and top-entry
+                                                  (not (memq top-status '(:failed :blocked :skipped)))
+                                                  (nth 1 top-entry))))
+                          (when (and task-id next-t)
+                            (puthash task-id next-t task-finish-times))
+                          (when has-saved-order
+                            (setq prev-ordered-finish next-t))
+                          (when (and proj-id (not allows-interleave))
+                            (setq last-non-interleave-proj proj-id)
+                            (setq last-non-interleave-finish next-t))
+                          ;; Record backfilled status in placement trace if placed before current-time
+                          (when (and actual-start (time-less-p actual-start current-time))
+                            (when (and task-id (nth 6 top-entry))
+                              (puthash task-id (nth 6 top-entry) run-backfilled-slots))
+                            (when (hash-table-p org-auto-scheduler--placement-traces)
+                              (let ((tr (gethash task-id org-auto-scheduler--placement-traces)))
+                                (when tr
+                                  (puthash task-id (plist-put tr :backfilled t) org-auto-scheduler--placement-traces)))))
+                          ;; Track skipped gap if task jumped forward by >= 10 minutes
+                          (when (and actual-start
+                                     (>= (float-time (time-subtract actual-start search-start)) 600))
+                            (setq open-gap-floor
+                                  (if (and open-gap-floor (time-less-p open-gap-floor search-start))
+                                      open-gap-floor
+                                    search-start)))
+                          ;; If task filled the start of open-gap-floor, advance open-gap-floor
+                          (when (and open-gap-floor actual-start
+                                     (<= (abs (float-time (time-subtract actual-start open-gap-floor))) 60))
+                            (setq open-gap-floor
+                                  (if (time-less-p next-t current-time) next-t nil)))
+                          (when (time-less-p current-time next-t)
+                            (setq current-time next-t))))
+                      (when (nth 2 task-info)
+                        (setq org-auto-scheduler--last-scheduled-project-id (nth 2 task-info)))
+                      (unless org-auto-scheduler--preview-mode
+                        (let ((scheduled-start
+                               (when (> (length org-auto-scheduler-completed-tasks) prev-completed-count)
+                                 (nth 1 (car org-auto-scheduler-completed-tasks)))))
+                          (org-auto-scheduler-add-to-report task-info scheduled-start))))
+                    (setq tasks-scheduled (1+ tasks-scheduled))
+                    (when reporter
+                      (progress-reporter-update reporter tasks-scheduled))))
+                (when reporter
+                  (progress-reporter-done reporter)))
+
+              ;; Normalize completed-tasks to chronological order (built via push)
+              (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
+              ;; Detect and record changes
+              (setq org-auto-scheduler--last-run-changes
+                    (org-auto-scheduler--detect-task-changes initial-snapshot
+                                                            org-auto-scheduler-completed-tasks
+                                                            marker-data))
+              ;; Update fingerprint and backfilled slot caches when committing (or on 0-change dry-run)
+              (when (or (not org-auto-scheduler--preview-mode)
+                        (null org-auto-scheduler--last-run-changes))
+                (setq org-auto-scheduler--last-task-fingerprints current-fingerprints)
+                (setq org-auto-scheduler--backfilled-task-slots run-backfilled-slots))
+              ;; Clear transient :reranked-from metadata after a real (non-preview) schedule commit
+              (when (and (not org-auto-scheduler--preview-mode)
+                         (boundp 'org-auto-scheduler--saved-review-decisions))
+                (let ((cleared-any nil))
+                  (dolist (entry org-auto-scheduler--saved-review-decisions)
+                    (when (plist-get (cdr entry) :reranked-from)
+                      (setcdr entry (plist-put (cdr entry) :reranked-from nil))
+                      (setq cleared-any t)))
+                  (when cleared-any
+                    (org-auto-scheduler-save-review-decisions t)))))
           (when (org-auto-scheduler--should-log-changes-p)
             (org-auto-scheduler--record-run-changes
              :run-type (or org-auto-scheduler--current-run-type 'manual)

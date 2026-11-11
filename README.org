@@ -744,6 +744,9 @@ up the report buffer.
 
 ;; Schedule preservation and buffer settings
 (setq org-auto-scheduler-preserve-today-scheduled t) ; keep today's schedule stable (default t)
+(setq org-auto-scheduler-background-preserve-today-mode 'all) ; 'all (default) or 'clocked-only
+(setq org-auto-scheduler-background-lapse-grace-minutes 30)     ; grace minutes before an unclocked task lapses in 'clocked-only mode
+(setq org-auto-scheduler-background-lapse-reference 'start-or-end) ; 'start-or-end (default), 'start, or 'end
 (setq org-auto-scheduler-start-buffer-minutes 5)     ; start 5m ahead when unclocked (0m when clocked)
 
 ;; Restrict to specific machines (optional)
@@ -752,22 +755,33 @@ up the report buffer.
 
 Toggle at runtime with =M-x org-auto-scheduler-toggle-background=.
 
-*** Safe Schedule Preservation & Smart Start Buffer
+*** Safe Schedule Preservation, Clocked-Only Mode & Smart Start Buffer
 <<safe-schedule-preservation--smart-start-buffer>>
 
 In background scheduling, a common frustration is that unclocked tasks constantly slide into =now + buffer= when you step away from your desk, leading to endless shifting across the day.
 
-Org Auto Scheduler solves this with *Safe Preservation* (=org-auto-scheduler-preserve-today-scheduled=, enabled by default):
-- *Stability by Default:* Tasks already scheduled for today remain anchored at their existing times during background runs.
+Org Auto Scheduler solves this with *Safe Preservation* (=org-auto-scheduler-preserve-today-scheduled=, enabled by default) and two configurable background preservation modes via =org-auto-scheduler-background-preserve-today-mode= (also aliased as =org-auto-scheduler-preserve-today-mode=):
+
+- *=all= (Default — Best for Mobile / CalDAV / Passive Workflows):*
+  - Keeps all of today's scheduled tasks anchored at their existing times during background runs unless displaced by a newly added task, a calendar collision, a stale =BLOCKER= inversion, or an explicit =-r-= / =-r-all-= marker.
+  - Prevents background runs from reshuffling your afternoon when you work from a mobile calendar without clocking in on Emacs.
+- *=clocked-only= (Opt-In — Best for Active =org-clock= Workflows):*
+  - Protects *only* the actively clocked-in task and pinned tasks (=:PINNED: t= / =-p-=).
+  - Keeps today's schedule completely still (zero drift) on idle runs *as long as* three invariants hold:
+    1. Upcoming unpinned tasks are in score/dependency order (checked via drift-free input fingerprints that ignore intraday CPM float changes, and excluding intentional hard time blocks, soft energy blocks, =NOT_BEFORE=, or backfilled gap tasks).
+    2. No unfinished, unclocked task has lapsed beyond the grace period (=org-auto-scheduler-background-lapse-grace-minutes=, default =30= minutes, measured according to =org-auto-scheduler-background-lapse-reference=: ='start-or-end= = $\min(\text{start} + \text{grace}, \text{end})$, ='start=, or ='end=).
+    3. No task collides with an external calendar event or violates a =BLOCKER= dependency.
+  - Whenever any check fails (e.g. a task's priority/effort changes or an unclocked task lapses past its grace window), all unpinned, unclocked tasks today (including lapsed ones) are re-placed from =now= in priority/score rank order.
+- *Automatic Stale =BLOCKER= & Overlap Recovery (All Modes):* Across both ='all= and ='clocked-only= modes, if a preserved task's explicit =BLOCKER= is unscheduled, being rescheduled, or ends after the dependent task starts (or if two preserved tasks overlap), the invalid dependent task (and any transitive dependents) is automatically evicted from preserved status and re-scheduled after its blocker.
 - *Smart Start Buffer:* When scheduling starts for new or rescheduled tasks:
   - If you are *currently clocked in* to a task: buffer is *0 minutes* (starts immediately at =now=).
   - If *not clocked in*: adds *5 minutes* buffer (=org-auto-scheduler-start-buffer-minutes=).
 - *Force Full Replan:* If you ever want to completely wipe and recalculate today's schedule from scratch, call =C-u M-x org-auto-scheduler-schedule-tasks= (or prefix =C-u= with your keybinding).
 
-*** Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -x-, -kill-, -e<dur>-, -+1d-, -#A-, -#B-, -#C-, -i-, -\i-)
+*** Interactive Title Modifiers (-r-, -s-, -\s-, -f-, -\f-, -p-, -\p-, -x-, -kill-, -e<dur>-, -+1d-, -#A-, -#B-, -#C-, -i-, -\i-, -ci-, -co-)
 <<interactive-title-modifiers>>
 
-When syncing with mobile calendar apps (via =org-caldav=, Google Calendar, or Nextcloud), you often need to reschedule or modify a task directly from your phone without opening Org property drawers.
+When syncing with mobile calendar apps (via =org-caldav=, Google Calendar, or Nextcloud), you often need to reschedule, clock in/out, or modify a task directly from your phone without opening Org property drawers.
 
 You can add lightweight modifier markers directly to the task title in any calendar app or Org headline:
 
@@ -792,6 +806,11 @@ You can add lightweight modifier markers directly to the task title in any calen
 | =-\#-=, =(-\!-)=, =(-pri-none-)= | *Clear Priority* | Removes the priority cookie from the task heading. |
 | =-i-= or =(-i-)= or =(-indep-)= | *Independent of Siblings* | Decouples the task from sequential outline sibling chains (sets =:INDEPENDENT: t= property and =:INDEPENDENT:= tag), allowing it to schedule as soon as its score permits. Triggers a reschedule. |
 | =-\i-= or =(-\i-)= or =(-\indep-)= | *Remove Independent* | Restores outline sibling sequencing (removes =:INDEPENDENT:= and =:PARALLEL:= properties and tags). |
+| =-ci-=, =(-ci-)=, =(-clockin-)= | *Clock In (Now or Slot Start)* | Starts the Org clock on this task. If =now= is within the task's scheduled window =[start, end]= and no clock is running, clocks in at =start=; otherwise clocks in at =now=. |
+| =-ci<time>-= (e.g. =(-ci14:30-)=, =(-ci10:15am-)=, =(-ci2:30pm-)=, =(-ci2pm-)=) | *Clock In at Time* | Starts the Org clock on this task at the specified 24-hour or 12-hour (=am=/=pm=) time today. |
+| =-co-=, =(-co-)=, =(-clockout-)= | *Clock Out (Now)* | Clocks out of the task at =now= (if currently clocked into this task, closes the running clock; otherwise records a closed =:LOGBOOK:= clock entry from the task's scheduled start to =now=), reducing remaining effort and triggering a reschedule. |
+| =-co<time>-= (e.g. =(-co15:15-)=, =(-co10:45am-)=, =(-co3pm-)=) | *Clock Out at Time* | Clocks out of the task at the specified 24-hour or 12-hour (=am=/=pm=) time today, recording a closed =:LOGBOOK:= entry and updating remaining effort. |
+| =-ci<t1>-co<t2>-= (e.g. =(-ci10:00am-co10:45am-)=) | *Log Closed Clock Interval* | Records a completed =CLOCK:= interval from =<t1>= to =<t2>= in the task's =:LOGBOOK:= drawer, reduces remaining effort accordingly, and reschedules. |
 | Combinations | *Multi-Modifier* | Any permutation in any order (e.g. =(-#A-i-)=, =(-i#a-)=, =(-rs-)=, =(-rp-)=, =(-r\p-)=, =(-rx-)=, =(-r-kill-)=, =(-re45m-)=, =(-sfr-)=, =(-\s\f-)=, =(-p\s-)=, =-fr-=). Order does not matter! |
 | =-r-all-= or =(-r-all-)= | *Reschedule All Overdue* | Triggers a cascade reschedule of all overdue tasks today forward into available time slots. |
 
@@ -823,7 +842,7 @@ Org Auto Scheduler includes an automatic *Change Log* that captures every modifi
 - *Noise-Free & Collated:* Runs that make zero changes are omitted by default (=org-auto-scheduler-change-log-record-empty= is =nil=). When enabled (=t=), consecutive background runs with no changes are cleanly collated into the same node with timestamped bullet points (=org-auto-scheduler-change-log-collate-empty=, default =t=), preventing log bloat while preserving execution heartbeats.
 - *Echo Notification:* When changes occur, Emacs briefly alerts you in the echo area: =Org Auto Scheduler [background]: 2 task(s) updated. [M-x org-auto-scheduler-show-change-log]=.
 - *Automatic File Saving:* Modified Org agenda files are automatically saved to disk when background changes occur (=org-auto-scheduler-background-save-buffers=, default =t=).
-- *Previous Days Rollover on First Run:* When enabled (=org-auto-scheduler-background-reschedule-past-tasks=, default =nil=), automatically reschedules all uncompleted TODO-state AUTOSCH tasks of previous days to today on the first background run of each day, re-integrating them into today's timeline by priority and saving agenda buffers.
+- *Previous Days Rollover on First Run:* When enabled (=org-auto-scheduler-background-reschedule-yesterday-tasks-once=, default =nil=, aliased as =org-auto-scheduler-background-reschedule-past-tasks=), automatically reschedules all uncompleted TODO-state AUTOSCH tasks of previous days to today on the first background run of each day, re-integrating them into today's timeline by priority and saving agenda buffers.
 
 Commands:
 - =M-x org-auto-scheduler-reschedule-past-tasks-to-today=: Manually reschedule uncompleted previous days' AUTOSCH tasks to today.
@@ -1213,8 +1232,13 @@ Backward-compatible aliases:
 | =org-auto-scheduler-background-interval=      | =300=   | Seconds between subsequent background runs (while still idle).                 |
 | =org-auto-scheduler-background-pause-on-clock= | =nil=   | When =t=, pause background scheduling while clocked into a task.               |
 | =org-auto-scheduler-preserve-today-scheduled= | =t=     | When non-nil, keep today's scheduled tasks stable during background sync unless triggered by -r- or new tasks. |
+| =org-auto-scheduler-background-preserve-today-mode= | ='all= | Which of today's scheduled tasks to preserve on background runs: ='all= (keep all today's slots; default) or ='clocked-only= (keep only clocked and pinned tasks; re-plan unpinned/lapsed tasks when schedule order or grace period is violated). Aliased as =org-auto-scheduler-preserve-today-mode=. |
+| =org-auto-scheduler-background-lapse-grace-minutes= | =30=    | Minutes after a task's reference time before an unclocked task counts as lapsed in ='clocked-only= mode (aliased as =org-auto-scheduler-lapse-grace-minutes=). |
+| =org-auto-scheduler-background-lapse-reference= | ='start-or-end= | Reference point for measuring whether an unclocked task has lapsed: ='start-or-end= ($\min(\text{start} + \text{grace}, \text{end})$), ='start= ($\text{start} + \text{grace}$), or ='end= ($\text{end} + \text{grace}$). Aliased as =org-auto-scheduler-lapse-reference=. |
+| =org-auto-scheduler-preserve-future-scheduled= | =t=    | When non-nil, preserve existing timed slots on future days during background runs unless forced with =-r-= or =C-u=. |
+| =org-auto-scheduler-manual-reschedule-lapsed= | =t=     | When non-nil, interactive/manual runs (=M-x org-auto-scheduler-schedule-tasks=) automatically reschedule today's lapsed unpinned tasks from =now= in score order. |
 | =org-auto-scheduler-start-buffer-minutes=     | =5=     | Buffer minutes added to current time when starting task scheduling (0 min when clocked in). |
-| =org-auto-scheduler-title-marker-regex=       | Tokenized expression | Regular expression matching title modifiers like =(-r-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-sfr-)=. |
+| =org-auto-scheduler-title-marker-regex=       | Tokenized expression | Regular expression matching title modifiers like =(-r-)=, =(-x-)=, =(-kill-)=, =(-e30m-)=, =(-+1d-)=, =(-sfr-)=, =(-ci-)=, =(-co-)=. |
 | =org-auto-scheduler-kill-todo-state=          | ="DROPPED"= | TODO state applied when a task contains the =(-kill-)=, =(-c-)=, or =(-drop-)= title marker. |
 | =org-auto-scheduler-allowed-hostnames=        | =nil=   | List of hostnames allowed to run background scheduling. =nil= = any machine.   |
 | =org-auto-scheduler-silent-mode=              | =nil=   | When =t=, suppress report buffer creation and display.                         |
@@ -1226,7 +1250,7 @@ Backward-compatible aliases:
 | =org-auto-scheduler-change-log-notify=         | =t=     | Display an echo area message when a background run updates tasks.              |
 | =org-auto-scheduler-change-log-max-entries=   | =200=   | Maximum number of run entries retained before older entries are pruned.        |
 | =org-auto-scheduler-background-save-buffers=  | =t=     | Automatically save modified agenda files to disk after background changes.     |
-| =org-auto-scheduler-background-reschedule-past-tasks= | =nil=   | Automatically reschedule uncompleted TODO AUTOSCH tasks of previous days to today on the first background run of the day. |
+| =org-auto-scheduler-background-reschedule-yesterday-tasks-once= | =nil= | Automatically reschedule uncompleted TODO AUTOSCH tasks of previous days to today on the first background run of the day (aliased as =org-auto-scheduler-background-reschedule-past-tasks=). |
 
 *** CalDAV Sync
 
@@ -1265,6 +1289,7 @@ Backward-compatible aliases:
 | =org-auto-scheduler-review-dim-future-days=     | =nil=                                           | When non-nil, dims tasks on future days using shadow face (=nil= keeps vibrant colors).         |
 | =org-auto-scheduler-review-auto-recalculate-on-move= | =t=                                             | When non-nil, reordering tasks automatically recalculates schedule times.                       |
 | =org-auto-scheduler-review-recalculate-delay=       | =3.0=                                           | Idle seconds after moving tasks before recalculating (debounces rapid moves and mouse drags).   |
+| =org-auto-scheduler-review-order-on-score-change=   | ='reset-task=                                   | How to handle saved manual review order (=:order=) when a task's base priority score changes: ='reset-task= (re-rank only the modified task by its new score and mark with =[RE-RANKED]=), ='reset-all= (clear all saved orders and re-sort from scratch), or ='keep= (always preserve manual order). |
 
 Example configuration:
 
