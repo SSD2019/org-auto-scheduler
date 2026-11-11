@@ -831,6 +831,92 @@ review preparation, review application, or sync) is currently in progress.")
   "List of completed/processed tasks in the current scheduling session.")
 
 ;; Advise org-caldav to ensure lexical-binding cookie in sync state buffers and files
+(declare-function org-caldav-sync "ext:org-caldav" ())
+(declare-function org-caldav-sync-calendar "ext:org-caldav" (&optional calendar resume))
+(declare-function org-caldav-events-url "ext:org-caldav" ())
+(declare-function org-caldav-check-connection "ext:org-caldav" ())
+(declare-function org-caldav-get-event-etag-list "ext:org-caldav" ())
+(declare-function org-caldav-load-sync-state "ext:org-caldav" ())
+(declare-function org-caldav-save-sync-state "ext:org-caldav" ())
+(declare-function org-caldav-sync-state-filename "ext:org-caldav" (id))
+(declare-function org-caldav-var-for-key "ext:org-caldav" (key))
+(declare-function org-caldav-use-oauth2 "ext:org-caldav" ())
+(declare-function org-caldav-check-oauth2 "ext:org-caldav" (provider))
+(declare-function org-caldav-retrieve-oauth2-token "ext:org-caldav" (provider calendar-id))
+(declare-function org-caldav-debug-print "ext:org-caldav" (level &rest objects))
+(declare-function org-caldav-get-org-files-for-sync "ext:org-caldav" ())
+(declare-function org-caldav-inbox-file "ext:org-caldav" (inbox))
+(declare-function org-caldav-update-events-in-org "ext:org-caldav" ())
+(declare-function org-caldav-display-sync-results "ext:org-caldav" ())
+(declare-function org-caldav-add-event "ext:org-caldav" (uid md5 etag sequence status))
+(declare-function org-caldav-search-event "ext:org-caldav" (uid))
+(declare-function org-caldav-event-md5 "ext:org-caldav" (event))
+(declare-function org-caldav-event-etag "ext:org-caldav" (event))
+(declare-function org-caldav-event-status "ext:org-caldav" (event))
+(declare-function org-caldav-event-set-status "ext:org-caldav" (event status))
+(declare-function org-caldav-event-set-etag "ext:org-caldav" (event etag))
+(declare-function org-caldav-sync-do-cal->org "ext:org-caldav" ())
+(declare-function org-caldav-sync-do-org->cal "ext:org-caldav" ())
+
+(defvar org-caldav-calendar-id)
+(defvar org-caldav-calendars)
+(defvar org-caldav-files)
+(defvar org-caldav-inbox)
+(defvar org-caldav-sync-direction)
+(defvar org-caldav-event-list)
+(defvar org-caldav-previous-files)
+(defvar org-caldav-previous-calendar)
+(defvar org-caldav-empty-calendar)
+(defvar org-caldav-sync-result)
+(defvar org-caldav-show-sync-results)
+(defvar org-caldav-retry-attempts)
+(defvar org-caldav-url)
+(defvar org-caldav-delete-org-entries)
+
+(defvar org-auto-scheduler--caldav-session-active nil
+  "Non-nil when inside an `org-auto-scheduler--with-caldav-session' scope.")
+
+(defvar org-auto-scheduler--caldav-checked-urls nil
+  "Hash table of CalDAV event URLs already connection-checked in the current session.")
+
+(defvar org-auto-scheduler--caldav-etag-cache nil
+  "Hash table mapping CalDAV event URLs to their last fetched `(uid . etag)' list in this session.")
+
+(defvar org-auto-scheduler--caldav-session-dirty nil
+  "Non-nil if local Org files or scheduler actions require a post-schedule `Org -> Cal' push.")
+
+(defvar org-auto-scheduler--caldav-pull-done nil
+  "Non-nil if the pre-schedule `Cal -> Org' pull has already completed in the current session.")
+
+(defvar org-auto-scheduler--caldav-pull-only nil
+  "Non-nil while executing the lightweight pre-schedule `Cal -> Org' pull.")
+
+(defvar org-auto-scheduler--caldav-pull-changed nil
+  "Non-nil if the pre-schedule pull applied remote changes to Org files.")
+
+(defvar org-auto-scheduler--caldav-pull-results nil
+  "Saved `org-caldav-sync-result' entries from the pre-schedule pull pass.")
+
+(defun org-auto-scheduler--call-with-caldav-session (fn)
+  "Call FN within a shared CalDAV optimization session.
+Reuses an outer session if one is already active."
+  (if org-auto-scheduler--caldav-session-active
+      (funcall fn)
+    (let ((org-auto-scheduler--caldav-session-active t)
+          (org-auto-scheduler--caldav-checked-urls (make-hash-table :test 'equal))
+          (org-auto-scheduler--caldav-etag-cache (make-hash-table :test 'equal))
+          (org-auto-scheduler--caldav-session-dirty nil)
+          (org-auto-scheduler--caldav-pull-done nil)
+          (org-auto-scheduler--caldav-pull-changed nil)
+          (org-auto-scheduler--caldav-pull-results nil))
+      (funcall fn))))
+
+(defmacro org-auto-scheduler--with-caldav-session (&rest body)
+  "Execute BODY within a shared CalDAV optimization session.
+Reuses an outer session if one is already active."
+  (declare (indent 0) (debug t))
+  `(org-auto-scheduler--call-with-caldav-session (lambda () ,@body)))
+
 (defun org-auto-scheduler--org-caldav-load-sync-state-advice (orig-fun &rest args)
   "Ensure the temporary buffer in `org-caldav-load-sync-state' has lexical-binding set."
   (let ((orig-insert-file-contents (symbol-function 'insert-file-contents)))
@@ -854,13 +940,373 @@ review preparation, review application, or sync) is currently in progress.")
                    (apply orig-insert iargs)))))
       (apply orig-fun args))))
 
-(with-eval-after-load 'org-caldav
+(defun org-auto-scheduler--org-caldav-check-connection-advice (orig-fun &rest args)
+  "Reuse connection check within an active `org-auto-scheduler' CalDAV session.
+An empty remote calendar is never cached: a later PUT resets
+`org-caldav-empty-calendar', and replaying a stale `empty' state would make
+`org-caldav-get-event-etag-list' wrongly return nil."
+  (if (and org-auto-scheduler--caldav-session-active
+           (hash-table-p org-auto-scheduler--caldav-checked-urls))
+      (let* ((url (org-caldav-events-url))
+             (cached (gethash url org-auto-scheduler--caldav-checked-urls)))
+        (if cached
+            t
+          (let ((res (apply orig-fun args)))
+            (unless org-caldav-empty-calendar
+              (puthash url t org-auto-scheduler--caldav-checked-urls))
+            res)))
+    (apply orig-fun args)))
+
+(defun org-auto-scheduler--org-caldav-get-event-etag-list-advice (orig-fun &rest args)
+  "Cache `org-caldav-get-event-etag-list' within a session until a PUT or DELETE occurs."
+  (if (and org-auto-scheduler--caldav-session-active
+           (hash-table-p org-auto-scheduler--caldav-etag-cache))
+      (let* ((url (org-caldav-events-url))
+             (cached (gethash url org-auto-scheduler--caldav-etag-cache '--miss--)))
+        (if (not (eq cached '--miss--))
+            (if (listp cached) (cl-copy-list cached) cached)
+          (let ((res (apply orig-fun args)))
+            (unless org-caldav-empty-calendar
+              (puthash url (if (listp res) (cl-copy-list res) res)
+                       org-auto-scheduler--caldav-etag-cache))
+            res)))
+    (apply orig-fun args)))
+
+(defun org-auto-scheduler--org-caldav-invalidate-etag-cache (&rest _args)
+  "Invalidate cached ETag list for current calendar URL after a PUT or DELETE."
+  (when (and org-auto-scheduler--caldav-session-active
+             (hash-table-p org-auto-scheduler--caldav-etag-cache))
+    (let ((url (ignore-errors (org-caldav-events-url))))
+      (when url
+        (remhash url org-auto-scheduler--caldav-etag-cache)))))
+
+(defun org-auto-scheduler--caldav-calendar-has-local-edits-p (&optional calendar)
+  "Return non-nil if CALENDAR has unsaved buffer edits or Org files newer than its sync state."
+  (let (calkeys calvalues)
+    (dolist (i (number-sequence 0 (1- (length calendar)) 2))
+      (setq calkeys (append calkeys (list (nth i calendar)))
+            calvalues (append calvalues (list (nth (1+ i) calendar)))))
+    (cl-progv (mapcar #'org-caldav-var-for-key calkeys) calvalues
+      (when (org-caldav-sync-do-org->cal)
+        (let* ((state-file (and org-caldav-calendar-id
+                                (ignore-errors
+                                  (org-caldav-sync-state-filename org-caldav-calendar-id))))
+               (state-attrs (and state-file (file-exists-p state-file)
+                                 (ignore-errors (file-attributes state-file))))
+               (state-mtime (and state-attrs (file-attribute-modification-time state-attrs))))
+          (if (null state-mtime)
+              (if state-file
+                  t
+                ;; No resolvable calendar id/state file: only unsaved edits count.
+                (cl-some (lambda (file)
+                           (let ((buf (and (stringp file) (get-file-buffer (expand-file-name file)))))
+                             (and buf (buffer-modified-p buf))))
+                         (org-caldav-get-org-files-for-sync)))
+            (cl-some
+             (lambda (file)
+               (when (and file (stringp file))
+                 (let* ((exp-file (expand-file-name file))
+                        (buf (get-file-buffer exp-file)))
+                   (or (and buf (buffer-modified-p buf))
+                       (and (file-exists-p exp-file)
+                            (let* ((attrs (ignore-errors (file-attributes exp-file)))
+                                   (mtime (and attrs (file-attribute-modification-time attrs))))
+                              (and mtime (time-less-p state-mtime mtime))))))))
+             (org-caldav-get-org-files-for-sync))))))))
+
+(defun org-auto-scheduler--caldav-pull-calendar (&optional calendar)
+  "Pull remote CalDAV changes (`Cal -> Org') for CALENDAR without exporting Org files.
+Returns non-nil if remote changes were pulled into Org."
+  (setq org-caldav-empty-calendar nil)
+  (setq org-caldav-previous-calendar calendar)
+  (when (org-auto-scheduler--caldav-calendar-has-local-edits-p calendar)
+    (setq org-auto-scheduler--caldav-session-dirty t))
+  (let (calkeys calvalues pulled-changes)
+    (dolist (i (number-sequence 0 (1- (length calendar)) 2))
+      (setq calkeys (append calkeys (list (nth i calendar)))
+            calvalues (append calvalues (list (nth (1+ i) calendar)))))
+    (cl-progv (mapcar #'org-caldav-var-for-key calkeys) calvalues
+      (when (org-caldav-sync-do-cal->org)
+        (let ((state-file (and org-caldav-calendar-id
+                               (ignore-errors
+                                 (org-caldav-sync-state-filename org-caldav-calendar-id)))))
+          (if (or (null state-file) (not (file-exists-p state-file)))
+              ;; Never synced before: defer to full sync during push pass
+              (setq org-auto-scheduler--caldav-session-dirty t)
+            (when (org-caldav-use-oauth2)
+              (org-caldav-check-oauth2 org-caldav-url)
+              (org-caldav-retrieve-oauth2-token org-caldav-url org-caldav-calendar-id))
+            (let ((numretry 0)
+                  success)
+              (while (null success)
+                (condition-case err
+                    (progn
+                      (org-caldav-check-connection)
+                      (setq success t))
+                  (error
+                   (if (= numretry (1- org-caldav-retry-attempts))
+                       (org-caldav-check-connection)
+                     (org-caldav-debug-print
+                      1 "Got error while checking connection (will try again):" err)
+                     (cl-incf numretry))))))
+            (setq org-caldav-event-list nil
+                  org-caldav-previous-files nil)
+            (org-caldav-load-sync-state)
+            (let* ((raw-events (org-caldav-get-event-etag-list))
+                   (remote-events (if (eq raw-events 'empty) nil raw-events))
+                   (seen-uids (make-hash-table :test 'equal))
+                   (has-remote-changes nil)
+                   (has-new-in-cal nil)
+                   (id-files-updated nil))
+              (dolist (cur org-caldav-event-list)
+                (unless (eq (org-caldav-event-status cur) 'ignored)
+                  (org-caldav-event-set-status cur nil)))
+              (cl-flet ((ensure-id-marker (uid)
+                          (or (org-id-find uid t)
+                              (and (not id-files-updated)
+                                   (progn
+                                     (setq id-files-updated t)
+                                     (org-id-update-id-locations
+                                      (cl-remove-if-not #'file-exists-p
+                                                        (org-caldav-get-org-files-for-sync)))
+                                     (org-id-find uid t))))))
+                (dolist (cur remote-events)
+                  (let* ((uid (car cur))
+                         (etag (cdr cur))
+                         (dbentry (org-caldav-search-event uid)))
+                    (puthash uid t seen-uids)
+                    (cond
+                     ((not dbentry)
+                      (org-caldav-debug-print 1 (format "Cal UID %s: New (fast pre-pull)" uid))
+                      (org-caldav-add-event uid nil etag nil 'new-in-cal)
+                      (setq has-remote-changes t
+                            has-new-in-cal t))
+                     ((eq (org-caldav-event-status dbentry) 'ignored)
+                      nil)
+                     ((null (org-caldav-event-etag dbentry))
+                      (org-caldav-event-set-status dbentry 'synced)
+                      (setq org-auto-scheduler--caldav-session-dirty t))
+                     ((not (string= etag (org-caldav-event-etag dbentry)))
+                      (if (string-match "^orgsexp-" uid)
+                          (progn
+                            (org-caldav-event-set-status dbentry 'changed-in-cal)
+                            (org-caldav-event-set-etag dbentry etag)
+                            (setq has-remote-changes t))
+                        (let ((m (ensure-id-marker uid)))
+                          (if (null m)
+                              (progn
+                                (org-caldav-debug-print
+                                 1 (format "Cal UID %s: Ignoring remote change (deleted in Org)" uid))
+                                (org-caldav-event-set-status dbentry 'synced)
+                                (setq org-auto-scheduler--caldav-session-dirty t))
+                            (let ((cur-md5 (with-current-buffer (marker-buffer m)
+                                             (save-excursion
+                                               (goto-char (marker-position m))
+                                               (md5 (buffer-substring-no-properties
+                                                     (org-entry-beginning-position)
+                                                     (org-entry-end-position))))))
+                                  (saved-md5 (org-caldav-event-md5 dbentry)))
+                              (move-marker m nil)
+                              (if (and saved-md5 (not (string= cur-md5 saved-md5)))
+                                  (progn
+                                    (org-caldav-debug-print
+                                     1 (format "Cal UID %s: Ignoring remote change (Org always wins)" uid))
+                                    (org-caldav-event-set-status dbentry 'synced)
+                                    (setq org-auto-scheduler--caldav-session-dirty t))
+                                (org-caldav-debug-print
+                                 1 (format "Cal UID %s: Changed (fast pre-pull)" uid))
+                                (org-caldav-event-set-status dbentry 'changed-in-cal)
+                                (org-caldav-event-set-etag dbentry etag)
+                                (setq has-remote-changes t)))))))
+                     (t
+                      (org-caldav-event-set-status dbentry 'synced)))))
+                (dolist (cur org-caldav-event-list)
+                  (when (null (org-caldav-event-status cur))
+                    (let ((uid (car cur)))
+                      (if (and (org-caldav-event-etag cur)
+                               (not (gethash uid seen-uids))
+                               (not (eq org-caldav-delete-org-entries 'never))
+                               (let ((m (ensure-id-marker uid)))
+                                 (when m (move-marker m nil) t)))
+                          (progn
+                            (org-caldav-debug-print
+                             1 (format "Cal UID %s: Deleted in Cal (fast pre-pull)" uid))
+                            (org-caldav-event-set-status cur 'deleted-in-cal)
+                            (setq has-remote-changes t))
+                        (org-caldav-event-set-status cur 'synced))))))
+              (when has-remote-changes
+                (org-caldav-update-events-in-org)
+                (org-caldav-save-sync-state)
+                (when has-new-in-cal
+                  (let ((inbox-file (org-caldav-inbox-file org-caldav-inbox)))
+                    (when (and inbox-file (file-exists-p inbox-file))
+                      (org-id-update-id-locations (list inbox-file)))))
+                (setq pulled-changes t
+                      org-auto-scheduler--caldav-pull-changed t))
+              (setq org-caldav-event-list nil))))))
+    pulled-changes))
+
+(defun org-auto-scheduler--call-with-caldav-caches (fn)
+  "Call FN with session connection/ETag caches wrapped around org-caldav.
+Uses `cl-letf' (not `advice-add') so the caches also apply when callers
+rebind these functions, and so no persistent advice is left on them."
+  (if (and org-auto-scheduler--caldav-session-active
+           (fboundp 'org-caldav-check-connection)
+           (fboundp 'org-caldav-get-event-etag-list))
+      (let ((orig-check (symbol-function 'org-caldav-check-connection))
+            (orig-etags (symbol-function 'org-caldav-get-event-etag-list)))
+        (cl-letf (((symbol-function 'org-caldav-check-connection)
+                   (lambda (&rest args)
+                     (apply #'org-auto-scheduler--org-caldav-check-connection-advice
+                            orig-check args)))
+                  ((symbol-function 'org-caldav-get-event-etag-list)
+                   (lambda (&rest args)
+                     (apply #'org-auto-scheduler--org-caldav-get-event-etag-list-advice
+                            orig-etags args))))
+          (funcall fn)))
+    (funcall fn)))
+
+(defun org-auto-scheduler--org-caldav-sync-calendar-advice (orig-fun &optional calendar resume)
+  "Route `org-caldav-sync-calendar' to the fast pre-schedule pull when active.
+The post-schedule push always runs the real `org-caldav-sync-calendar', so
+deletions and Cal->Org reconciliation keep org-caldav semantics.  Network cost
+is bounded by the session connection and ETag caches."
+  (org-auto-scheduler--call-with-caldav-caches
+   (lambda ()
+     (if (and org-auto-scheduler--caldav-pull-only (not resume))
+         (org-auto-scheduler--caldav-pull-calendar calendar)
+       (funcall orig-fun calendar resume)))))
+
+(defun org-auto-scheduler--install-org-caldav-advices ()
+  "Register `org-auto-scheduler' advices on `org-caldav' functions."
+  ;; Remove advice from earlier versions (also when the function is now undefined).
+  (dolist (spec '((org-caldav-check-connection . org-auto-scheduler--org-caldav-check-connection-advice)
+                  (org-caldav-get-event-etag-list . org-auto-scheduler--org-caldav-get-event-etag-list-advice)
+                  (org-caldav-update-eventdb-from-cal . org-auto-scheduler--org-caldav-update-eventdb-from-cal-advice)
+                  (org-caldav-update-events-in-org . org-auto-scheduler--org-caldav-update-events-in-org-advice)))
+    (ignore-errors (advice-remove (car spec) (cdr spec))))
   (advice-add 'org-caldav-load-sync-state :around #'org-auto-scheduler--org-caldav-load-sync-state-advice)
-  (advice-add 'org-caldav-save-sync-state :around #'org-auto-scheduler--org-caldav-save-sync-state-advice))
+  (advice-add 'org-caldav-save-sync-state :around #'org-auto-scheduler--org-caldav-save-sync-state-advice)
+  (advice-add 'org-caldav-put-event :after #'org-auto-scheduler--org-caldav-invalidate-etag-cache)
+  (advice-add 'org-caldav-delete-event :after #'org-auto-scheduler--org-caldav-invalidate-etag-cache)
+  (advice-add 'org-caldav-sync-calendar :around #'org-auto-scheduler--org-caldav-sync-calendar-advice))
+
+(with-eval-after-load 'org-caldav
+  (org-auto-scheduler--install-org-caldav-advices))
 
 (when (featurep 'org-caldav)
-  (advice-add 'org-caldav-load-sync-state :around #'org-auto-scheduler--org-caldav-load-sync-state-advice)
-  (advice-add 'org-caldav-save-sync-state :around #'org-auto-scheduler--org-caldav-save-sync-state-advice))
+  (org-auto-scheduler--install-org-caldav-advices))
+
+(defvar org-auto-scheduler--caldav-last-push-failure nil
+  "Time of the last failed CalDAV push, used to throttle background retries.")
+
+(defcustom org-auto-scheduler-caldav-retry-cooldown 300
+  "Seconds the background daemon waits before retrying a failed CalDAV push."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defun org-auto-scheduler--caldav-in-failure-cooldown-p ()
+  "Return non-nil if a background run should not retry a recently failed push."
+  (and org-auto-scheduler--caldav-last-push-failure
+       (org-auto-scheduler--caldav-background-run-p)
+       (< (float-time (time-since org-auto-scheduler--caldav-last-push-failure))
+          org-auto-scheduler-caldav-retry-cooldown)))
+
+(defun org-auto-scheduler--caldav-needs-push-p (&optional force-dirty)
+  "Return non-nil if local Org files or scheduler changes need to be pushed to CalDAV.
+A leftover `org-caldav-event-list' is deliberately not treated as a reason to
+push: it only means an earlier sync was aborted, which the next sync resumes."
+  (and (not (and (not force-dirty)
+                 (org-auto-scheduler--caldav-in-failure-cooldown-p)))
+       (or force-dirty
+           org-auto-scheduler--caldav-session-dirty
+           (and (fboundp 'org-caldav-sync-state-filename)
+                (if (and (boundp 'org-caldav-calendars) org-caldav-calendars)
+                    (cl-some #'org-auto-scheduler--caldav-calendar-has-local-edits-p
+                             org-caldav-calendars)
+                  (org-auto-scheduler--caldav-calendar-has-local-edits-p nil))))))
+
+(defun org-auto-scheduler--caldav-pull ()
+  "Perform a lightweight pre-schedule `Cal -> Org' pull if not already done in this session.
+Returns non-nil only if remote changes may have been applied to Org files."
+  (when (and org-auto-scheduler-sync-caldav
+             (not org-auto-scheduler--preview-mode)
+             (not org-auto-scheduler--caldav-pull-done)
+             (require 'org-caldav nil t))
+    (setq org-auto-scheduler--caldav-pull-done t)
+    (condition-case err
+        (let* ((resume (bound-and-true-p org-caldav-event-list))
+               (org-auto-scheduler--caldav-pull-only (null resume))
+               (org-caldav-show-sync-results nil))
+          (org-caldav-sync)
+          (when (bound-and-true-p org-caldav-sync-result)
+            (setq org-auto-scheduler--caldav-pull-results
+                  (append org-auto-scheduler--caldav-pull-results
+                          (copy-sequence org-caldav-sync-result))))
+          ;; A resumed (full) sync may have touched Org files; assume changed.
+          (or resume org-auto-scheduler--caldav-pull-changed))
+      (error
+       (message "CalDAV sync failed (pre-schedule): %s" (error-message-string err))
+       nil))))
+
+(defun org-auto-scheduler--caldav-background-run-p ()
+  "Return non-nil when running inside the background daemon."
+  (memq org-auto-scheduler--current-run-type '(background-async background-sync)))
+
+(defun org-auto-scheduler--caldav-push (&optional force-dirty)
+  "Conditionally push local Org & scheduler changes (`Org -> Cal') if dirty.
+In background runs, agenda buffers are only auto-saved when
+`org-auto-scheduler-background-save-buffers' is non-nil; otherwise the push is
+skipped if any agenda buffer has unsaved edits."
+  (when (and org-auto-scheduler-sync-caldav
+             (not org-auto-scheduler--preview-mode)
+             (require 'org-caldav nil t))
+    (cond
+     ((not (org-auto-scheduler--caldav-needs-push-p force-dirty))
+      (org-auto-scheduler--log-info "Skipping post-schedule CalDAV push (no local or schedule changes)")
+      (when (and org-auto-scheduler--caldav-pull-results
+                 (bound-and-true-p org-caldav-show-sync-results)
+                 (not (bound-and-true-p org-auto-scheduler-silent-mode))
+                 (fboundp 'org-caldav-display-sync-results))
+        (setq org-caldav-sync-result org-auto-scheduler--caldav-pull-results)
+        (org-caldav-display-sync-results)))
+     ((and (org-auto-scheduler--caldav-background-run-p)
+           (not (bound-and-true-p org-auto-scheduler-background-save-buffers))
+           (cl-some (lambda (f)
+                      (let ((b (and f (get-file-buffer f))))
+                        (and b (buffer-modified-p b))))
+                    (ignore-errors (org-agenda-files t))))
+      (org-auto-scheduler--log-info
+       "Skipping background CalDAV push: unsaved agenda buffers and background auto-save is disabled"))
+     (t
+      (when (or (not (org-auto-scheduler--caldav-background-run-p))
+                (bound-and-true-p org-auto-scheduler-background-save-buffers))
+        (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV push")
+        (save-some-buffers t (lambda ()
+                               (and (buffer-file-name)
+                                    (member (buffer-file-name) (org-agenda-files t))))))
+      (condition-case err
+          (let ((saved-show (and (not (bound-and-true-p org-auto-scheduler-silent-mode))
+                                 org-caldav-show-sync-results)))
+            (let ((org-caldav-show-sync-results nil))
+              (org-caldav-sync))
+            (when org-auto-scheduler--caldav-pull-results
+              (setq org-caldav-sync-result
+                    (append org-auto-scheduler--caldav-pull-results org-caldav-sync-result)))
+            (when (and saved-show (fboundp 'org-caldav-display-sync-results))
+              (org-caldav-display-sync-results))
+            (setq org-auto-scheduler--caldav-session-dirty nil
+                  org-auto-scheduler--caldav-last-push-failure nil))
+        (error
+         (setq org-auto-scheduler--caldav-last-push-failure (current-time))
+         ;; Keep pull results visible even though the push failed.
+         (when (and org-auto-scheduler--caldav-pull-results
+                    (not (bound-and-true-p org-auto-scheduler-silent-mode))
+                    (bound-and-true-p org-caldav-show-sync-results)
+                    (fboundp 'org-caldav-display-sync-results))
+           (setq org-caldav-sync-result org-auto-scheduler--caldav-pull-results)
+           (ignore-errors (org-caldav-display-sync-results)))
+         (message "CalDAV sync failed (post-schedule): %s" (error-message-string err))))))))
 
 (defcustom org-auto-scheduler-allowed-hostnames nil
   "List of hostnames allowed to run background auto-scheduling.
@@ -3069,45 +3515,48 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
     (org-auto-scheduler--log-info "Waiting for background scheduler thread to complete...")
     (thread-join org-auto-scheduler--background-thread))
   (org-auto-scheduler--with-active-operation (or org-auto-scheduler--current-run-type 'scheduling)
-    (org-auto-scheduler--log-info "Starting auto-scheduling process")
-  (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders force-replan)))
-    (setq org-auto-scheduler--session-cleaned-placeholders (or cleaned-placeholders 0))
-    (org-auto-scheduler-load-review-decisions)
-    (when (and org-auto-scheduler-sync-caldav
-               (not org-auto-scheduler--preview-mode)
-               (require 'org-caldav nil t))
-      (condition-case err
-          (org-caldav-sync)
-        (error (message "CalDAV sync failed (pre-schedule): %s" (error-message-string err)))))
-    (condition-case err
-        (progn
-          (org-auto-scheduler-validate-config)              ; Validate config at runtime
-          (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
-          (setq org-auto-scheduler--pomodoro-continuous-minutes 0)
-          (unless (hash-table-p org-auto-scheduler--placement-traces)
-            (setq org-auto-scheduler--placement-traces (make-hash-table :test 'equal)))
-          (clrhash org-auto-scheduler--placement-traces)
-          (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
-          (unless org-auto-scheduler--preview-mode
-            (org-auto-scheduler-create-report-buffer))      ; Create the report buffer
-          (let* ((raw-tasks (org-auto-scheduler-get-schedulable-tasks))
-                 (marker-data (make-hash-table :test 'equal))
-                 (has-r-all nil)
-                 (tasks
-                  (let ((sched-tasks '()))
-                    (dolist (m raw-tasks)
-                      (let* ((task-id (org-with-point-at m
-                                        (or (org-id-get)
-                                            (when (buffer-file-name) (org-id-get-create))))))
-                        (when task-id
-                          (let ((m-res (org-auto-scheduler--process-title-markers m)))
-                            (when m-res
-                              (puthash task-id m-res marker-data)
-                              (when (plist-get m-res :reschedule-all)
-                                (setq has-r-all t)))
-                            (unless (and m-res (or (plist-get m-res :done) (plist-get m-res :kill) (plist-get m-res :waiting)))
-                              (push m sched-tasks))))))
-                    (nreverse sched-tasks)))
+    (org-auto-scheduler--with-caldav-session
+      (org-auto-scheduler--log-info "Starting auto-scheduling process")
+      (when (and org-auto-scheduler-sync-caldav
+                 (not org-auto-scheduler--preview-mode))
+        (org-auto-scheduler--caldav-pull))
+      (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders force-replan)))
+        (setq org-auto-scheduler--session-cleaned-placeholders (or cleaned-placeholders 0))
+        (when (and (not org-auto-scheduler--preview-mode)
+                   (> org-auto-scheduler--session-cleaned-placeholders 0))
+          (setq org-auto-scheduler--caldav-session-dirty t))
+        (org-auto-scheduler-load-review-decisions)
+        (condition-case err
+            (progn
+              (org-auto-scheduler-validate-config)              ; Validate config at runtime
+              (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
+              (setq org-auto-scheduler--pomodoro-continuous-minutes 0)
+              (unless (hash-table-p org-auto-scheduler--placement-traces)
+                (setq org-auto-scheduler--placement-traces (make-hash-table :test 'equal)))
+              (clrhash org-auto-scheduler--placement-traces)
+              (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
+              (unless org-auto-scheduler--preview-mode
+                (org-auto-scheduler-create-report-buffer))      ; Create the report buffer
+              (let* ((raw-tasks (org-auto-scheduler-get-schedulable-tasks))
+                     (marker-data (make-hash-table :test 'equal))
+                     (has-r-all nil)
+                     (tasks
+                      (let ((sched-tasks '()))
+                        (dolist (m raw-tasks)
+                          (let* ((task-id (org-with-point-at m
+                                            (or (org-id-get)
+                                                (when (buffer-file-name) (org-id-get-create))))))
+                            (when task-id
+                              (let ((m-res (org-auto-scheduler--process-title-markers m)))
+                                (when m-res
+                                  (puthash task-id m-res marker-data)
+                                  (unless org-auto-scheduler--preview-mode
+                                    (setq org-auto-scheduler--caldav-session-dirty t))
+                                  (when (plist-get m-res :reschedule-all)
+                                    (setq has-r-all t)))
+                                (unless (and m-res (or (plist-get m-res :done) (plist-get m-res :kill) (plist-get m-res :waiting)))
+                                  (push m sched-tasks))))))
+                        (nreverse sched-tasks)))
                  (_ (org-auto-scheduler--merge-saved-decisions tasks))
                  (sorted-tasks-info (org-auto-scheduler-sort-tasks tasks))
                  (initial-snapshot (org-auto-scheduler--capture-tasks-snapshot sorted-tasks-info))
@@ -3676,6 +4125,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (org-auto-scheduler--detect-task-changes initial-snapshot
                                                             org-auto-scheduler-completed-tasks
                                                             marker-data))
+              (when (and (not org-auto-scheduler--preview-mode)
+                         org-auto-scheduler--last-run-changes)
+                (setq org-auto-scheduler--caldav-session-dirty t))
               ;; Update fingerprint and backfilled slot caches when committing (or on 0-change dry-run)
               (when (or (not org-auto-scheduler--preview-mode)
                         (null org-auto-scheduler--last-run-changes))
@@ -3691,30 +4143,29 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                       (setq cleared-any t)))
                   (when cleared-any
                     (org-auto-scheduler-save-review-decisions t)))))
-          (when (org-auto-scheduler--should-log-changes-p)
-            (org-auto-scheduler--record-run-changes
-             :run-type (or org-auto-scheduler--current-run-type 'manual)
-             :start-time (or (bound-and-true-p org-auto-scheduler--run-start-time) now)
-             :end-time (current-time)
-             :tasks-evaluated total-tasks
-             :changes org-auto-scheduler--last-run-changes
-             :cleaned-placeholders (or org-auto-scheduler--session-cleaned-placeholders 0)))
-          (unless org-auto-scheduler--preview-mode
-            (org-auto-scheduler-display-report))
-          (org-auto-scheduler--log-info "Scheduled %d tasks (changes: %d)"
-                                        tasks-scheduled
-                                        (length org-auto-scheduler--last-run-changes))
-          (when (and org-auto-scheduler-sync-caldav
-                     (require 'org-caldav nil t))
-            (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV sync")
-            (save-some-buffers t (lambda ()
-                                   (and (buffer-file-name)
-                                        (member (buffer-file-name) (org-agenda-files t)))))
-            (condition-case err
-                (org-caldav-sync)
-              (error (message "CalDAV sync failed (post-schedule): %s" (error-message-string err)))))))
-      (error
-       (org-auto-scheduler--log-error "Error in scheduling process: %s" err))))))
+              (when (org-auto-scheduler--should-log-changes-p)
+                (org-auto-scheduler--record-run-changes
+                 :run-type (or org-auto-scheduler--current-run-type 'manual)
+                 :start-time (or (bound-and-true-p org-auto-scheduler--run-start-time) now)
+                 :end-time (current-time)
+                 :tasks-evaluated total-tasks
+                 :changes org-auto-scheduler--last-run-changes
+                 :cleaned-placeholders (or org-auto-scheduler--session-cleaned-placeholders 0)))
+              (unless org-auto-scheduler--preview-mode
+                (org-auto-scheduler-display-report))
+              (org-auto-scheduler--log-info "Scheduled %d tasks (changes: %d)"
+                                            tasks-scheduled
+                                            (length org-auto-scheduler--last-run-changes))
+              (when (and org-auto-scheduler-sync-caldav
+                         (not org-auto-scheduler--preview-mode))
+                (org-auto-scheduler--caldav-push))))
+          (error
+           (org-auto-scheduler--log-error "Error in scheduling process: %s" err)
+           ;; Edits made before the failure (placeholder cleanup, marker
+           ;; stripping, partial scheduling) still need to reach the calendar.
+           (when (and org-auto-scheduler--caldav-session-dirty
+                      (not org-auto-scheduler--preview-mode))
+             (ignore-errors (org-auto-scheduler--caldav-push)))))))))
 
 (defun org-auto-scheduler--set-scheduled (schedule-str)
   "Safely set SCHEDULED planning info on current heading to SCHEDULE-STR.

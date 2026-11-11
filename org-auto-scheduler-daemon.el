@@ -20,6 +20,9 @@
 
 (declare-function org-auto-scheduler-reschedule-past-tasks-to-today "org-auto-scheduler" (&optional target-date scope))
 (declare-function org-auto-scheduler-schedule-tasks "org-auto-scheduler" (&optional force-replan))
+(declare-function org-auto-scheduler--call-with-caldav-session "org-auto-scheduler" (fn))
+(declare-function org-auto-scheduler--caldav-pull "org-auto-scheduler" ())
+(declare-function org-auto-scheduler--caldav-push "org-auto-scheduler" (&optional force-dirty))
 
 (defvar org-auto-scheduler--idle-timer nil
   "Primary idle timer for background auto-scheduling.")
@@ -298,47 +301,58 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
                   (mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon)))
               (when (and mtime-snapshot
                          (org-auto-scheduler--acquire-or-refresh-host-lease))
-                ;; On first background run of the day, optionally reschedule uncompleted past tasks
-                (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-yesterday-tasks-once)
-                           is-first-run-of-day
-                           (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
-                  (setq resched-past-count
-                        (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
-                ;; Two-Phase Execution:
-                ;; Phase 1: Pure in-memory dry-run (when no inline title markers require stripping)
-                (if (or (> resched-past-count 0)
-                        (org-auto-scheduler--agenda-has-title-markers-p))
-                    (org-auto-scheduler-schedule-tasks)
-                  (let ((org-auto-scheduler--preview-mode t))
-                    (org-auto-scheduler-schedule-tasks))
-                  ;; Phase 2: Fast atomic commit ONLY if Phase 1 detected actual schedule changes
-                  ;; and disk mtimes / buffer clean state remain unchanged.
-                  (when (and org-auto-scheduler--last-run-changes
-                             (> (length org-auto-scheduler--last-run-changes) 0)
-                             (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
-                    (let ((org-auto-scheduler--preview-mode nil))
-                      (org-auto-scheduler-schedule-tasks))))
-                ;; Save agenda buffers if configured and changes were made
-                (when (and org-auto-scheduler-background-save-buffers
-                           (or (and org-auto-scheduler--last-run-changes
-                                    (> (length org-auto-scheduler--last-run-changes) 0))
-                               (> resched-past-count 0)))
-                  (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
-                  (save-some-buffers t (lambda ()
-                                         (and (buffer-file-name)
-                                              (member (buffer-file-name) (org-agenda-files t))))))
-                ;; Notify user if changes were made
-                (when (and org-auto-scheduler-change-log-notify
-                           (or (and org-auto-scheduler--last-run-changes
-                                    (> (length org-auto-scheduler--last-run-changes) 0))
-                               (> resched-past-count 0)))
-                  (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
-                           (length (or org-auto-scheduler--last-run-changes '()))
-                           (if (> resched-past-count 0)
-                               (format " (%d from past days rescheduled)" resched-past-count)
-                             "")))
-                ;; Server-only End-of-Day adherence check
-                (org-auto-scheduler--maybe-run-server-eod-check (current-time))))
+                (org-auto-scheduler--call-with-caldav-session
+                 (lambda ()
+                   (when (org-auto-scheduler--caldav-pull)
+                     (setq mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon)))
+                   (when mtime-snapshot
+                     ;; On first background run of the day, optionally reschedule uncompleted past tasks
+                     (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-yesterday-tasks-once)
+                                is-first-run-of-day
+                                (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
+                       (setq resched-past-count
+                             (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
+                     ;; Two-Phase Execution:
+                     ;; Phase 1: Pure in-memory dry-run (when no inline title markers require stripping)
+                     (if (or (> resched-past-count 0)
+                             (org-auto-scheduler--agenda-has-title-markers-p))
+                         (org-auto-scheduler-schedule-tasks)
+                       (let ((org-auto-scheduler--preview-mode t))
+                         (org-auto-scheduler-schedule-tasks))
+                       ;; Phase 2: Fast atomic commit ONLY if Phase 1 detected actual schedule changes
+                       ;; and disk mtimes / buffer clean state remain unchanged.
+                       (if (and org-auto-scheduler--last-run-changes
+                                (> (length org-auto-scheduler--last-run-changes) 0)
+                                (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
+                           (let ((org-auto-scheduler--preview-mode nil))
+                             (org-auto-scheduler-schedule-tasks))
+                         ;; Only push when nothing changed locally during the dry-run.
+                         ;; If changes were detected but disk mtimes moved, skip: the
+                         ;; next run re-evaluates against the fresh files.
+                         (unless (and org-auto-scheduler--last-run-changes
+                                      (> (length org-auto-scheduler--last-run-changes) 0))
+                           (org-auto-scheduler--caldav-push))))
+                     ;; Save agenda buffers if configured and changes were made
+                     (when (and org-auto-scheduler-background-save-buffers
+                                (or (and org-auto-scheduler--last-run-changes
+                                         (> (length org-auto-scheduler--last-run-changes) 0))
+                                    (> resched-past-count 0)))
+                       (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
+                       (save-some-buffers t (lambda ()
+                                              (and (buffer-file-name)
+                                                   (member (buffer-file-name) (org-agenda-files t))))))
+                     ;; Notify user if changes were made
+                     (when (and org-auto-scheduler-change-log-notify
+                                (or (and org-auto-scheduler--last-run-changes
+                                         (> (length org-auto-scheduler--last-run-changes) 0))
+                                    (> resched-past-count 0)))
+                       (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
+                                (length (or org-auto-scheduler--last-run-changes '()))
+                                (if (> resched-past-count 0)
+                                    (format " (%d from past days rescheduled)" resched-past-count)
+                                  "")))
+                     ;; Server-only End-of-Day adherence check
+                     (org-auto-scheduler--maybe-run-server-eod-check (current-time)))))))
           (error
            (org-auto-scheduler--log-error "Error in background scheduler: %s" err)
            (when (org-auto-scheduler--should-log-changes-p)

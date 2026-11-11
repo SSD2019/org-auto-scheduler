@@ -17,6 +17,13 @@
 (require 'color)
 (eval-when-compile (require 'evil nil t))
 
+(declare-function org-auto-scheduler--call-with-caldav-session "org-auto-scheduler" (fn))
+(declare-function org-auto-scheduler--caldav-pull "org-auto-scheduler" ())
+(declare-function org-auto-scheduler--caldav-push "org-auto-scheduler" (&optional force-dirty))
+
+(defvar org-auto-scheduler-sync-caldav)
+(defvar org-auto-scheduler--caldav-pull-done)
+
 (unless (fboundp 'org-auto-scheduler--with-active-operation)
   (defmacro org-auto-scheduler--with-active-operation (op-name &rest body)
     "Execute BODY with `org-auto-scheduler--active-operation` bound to OP-NAME."
@@ -3163,16 +3170,22 @@ Automatically recalculates dependent times based on visual layout before executi
           (message "Applied %d tasks from the auto-scheduler review!" applied-count))
       (kill-buffer (current-buffer)))
     (when (and org-auto-scheduler-sync-caldav
-               (require 'org-caldav nil t))
-      (condition-case err
-          (org-caldav-sync)
-        (error (message "CalDAV sync failed (review apply): %s" (error-message-string err))))))))
+               (fboundp 'org-auto-scheduler--caldav-push))
+      (org-auto-scheduler--call-with-caldav-session
+       (lambda ()
+         (org-auto-scheduler--caldav-pull)
+         (org-auto-scheduler--caldav-push (> applied-count 0))))))))
 
 (defun org-auto-scheduler-review-and-apply ()
   "Calculate an auto-schedule in preview mode and display it for interactive review."
   (interactive)
   (org-auto-scheduler--with-active-operation 'review-prepare
     (org-auto-scheduler-load-review-decisions)
+    (when (and org-auto-scheduler-sync-caldav
+               (fboundp 'org-auto-scheduler--caldav-pull))
+      (org-auto-scheduler--call-with-caldav-session
+       (lambda ()
+         (org-auto-scheduler--caldav-pull))))
   (message "Calculating proposed schedule...")
   (let ((org-auto-scheduler--preview-mode t))
     (org-auto-scheduler-schedule-tasks))
