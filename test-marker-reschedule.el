@@ -6,6 +6,15 @@
 (require 'org)
 (load-file "org-auto-scheduler.el")
 
+;; Many tests assume a morning start.  Pin `current-time' to 08:00 today so the suite
+;; is deterministic at any time of day.  Set TEST_REAL_CLOCK=1 to use the real clock.
+;; (Tests that bind `current-time' themselves via `cl-letf' override this.)
+(defvar test-fixed-now
+  (let ((d (decode-time)))
+    (encode-time 0 0 8 (nth 3 d) (nth 4 d) (nth 5 d))))
+(unless (getenv "TEST_REAL_CLOCK")
+  (advice-add 'current-time :override (lambda () test-fixed-now)))
+
 (defvar test-failures 0)
 (setq test-orig-agenda-files (copy-sequence org-agenda-files))
 (setq test-orig-agenda-files (copy-sequence org-agenda-files))
@@ -481,6 +490,8 @@ SCHEDULED: <%s %s 23:00-23:59>\n\
            (today-dow (format-time-string "%a" fake-now))
            (lapsed-start (format-time-string "%H:%M" (time-subtract fake-now (seconds-to-time 3600))))
            (lapsed-end (format-time-string "%H:%M" (time-subtract fake-now (seconds-to-time 1800))))
+           ;; Lapsed tasks are only left in place by background runs; manual runs replan them.
+           (org-auto-scheduler--current-run-type 'background-sync)
        (org-auto-scheduler-sync-caldav nil)
        (org-auto-scheduler-silent-mode t)
        (org-auto-scheduler-preserve-today-scheduled t)
@@ -1532,7 +1543,8 @@ SCHEDULED: <%s 10:00-11:00>
         (goto-char (point-min))
         (re-search-forward "\\[ \\] Generate PKCE code")
         (beginning-of-line)
-        (org-auto-scheduler-focus-toggle-checklist)
+        ;; A plain toggle cycles [ ] -> [-] (in progress) -> [X]; a prefix arg forces the binary [ ] <-> [X] toggle.
+        (org-auto-scheduler-focus-toggle-checklist t)
         (assert-true (string-match-p "CHECKLIST \\[2/2\\]" (buffer-string)) "Test 16.3: Checklist count updated to 2/2")
         (assert-true (string-match-p "\\[X\\] Generate PKCE code" (buffer-string)) "Test 16.3: Item is now [X]")
         ;; Verify keybindings: RET toggles checklist, SPC is preserved for Spacemacs leader / scrolling
@@ -1627,8 +1639,11 @@ SCHEDULED: <%s 10:00-11:00>
         (insert "#+TODO: TODO NEXT IN-PROGRESS WAITING HOLD | DONE CANCELLED\n")
         (org-mode)
         (insert "* TODO Task With Clock :AUTOSCH:\nSCHEDULED: <2026-09-28 Mon 14:00-15:00>\n:PROPERTIES:\n:ID: test-wait-clk-1\n:EFFORT: 60\n:END:\n")
-        (insert "* WAITING Stale Task A :AUTOSCH:\nSCHEDULED: <2026-09-20 Sun>\n:PROPERTIES:\n:ID: test-wait-stale-a\n:EFFORT: 30\n:WAITING_SINCE: 2026-09-18 10:00\n:END:\n")
-        (insert "* HOLD Fresh Task B :AUTOSCH:\n:PROPERTIES:\n:ID: test-wait-fresh-b\n:EFFORT: 45\n:WAITING_SINCE: 2026-09-28 09:00\n:END:\n")
+        (insert (format "* WAITING Stale Task A :AUTOSCH:\nSCHEDULED: <2026-09-20 Sun>\n:PROPERTIES:\n:ID: test-wait-stale-a\n:EFFORT: 30\n:WAITING_SINCE: %s 10:00\n:END:\n"
+                       ;; relative to the (pinned) current time so the test does not rot as the calendar advances
+                       (format-time-string "%Y-%m-%d" (time-subtract (current-time) (* 10 86400)))))
+        (insert (format "* HOLD Fresh Task B :AUTOSCH:\n:PROPERTIES:\n:ID: test-wait-fresh-b\n:EFFORT: 45\n:WAITING_SINCE: %s 09:00\n:END:\n"
+                       (format-time-string "%Y-%m-%d" (time-subtract (current-time) 86400))))
         (insert "* TODO Normal Active C :AUTOSCH:\n:PROPERTIES:\n:ID: test-wait-active-c\n:EFFORT: 60\n:END:\n")
         (save-buffer)
         (let ((org-agenda-files (list temp-file)))
@@ -2203,8 +2218,8 @@ SCHEDULED: <%s 10:00-11:00>
             (dotimes (i 6)
               (org-auto-scheduler-focus-log-work (format "Progress milestone step #%d" (1+ i))))
             (let ((hud-str (buffer-string)))
-              (assert-true (string-match-p "WORK LOG \\[3-7 of 7\\]" hud-str)
-                           "Test 21.5: Work log header shows [3-7 of 7] entries visible")
+              (assert-true (string-match-p "WORK LOG \\[1-5 of 7\\]" hud-str)
+                           "Test 21.5: Work log header shows [1-5 of 7] (newest five) entries visible")
               (assert-true (string-match-p "Progress milestone step #6" hud-str)
                            "Test 21.5: Latest milestone #6 visible at offset 0"))
             ;; Scroll up to view older logs
@@ -2215,8 +2230,8 @@ SCHEDULED: <%s 10:00-11:00>
             ;; Scroll up again
             (org-auto-scheduler-focus-log-scroll-up)
             (let ((hud-str (buffer-string)))
-              (assert-true (string-match-p "WORK LOG \\[1-5 of 7\\]" hud-str)
-                           "Test 21.5: Scroll up shifted to oldest window [1-5 of 7]")
+              (assert-true (string-match-p "WORK LOG \\[3-7 of 7\\]" hud-str)
+                           "Test 21.5: Scroll up shifted to oldest window [3-7 of 7]")
               (assert-true (string-match-p "Implemented nested checklist support" hud-str)
                            "Test 21.5: Oldest work log entry visible after scroll"))
             ;; Scroll down back toward newest
@@ -3024,7 +3039,7 @@ SCHEDULED: <%s %s 16:26-18:26>\n\
        (org-auto-scheduler-end-time "18:00")
        (org-auto-scheduler-start-buffer-minutes 5)
        (org-auto-scheduler-task-gap 0)
-       (org-auto-scheduler--current-run-type 'background)
+       (org-auto-scheduler--current-run-type 'background-sync)
        (org-auto-scheduler--saved-review-decisions nil)
        (org-auto-scheduler--last-task-fingerprints nil)
        (org-auto-scheduler--backfilled-task-slots (make-hash-table :test 'equal)))
@@ -3123,7 +3138,7 @@ SCHEDULED: <2026-10-07 Wed 14:00-15:00>\n\
        (org-auto-scheduler-end-time "18:00")
        (org-auto-scheduler-start-buffer-minutes 0)
        (org-auto-scheduler-task-gap 0)
-       (org-auto-scheduler--current-run-type 'background)
+       (org-auto-scheduler--current-run-type 'background-sync)
        (org-auto-scheduler--saved-review-decisions nil))
   ;; Stale schedule where [#B] Dependent (09:00-10:00) is scheduled BEFORE its [#A] Blocker (11:00-12:00),
   ;; and Transitive Child C (10:00-10:30) depends on B!
@@ -3306,7 +3321,330 @@ SCHEDULED: <2026-10-07 Wed 09:30-11:30>\n\
               'org-auto-scheduler-background-lapse-reference
               "Test 27.5d: org-auto-scheduler-lapse-reference aliases org-auto-scheduler-background-lapse-reference")
 
+;; ============================================================================
+;; TEST 28: Review-order drift immunity, repeated-reset guard, combined clock markers,
+;;          fingerprint add/remove semantics, and clocked-only run-type scope
+;; ============================================================================
+(message "\n--- TEST 28: Drift-free review order, combined clock markers, fingerprints, run-type scope ---")
+
+;; 28.1: Saved review order must survive daily deadline-urgency drift, but still reset
+;; when effort, priority or the DEADLINE date itself is edited.
+(defun t28-reranked-ids-after (edit-fn)
+  "Save a review order on 2026-10-07, apply EDIT-FN (at heading dl1), re-review on 10-08.
+Return the list of task ids whose saved order was reset."
+  (let* ((temp-dir (make-temp-file "org-t28-drift-" t))
+         (test-org (expand-file-name "t28.org" temp-dir))
+         (day1 (encode-time 0 0 9 7 10 2026))
+         (day2 (encode-time 0 0 9 8 10 2026))
+         (org-auto-scheduler-silent-mode t)
+         (org-auto-scheduler-sync-caldav nil)
+         (org-auto-scheduler-review-state-file (expand-file-name "review-state.el" temp-dir))
+         (org-auto-scheduler-review-persistence-backend 'state-file)
+         (org-auto-scheduler-review-order-on-score-change 'reset-task)
+         (org-auto-scheduler--saved-review-decisions nil)
+         (org-auto-scheduler--reranked-tasks nil)
+         (result nil))
+    (with-temp-file test-org
+      (insert "* Project :PROJECT:\n:PROPERTIES:\n:PARALLEL: t\n:END:\n\
+** TODO [#B] Deadline task :AUTOSCH:\nDEADLINE: <2026-10-12 Mon>\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-dl1\n:END:\n\
+** TODO [#B] Plain task :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-pl1\n:END:\n"))
+    (setq org-agenda-files (list test-org))
+    (cl-letf (((symbol-function 'current-time) (lambda () day1)))
+      (org-auto-scheduler-review-and-apply)
+      (org-auto-scheduler-review-save-decisions)
+      (when (get-buffer "*Org Auto Scheduler Review*") (kill-buffer "*Org Auto Scheduler Review*")))
+    (when edit-fn
+      (with-current-buffer (find-file-noselect test-org)
+        (goto-char (point-min))
+        (re-search-forward ":ID:[ \t]*t28-dl1")
+        (org-back-to-heading t)
+        (funcall edit-fn)
+        (save-buffer)))
+    (cl-letf (((symbol-function 'current-time) (lambda () day2)))
+      (org-auto-scheduler-review-and-apply))
+    (setq result (mapcar (lambda (r) (plist-get r :task-id)) org-auto-scheduler--reranked-tasks))
+    (when (get-buffer "*Org Auto Scheduler Review*") (kill-buffer "*Org Auto Scheduler Review*"))
+    (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
+    (delete-directory temp-dir t)
+    result))
+
+(assert-equal (t28-reranked-ids-after nil) nil
+              "Test 28.1a: No edit, one day later: deadline urgency drift does NOT reset saved order")
+;; Effort only influences the score when a non-zero effort weight is configured (default 0.0).
+(assert-true (let ((org-auto-scheduler-effort-weight 0.01))
+               (member "t28-dl1" (t28-reranked-ids-after (lambda () (org-entry-put nil "Effort" "2:00")))))
+             "Test 28.1b: Effort edit resets saved order when effort contributes to the score")
+(assert-true (member "t28-dl1" (t28-reranked-ids-after (lambda () (org-priority ?A))))
+             "Test 28.1c: Priority edit resets saved order")
+(assert-true (member "t28-dl1" (t28-reranked-ids-after (lambda () (org-deadline nil "2026-10-20"))))
+             "Test 28.1d: DEADLINE date edit resets saved order")
+
+;; 28.2: A reset fires once; a second merge with no further edits reports nothing.
+(let* ((temp-dir (make-temp-file "org-t28-twice-" t))
+       (test-org (expand-file-name "t28b.org" temp-dir))
+       (fake-now (encode-time 0 0 9 7 10 2026))
+       (org-auto-scheduler-silent-mode t)
+       (org-auto-scheduler-sync-caldav nil)
+       (org-auto-scheduler-review-state-file (expand-file-name "review-state.el" temp-dir))
+       (org-auto-scheduler-review-persistence-backend 'state-file)
+       (org-auto-scheduler-review-order-on-score-change 'reset-task)
+       (org-auto-scheduler--saved-review-decisions nil)
+       (org-auto-scheduler--reranked-tasks nil)
+       (first nil) (second nil))
+  (with-temp-file test-org
+    (insert "* Project :PROJECT:\n:PROPERTIES:\n:PARALLEL: t\n:END:\n\
+** TODO [#B] Task Mid :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-mid\n:END:\n\
+** TODO [#C] Task Low :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-low\n:END:\n"))
+  (setq org-agenda-files (list test-org))
+  (cl-letf (((symbol-function 'current-time) (lambda () fake-now)))
+    (org-auto-scheduler-review-and-apply)
+    (org-auto-scheduler-review-save-decisions)
+    (kill-buffer "*Org Auto Scheduler Review*")
+    (with-current-buffer (find-file-noselect test-org)
+      (goto-char (point-min))
+      (re-search-forward ":ID:[ \t]*t28-low")
+      (org-back-to-heading t)
+      (org-priority ?A)
+      (save-buffer))
+    (org-auto-scheduler-review-and-apply)
+    (setq first (length org-auto-scheduler--reranked-tasks))
+    (kill-buffer "*Org Auto Scheduler Review*")
+    (org-auto-scheduler-review-and-apply)
+    (setq second (length org-auto-scheduler--reranked-tasks))
+    (kill-buffer "*Org Auto Scheduler Review*"))
+  (assert-equal first 1 "Test 28.2a: Priority edit resets order once")
+  (assert-equal second 0 "Test 28.2b: Second merge without edits reports no further reset")
+  (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
+  (delete-directory temp-dir t))
+
+;; 28.3: Stable score is drift-free; urgency drift is excluded
+(with-temp-buffer
+  (org-mode)
+  (insert "* TODO [#B] Stable score task\nDEADLINE: <2026-10-12 Mon>\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-stable\n:END:\n")
+  (goto-char (point-min))
+  (let* ((m (point-marker))
+         (d1 (encode-time 0 0 9 7 10 2026))
+         (d2 (encode-time 0 0 9 9 10 2026))
+         (s1 (cl-letf (((symbol-function 'current-time) (lambda () d1)))
+               (org-auto-scheduler-calculate-score m)))
+         (s2 (cl-letf (((symbol-function 'current-time) (lambda () d2)))
+               (org-auto-scheduler-calculate-score m))))
+    (assert-true (/= (car s1) (car s2))
+                 "Test 28.3a: Total score drifts as the deadline approaches (precondition)")
+    (assert-equal (org-auto-scheduler--stable-score s1) (org-auto-scheduler--stable-score s2)
+                  "Test 28.3b: Stable score is identical across days")))
+
+;; 28.4: Combined clock markers (-rci-, -sco2pm-) and not-applied case
+(let ((org-auto-scheduler-silent-mode t)
+      (now (encode-time 0 0 15 7 10 2026)))
+  ;; -rci- : clock-in must not be silently dropped
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO (-rci-) Combo task\n:PROPERTIES:\n:ID: t28-rci\n:Effort: 1:00\n:END:\n")
+    (goto-char (point-min))
+    (let ((res (cl-letf (((symbol-function 'current-time) (lambda () now)))
+                 (org-auto-scheduler--process-title-markers (point-marker)))))
+      (assert-true (plist-get res :clockin) "Test 28.4a: -rci- clock-in detected")
+      (assert-true (plist-get res :reschedule) "Test 28.4b: -rci- still flags reschedule (r)")
+      (assert-true (string-match-p "CLOCK:" (buffer-string)) "Test 28.4c: -rci- wrote a CLOCK line")
+      (when (org-clocking-p) (org-clock-out nil t))))
+  ;; -sco2pm- : retroactive clock-out on a past scheduled slot
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO (-sco2pm-) Retro task\nSCHEDULED: <2026-10-07 Wed 13:00-14:00>\n:PROPERTIES:\n:ID: t28-sco\n:Effort: 1:00\n:END:\n")
+    (goto-char (point-min))
+    (let ((res (cl-letf (((symbol-function 'current-time) (lambda () now)))
+                 (org-auto-scheduler--process-title-markers (point-marker)))))
+      (assert-equal (plist-get res :clockout) "14:00" "Test 28.4d: -sco2pm- clock-out at 14:00")
+      (assert-true (plist-get res :splittable) "Test 28.4e: -sco2pm- still sets splittable (s)")
+      (assert-true (string-match-p "CLOCK:" (buffer-string)) "Test 28.4f: -sco2pm- logged a CLOCK interval")))
+  ;; -ci- plus -co- with no schedule window: zero-length interval is not applied, no error
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO (-ci--co-) Empty interval\n:PROPERTIES:\n:ID: t28-empty\n:Effort: 1:00\n:END:\n")
+    (goto-char (point-min))
+    (let ((res (cl-letf (((symbol-function 'current-time) (lambda () now)))
+                 (org-auto-scheduler--process-title-markers (point-marker)))))
+      (assert-true (null (plist-get res :clockin)) "Test 28.4g: zero-length -ci-/-co- not reported as applied")
+      (assert-true (not (string-match-p "CLOCK:" (buffer-string))) "Test 28.4h: zero-length -ci-/-co- writes no CLOCK line"))))
+
+;; 28.5: Fingerprint comparison: additions/changes trigger, removals do not
+(let ((old (make-hash-table :test 'equal))
+      (same-minus-one (make-hash-table :test 'equal))
+      (plus-one (make-hash-table :test 'equal))
+      (changed (make-hash-table :test 'equal)))
+  (puthash "a" '(:x 1) old) (puthash "b" '(:x 1) old)
+  (puthash "a" '(:x 1) same-minus-one)
+  (puthash "a" '(:x 1) plus-one) (puthash "b" '(:x 1) plus-one) (puthash "c" '(:x 1) plus-one)
+  (puthash "a" '(:x 1) changed) (puthash "b" '(:x 2) changed)
+  (assert-true (null (org-auto-scheduler--fingerprints-changed-p same-minus-one old))
+               "Test 28.5a: A completed/removed task does not trigger a replan")
+  (assert-true (org-auto-scheduler--fingerprints-changed-p plus-one old)
+               "Test 28.5b: A newly added task triggers a replan")
+  (assert-true (org-auto-scheduler--fingerprints-changed-p changed old)
+               "Test 28.5c: A changed task fingerprint triggers a replan")
+  (assert-true (null (org-auto-scheduler--fingerprints-changed-p old old))
+               "Test 28.5d: Identical fingerprints do not trigger"))
+
+;; 28.6: clocked-only applies to background runs only; manual runs still replan started tasks
+(let* ((temp-dir (make-temp-file "org-t28-scope-" t))
+       (test-org (expand-file-name "t28-scope.org" temp-dir))
+       (org-auto-scheduler-silent-mode t)
+       (org-auto-scheduler-sync-caldav nil)
+       (org-auto-scheduler-preserve-today-scheduled t)
+       (org-auto-scheduler-manual-reschedule-lapsed t)
+       (org-auto-scheduler-background-preserve-today-mode 'clocked-only)
+       (org-auto-scheduler-background-lapse-grace-minutes 30)
+       (org-auto-scheduler-start-time "09:00")
+       (org-auto-scheduler-end-time "18:00")
+       (org-auto-scheduler-start-buffer-minutes 5)
+       (org-auto-scheduler-task-gap 0)
+       (org-auto-scheduler--current-run-type nil)
+       (org-auto-scheduler--saved-review-decisions nil)
+       (org-auto-scheduler--last-task-fingerprints nil)
+       (org-auto-scheduler--backfilled-task-slots (make-hash-table :test 'equal)))
+  (with-temp-file test-org
+    (insert "* Tasks :PROJECT:\n:PROPERTIES:\n:PARALLEL: t\n:END:\n\
+** TODO [#A] Started task :AUTOSCH:\nSCHEDULED: <2026-10-07 Wed 09:00-10:00>\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-started\n:END:\n"))
+  (setq org-agenda-files (list test-org))
+  (let ((now-0900 (encode-time 0 0 9 7 10 2026))
+        (now-0920 (encode-time 0 20 9 7 10 2026)))
+    (let ((org-auto-scheduler--current-run-type 'background-sync))
+      (cl-letf (((symbol-function 'current-time) (lambda () now-0900)))
+        (org-auto-scheduler-schedule-tasks))
+      (cl-letf (((symbol-function 'current-time) (lambda () now-0920)))
+        (org-auto-scheduler-schedule-tasks)))
+    (with-current-buffer (find-file-noselect test-org)
+      (goto-char (point-min))
+      (re-search-forward ":ID:[ \t]*t28-started")
+      (assert-equal (org-entry-get nil "SCHEDULED") "<2026-10-07 Wed 09:00-10:00>"
+                    "Test 28.6a: Background run in clocked-only mode keeps started task within grace"))
+    ;; Manual run (run type nil) at 09:20 behaves like the classic replan-lapsed manual run
+    (cl-letf (((symbol-function 'current-time) (lambda () now-0920)))
+      (org-auto-scheduler-schedule-tasks))
+    (with-current-buffer (find-file-noselect test-org)
+      (goto-char (point-min))
+      (re-search-forward ":ID:[ \t]*t28-started")
+      (assert-true (not (equal (org-entry-get nil "SCHEDULED") "<2026-10-07 Wed 09:00-10:00>"))
+                   "Test 28.6b: Manual run is NOT held in place by background clocked-only mode")))
+  (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
+  (delete-directory temp-dir t))
+
+;; 28.7: A pinned task that overlaps an earlier unpinned preserved task evicts that earlier task
+(dolist (mode '(all clocked-only))
+  (let* ((temp-dir (make-temp-file "org-t28-overlap-" t))
+         (test-org (expand-file-name "t28-overlap.org" temp-dir))
+         (fake-now (encode-time 0 0 9 7 10 2026))
+         (org-auto-scheduler-silent-mode t)
+         (org-auto-scheduler-sync-caldav nil)
+         (org-auto-scheduler-preserve-today-scheduled t)
+         (org-auto-scheduler-background-preserve-today-mode mode)
+         (org-auto-scheduler-start-time "09:00")
+         (org-auto-scheduler-end-time "18:00")
+         (org-auto-scheduler-start-buffer-minutes 0)
+         (org-auto-scheduler-task-gap 0)
+         (org-auto-scheduler--current-run-type 'background-sync)
+         (org-auto-scheduler--saved-review-decisions nil)
+         (org-auto-scheduler--last-task-fingerprints nil))
+    (with-temp-file test-org
+      (insert "* Tasks :PROJECT:\n:PROPERTIES:\n:PARALLEL: t\n:END:\n\
+** TODO [#B] Unpinned X :AUTOSCH:\nSCHEDULED: <2026-10-07 Wed 10:00-11:00>\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-ov-x\n:END:\n\
+** TODO [#B] Pinned P :AUTOSCH:\nSCHEDULED: <2026-10-07 Wed 10:30-11:30>\n:PROPERTIES:\n:Effort: 1:00\n:PINNED: t\n:PINNED_TIME: 2026-10-07 10:30\n:ID: t28-ov-p\n:END:\n"))
+    (setq org-agenda-files (list test-org))
+    (cl-letf (((symbol-function 'current-time) (lambda () fake-now)))
+      (org-auto-scheduler-schedule-tasks))
+    (with-current-buffer (find-file-noselect test-org)
+      (goto-char (point-min))
+      (re-search-forward ":ID:[ \t]*t28-ov-p")
+      (assert-equal (org-entry-get nil "SCHEDULED") "<2026-10-07 Wed 10:30-11:30>"
+                    (format "Test 28.7a (%s): Pinned task stays at its pinned slot" mode))
+      (goto-char (point-min))
+      (re-search-forward ":ID:[ \t]*t28-ov-x")
+      (let* ((sched (org-entry-get nil "SCHEDULED"))
+             (st (org-time-string-to-time sched))
+             (en (org-auto-scheduler-calculate-task-end-time (point))))
+        (assert-true (or (not (time-less-p (encode-time 0 30 10 7 10 2026) en))
+                         (not (time-less-p st (encode-time 0 30 11 7 10 2026))))
+                     (format "Test 28.7b (%s): Overlapped unpinned task moved off the pinned slot (actual: %s)" mode sched))))
+    (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
+    (delete-directory temp-dir t)))
+
+;; 28.8: Sort predicate is transitive when saved order contradicts scores and a new task is added
+(with-temp-buffer
+  (org-mode)
+  (insert "* TODO A\n:PROPERTIES:\n:ID: t28-ca\n:END:\n* TODO B\n:PROPERTIES:\n:ID: t28-cb\n:END:\n* TODO C\n:PROPERTIES:\n:ID: t28-cc\n:END:\n")
+  (let* ((org-auto-scheduler-review-persistence-backend 'state-file)
+         (org-auto-scheduler--saved-review-decisions
+          (list (cons "t28-ca" (list :order 1.0 :is-new nil))
+                (cons "t28-cb" (list :order 2.0 :is-new nil))
+                (cons "t28-cc" (list :order 150.0 :is-new t))))
+         (mk (lambda (id)
+               (save-excursion
+                 (goto-char (point-min))
+                 (re-search-forward (format ":ID: %s" id))
+                 (org-back-to-heading t)
+                 (point-marker))))
+         (mkti (lambda (id score)
+                 (list (funcall mk id) score nil 0 (cons nil 1) id "n" nil nil nil nil nil 60 nil 0 t)))
+         ;; Saved order says A before B although A has the lower score; new task C scores in between.
+         (a (funcall mkti "t28-ca" 10.0))
+         (b (funcall mkti "t28-cb" 20.0))
+         (c (funcall mkti "t28-cc" 15.0))
+         (pm (make-hash-table :test 'equal))
+         (pred (lambda (x y) (org-auto-scheduler--complex-sort-predicate x y pm)))
+         (results nil))
+    (dolist (perm (list (list a b c) (list a c b) (list b a c) (list b c a) (list c a b) (list c b a)))
+      (push (mapcar (lambda (x) (nth 5 x)) (sort (copy-sequence perm) pred)) results))
+    (assert-equal (delete-dups (copy-sequence results))
+                  '(("t28-ca" "t28-cb" "t28-cc"))
+                  "Test 28.8: Sort order is identical for every input permutation (transitive predicate)")))
+
+;; 28.9: New tasks in a parallel group are slotted by score; in a sequential group by outline position
+(defun t28-new-task-times (parallel-prop new-priority)
+  "Run once, append a new task with NEW-PRIORITY, run again; return start times (HH:MM) of old B, old C, new."
+  (let* ((d (make-temp-file "org-t28-new-" t))
+         (f (expand-file-name "n.org" d))
+         (now (encode-time 0 0 8 7 10 2026))
+         (org-auto-scheduler-silent-mode t)
+         (org-auto-scheduler-sync-caldav nil)
+         (org-auto-scheduler-review-state-file (expand-file-name "rs.el" d))
+         (org-auto-scheduler-review-persistence-backend 'state-file)
+         (org-auto-scheduler--saved-review-decisions nil)
+         (org-auto-scheduler-start-time "09:00")
+         (org-auto-scheduler-end-time "18:00")
+         (org-auto-scheduler-start-buffer-minutes 0)
+         (org-auto-scheduler-task-gap 0)
+         (result nil))
+    (with-temp-file f
+      (insert (format "* Project :PROJECT:\n:PROPERTIES:\n:%s\n:END:\n\
+** TODO [#B] Old B :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28n-b\n:END:\n\
+** TODO [#C] Old C :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28n-c\n:END:\n" parallel-prop)))
+    (setq org-agenda-files (list f))
+    (cl-letf (((symbol-function 'current-time) (lambda () now)))
+      (org-auto-scheduler-schedule-tasks)
+      (with-current-buffer (find-file-noselect f)
+        (goto-char (point-max))
+        (insert (format "** TODO [#%s] New task :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28n-new\n:END:\n" new-priority))
+        (save-buffer))
+      (org-auto-scheduler-schedule-tasks)
+      (with-current-buffer (find-file-noselect f)
+        (dolist (id '("t28n-b" "t28n-c" "t28n-new"))
+          (goto-char (point-min))
+          (re-search-forward (concat ":ID: " id))
+          (push (let ((sc (org-entry-get nil "SCHEDULED"))) (and sc (substring sc 16 21))) result))))
+    (when (get-file-buffer f) (kill-buffer (get-file-buffer f)))
+    (delete-directory d t)
+    (nreverse result)))
+
+(assert-equal (t28-new-task-times "PARALLEL: t" "A") '("10:00" "11:00" "09:00")
+              "Test 28.9a: New [#A] task in a parallel group is scheduled before older [#B]/[#C] tasks")
+;; A new [#C] task ties with older [#C]; it goes after it (and after the higher-scored [#B]).
+(assert-equal (t28-new-task-times "PARALLEL: t" "C") '("09:00" "10:00" "11:00")
+              "Test 28.9b: New low-priority task in a parallel group goes after higher-or-equal-scored tasks")
+(assert-equal (t28-new-task-times "ORDERED: t" "A") '("09:00" "10:00" "11:00")
+              "Test 28.9c: New task in an ordered (sequential) group keeps outline position")
+
 (if (= test-failures 0)
-    (message "ALL 27 TEST SUITES PASSED PERFECTLY!")
+    (message "ALL 28 TEST SUITES PASSED PERFECTLY!")
   (message "FAILURES DETECTED: %d" test-failures))
 (message "==============================================")
