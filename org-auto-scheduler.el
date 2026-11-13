@@ -1761,17 +1761,31 @@ Hash table with date strings as keys and lists of items as values.")
                    (or (nth 4 parsed) 1)  ; month
                    (or (nth 5 parsed) 1970)))))  ; year
 
+(defun org-auto-scheduler--valid-org-pom-p (pom)
+  "Return non-nil if POM refers to a valid `org-mode' buffer position."
+  (cond
+   ((markerp pom)
+    (and (marker-buffer pom)
+         (buffer-live-p (marker-buffer pom))
+         (with-current-buffer (marker-buffer pom)
+           (derived-mode-p 'org-mode))))
+   ((numberp pom)
+    (derived-mode-p 'org-mode))
+   (t
+    (derived-mode-p 'org-mode))))
+
 (defun org-auto-scheduler-get-effort (pom)
   "Get the effort estimate for the task at point or marker POM.
 Checks for what-if overrides in the review buffer if active."
-  (let* ((task-id (org-with-point-at pom (org-id-get)))
-         (override (org-auto-scheduler--get-review-override task-id))
-         (overridden-effort (and override (plist-get override :effort))))
-    (if overridden-effort
-        overridden-effort
-      (let ((effort (org-entry-get pom "Effort")))
-        (when effort
-          (org-duration-to-minutes effort))))))
+  (when (org-auto-scheduler--valid-org-pom-p pom)
+    (let* ((task-id (org-with-point-at pom (org-id-get)))
+           (override (org-auto-scheduler--get-review-override task-id))
+           (overridden-effort (and override (plist-get override :effort))))
+      (if overridden-effort
+          overridden-effort
+        (let ((effort (org-entry-get pom "Effort")))
+          (when effort
+            (org-duration-to-minutes effort)))))))
 
 (defun org-auto-scheduler-get-priority (task)
   "Get the priority of TASK."
@@ -1907,7 +1921,9 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
 (defun org-auto-scheduler-calculate-score (marker)
   "Calculate a score for a task at MARKER based on its properties and state.
 Returns a list containing the total score and individual score components."
-  (condition-case err
+  (if (not (org-auto-scheduler--valid-org-pom-p marker))
+      (list 0 0 0 0 0 0 0 0 0 0 0 "" 0 0 0)
+    (condition-case err
       (let* ((base-effort (or (org-auto-scheduler-get-effort marker) 60))
              (multiplier (org-auto-scheduler-get-effort-multiplier marker))
              (effort (round (* base-effort multiplier)))
@@ -1963,7 +1979,7 @@ Returns a list containing the total score and individual score components."
                                     err
                                     marker
                                     (with-output-to-string (backtrace)))
-     (list 0 0 0 0 0 0 0 0 0 0 0 "" 0 0 0))))  ; Return all zeroes on error
+     (list 0 0 0 0 0 0 0 0 0 0 0 "" 0 0 0)))))  ; Return all zeroes on error
 
 (defun org-auto-scheduler-get-parent-id (marker)
   "Get the ID of the parent heading for the task at MARKER."
@@ -5911,23 +5927,25 @@ is the maximum end time of any blocker scheduled (or nil if none)."
 
 (defun org-auto-scheduler-get-task-tag-block (marker)
   "Get the hard time block for the task at MARKER based on its tags (`org-auto-scheduler-time-blocks')."
-  (let* ((tags (org-get-tags marker))
-         (matching-block nil))
-    (dolist (tag-block org-auto-scheduler-time-blocks)
-      (when (and (not matching-block)
-                 (member (car tag-block) tags))
-        (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
-    matching-block))
+  (when (org-auto-scheduler--valid-org-pom-p marker)
+    (let* ((tags (org-get-tags marker))
+           (matching-block nil))
+      (dolist (tag-block org-auto-scheduler-time-blocks)
+        (when (and (not matching-block)
+                   (member (car tag-block) tags))
+          (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
+      matching-block)))
 
 (defun org-auto-scheduler-get-task-energy-block (marker)
   "Get the soft preferred energy block for the task at MARKER based on its tags (`org-auto-scheduler-energy-blocks')."
-  (let* ((tags (org-get-tags marker))
-         (matching-block nil))
-    (dolist (tag-block org-auto-scheduler-energy-blocks)
-      (when (and (not matching-block)
-                 (member (car tag-block) tags))
-        (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
-    matching-block))
+  (when (org-auto-scheduler--valid-org-pom-p marker)
+    (let* ((tags (org-get-tags marker))
+           (matching-block nil))
+      (dolist (tag-block org-auto-scheduler-energy-blocks)
+        (when (and (not matching-block)
+                   (member (car tag-block) tags))
+          (setq matching-block (org-auto-scheduler--normalize-block-list (cdr tag-block)))))
+      matching-block)))
 
 (defun org-auto-scheduler-time-fits-block-p (block-start block-end remaining-effort)
   "Check if the task with REMAINING-EFFORT fits within the time block from BLOCK-START to BLOCK-END."
@@ -6359,54 +6377,55 @@ Returns the number of tasks rescheduled."
          (waiting-states (bound-and-true-p org-auto-scheduler-waiting-states))
          (count 0)
          (rescheduled-tasks '()))
-    (org-map-entries
-     (lambda ()
-       (let* ((state (or (org-get-todo-state)
-                         (save-excursion
-                           (org-back-to-heading t)
-                           (when (looking-at "^\\*+[ 	]+\\([A-Z-]+\\)[ 	]+")
-                             (let ((kw (match-string-no-properties 1)))
-                               (when (assoc kw org-auto-scheduler-state-weights)
-                                 kw))))))
-              (tags (org-get-tags))
-              (is-autosch (member "AUTOSCH" tags))
-              (is-archive (member "ARCHIVE" tags))
-              (is-waiting (and state waiting-states (member state waiting-states)))
-              (is-done (or (null state)
-                           (member state done-states)
-                           (and (bound-and-true-p org-auto-scheduler-kill-todo-state)
-                                (string= state org-auto-scheduler-kill-todo-state))))
-              (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
-                                  (org-entry-get nil "AUTOSCH_PLACEHOLDER")
-                                  (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
-              (has-repeater (org-auto-scheduler-has-repeater-task (point-marker)))
-              (sched-str (org-entry-get nil "SCHEDULED")))
-         (when (and is-autosch
-                    (not is-archive)
-                    (not is-waiting)
-                    (not is-done)
-                    (not is-placeholder)
-                    (not has-repeater)
-                    sched-str)
-           (let ((sched-date (and (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched-str)
-                                  (match-string 1 sched-str))))
-             (when (and sched-date (string< sched-date today-str))
-               (let ((headline (org-get-heading t t t t)))
-                 (org-auto-scheduler--log-info "Rescheduling past task '%s' (%s) to %s"
-                                               headline sched-str today-str)
-                 (org-auto-scheduler--set-scheduled today-str)
-                 ;; If task had a PINNED_TIME with a past date, update date portion to today-str
-                 (let ((pinned-prop (org-entry-get nil org-auto-scheduler-pinned-time-property)))
-                   (when (and pinned-prop
-                              (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)[ 	]+\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" pinned-prop))
-                     (let ((pdate (match-string 1 pinned-prop))
-                           (ptime (match-string 2 pinned-prop)))
-                       (when (string< pdate today-str)
-                         (org-set-property org-auto-scheduler-pinned-time-property (format "%s %s" today-str ptime))))))
-                 (cl-incf count)
-                 (push headline rescheduled-tasks)))))))
-     nil
-     search-scope)
+    (when (or search-scope (derived-mode-p 'org-mode))
+      (org-map-entries
+       (lambda ()
+         (let* ((state (or (org-get-todo-state)
+                           (save-excursion
+                             (org-back-to-heading t)
+                             (when (looking-at "^\\*+[ 	]+\\([A-Z-]+\\)[ 	]+")
+                               (let ((kw (match-string-no-properties 1)))
+                                 (when (assoc kw org-auto-scheduler-state-weights)
+                                   kw))))))
+                (tags (org-get-tags))
+                (is-autosch (member "AUTOSCH" tags))
+                (is-archive (member "ARCHIVE" tags))
+                (is-waiting (and state waiting-states (member state waiting-states)))
+                (is-done (or (null state)
+                             (member state done-states)
+                             (and (bound-and-true-p org-auto-scheduler-kill-todo-state)
+                                  (string= state org-auto-scheduler-kill-todo-state))))
+                (is-placeholder (or (member org-auto-scheduler-placeholder-tag tags)
+                                    (org-entry-get nil "AUTOSCH_PLACEHOLDER")
+                                    (org-entry-get nil "AUTOSCH_ORIGIN_ID")))
+                (has-repeater (org-auto-scheduler-has-repeater-task (point-marker)))
+                (sched-str (org-entry-get nil "SCHEDULED")))
+           (when (and is-autosch
+                      (not is-archive)
+                      (not is-waiting)
+                      (not is-done)
+                      (not is-placeholder)
+                      (not has-repeater)
+                      sched-str)
+             (let ((sched-date (and (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched-str)
+                                    (match-string 1 sched-str))))
+               (when (and sched-date (string< sched-date today-str))
+                 (let ((headline (org-get-heading t t t t)))
+                   (org-auto-scheduler--log-info "Rescheduling past task '%s' (%s) to %s"
+                                                 headline sched-str today-str)
+                   (org-auto-scheduler--set-scheduled today-str)
+                   ;; If task had a PINNED_TIME with a past date, update date portion to today-str
+                   (let ((pinned-prop (org-entry-get nil org-auto-scheduler-pinned-time-property)))
+                     (when (and pinned-prop
+                                (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)[ 	]+\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)" pinned-prop))
+                       (let ((pdate (match-string 1 pinned-prop))
+                             (ptime (match-string 2 pinned-prop)))
+                         (when (string< pdate today-str)
+                           (org-set-property org-auto-scheduler-pinned-time-property (format "%s %s" today-str ptime))))))
+                   (cl-incf count)
+                   (push headline rescheduled-tasks)))))))
+       nil
+       search-scope))
     (when (> count 0)
       (org-auto-scheduler--log-info "Rescheduled %d past AUTOSCH task(s) to %s: %s"
                                     count today-str (string-join (nreverse rescheduled-tasks) ", ")))

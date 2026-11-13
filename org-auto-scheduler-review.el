@@ -1246,11 +1246,15 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 
 (defun org-auto-scheduler--check-task-warnings (task marker)
   "Check for scheduling warnings on TASK and return a list of warning strings."
-  (let ((warnings nil)
-        (time-block (org-auto-scheduler-get-task-tag-block marker))
-        (not-before (org-with-point-at marker (org-entry-get nil "NOT_BEFORE")))
-        (start (nth 1 task))
-        (effort-prop (org-auto-scheduler-get-effort marker)))
+  (let* ((task-id (nth 0 task))
+         (m (or (and (org-auto-scheduler--valid-org-pom-p marker) marker)
+                (and task-id (stringp task-id) (org-id-find task-id t))))
+         (valid-m (org-auto-scheduler--valid-org-pom-p m))
+         (warnings nil)
+         (time-block (when valid-m (org-auto-scheduler-get-task-tag-block m)))
+         (not-before (when valid-m (org-with-point-at m (org-entry-get nil "NOT_BEFORE"))))
+         (start (nth 1 task))
+         (effort-prop (when valid-m (org-auto-scheduler-get-effort m))))
     ;; Outside time block?
     (when (and time-block start (not (eq (nth 9 task) :failed)))
       (let ((in-block nil))
@@ -1266,11 +1270,11 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
     (when not-before
       (push "📌 NOT_BEFORE constraint" warnings))
     ;; Default effort used?
-    (unless effort-prop
+    (when (and valid-m (not effort-prop))
       (push "Using default effort estimate" warnings))
     ;; Explicit Blocker / Dependency Checks
-    (when (and marker (markerp marker) (marker-buffer marker))
-      (let ((resolved (org-auto-scheduler--resolve-blocker-specs marker)))
+    (when valid-m
+      (let ((resolved (org-auto-scheduler--resolve-blocker-specs m)))
         (dolist (item resolved)
           (let ((b (plist-get item :marker))
                 (id (plist-get item :id))
@@ -1333,13 +1337,15 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
 
 (defun org-auto-scheduler--smart-effort-label (marker)
   "Return effort string, appending '[?]' if using default/historical estimate."
-  (let ((explicit (org-auto-scheduler-get-effort marker)))
-    (if explicit
-        (format "%dm" (round explicit))
-      (let* ((cat (org-with-point-at marker (org-get-category)))
-             (mult (cdr (assoc cat org-auto-scheduler-historical-multipliers)))
-             (est (round (* org-auto-scheduler-default-task-duration (or mult 1.0)))))
-        (format "%dm[?]" est)))))
+  (if (not (org-auto-scheduler--valid-org-pom-p marker))
+      (format "%dm[?]" org-auto-scheduler-default-task-duration)
+    (let ((explicit (org-auto-scheduler-get-effort marker)))
+      (if explicit
+          (format "%dm" (round explicit))
+        (let* ((cat (org-with-point-at marker (org-get-category)))
+               (mult (cdr (assoc cat org-auto-scheduler-historical-multipliers)))
+               (est (round (* org-auto-scheduler-default-task-duration (or mult 1.0)))))
+          (format "%dm[?]" est))))))
 
 (defun org-auto-scheduler--format-time-short (time)
   "Format TIME as 'Mon 09:15' for the review buffer."
