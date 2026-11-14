@@ -685,6 +685,15 @@ Returns a list of change plists."
        (or (not org-auto-scheduler-change-log-background-only)
            (memq org-auto-scheduler--current-run-type '(background-async background-sync)))))
 
+(defun org-auto-scheduler--deactivate-timestamps (str)
+  "Convert active Org timestamps (<...>) in STR to inactive ([...]).
+Returns nil if STR is nil."
+  (when (stringp str)
+    (replace-regexp-in-string
+     "<\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}[^>\n]*\\)>"
+     "[\\1]"
+     str)))
+
 (defun org-auto-scheduler--format-change-log-entry (run-info changes)
   "Format an Org-mode change log entry for a scheduler run.
 RUN-INFO is a plist with :run-type, :start-time, :end-time, :tasks-evaluated,
@@ -752,8 +761,8 @@ CHANGES is a list of change plists."
           (push (format "  - Action: %s" ma) lines))
         (when sched-changed
           (push (format "  - Schedule: %s → %s"
-                        (or orig-sched "Unscheduled")
-                        (or final-sched "Unscheduled"))
+                        (or (org-auto-scheduler--deactivate-timestamps orig-sched) "Unscheduled")
+                        (or (org-auto-scheduler--deactivate-timestamps final-sched) "Unscheduled"))
                 lines))
         (when split
           (push "  - Split: initial chunk scheduled, remaining effort placed on subsequent days" lines))

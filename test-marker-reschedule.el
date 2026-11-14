@@ -728,7 +728,11 @@ SCHEDULED: <%s %s 10:00-11:00>
       (assert-true (string-match-p "Task One" file-str)
                    "Test 8.2: File contains Task One")
       (assert-true (string-match-p "Task Two" file-str)
-                   "Test 8.2: File contains Task Two")))
+                   "Test 8.2: File contains Task Two")
+      (assert-true (not (string-match-p "<[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}[^>\n]*>" file-str))
+                   "Test 8.2: Change log file contains no active timestamps")
+      (assert-true (string-match-p "Schedule: .*\\[[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}" file-str)
+                   "Test 8.2: Change log file uses inactive timestamps for schedules")))
 
   ;; 8.3 Verify 0-change run behavior (record-empty nil suppresses log, record-empty t logs)
   (let ((initial-buf-size (with-current-buffer (get-buffer org-auto-scheduler-change-log-buffer-name)
