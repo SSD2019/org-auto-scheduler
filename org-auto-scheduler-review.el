@@ -1206,21 +1206,50 @@ Returns a truncated string (max 20 chars) or nil."
       (concat (substring str 0 (- max 2)) "..")
     (or str "")))
 
+(defun org-auto-scheduler--random-unique-color (used-colors)
+  "Generate a random vibrant \"#rrggbb\" hex color not in USED-COLORS.
+USED-COLORS is a hash-table keyed by lowercased color strings."
+  (let ((color nil)
+        (attempts 0))
+    (while (and (null color) (< attempts 200))
+      (cl-incf attempts)
+      (let* ((hue (/ (random 1000) 1000.0))
+             (sat (+ 0.55 (/ (random 350) 1000.0)))
+             (lit (+ 0.48 (/ (random 180) 1000.0)))
+             (candidate (downcase
+                         (apply #'color-rgb-to-hex
+                                (append (color-hsl-to-rgb hue sat lit) '(2))))))
+        (unless (gethash candidate used-colors)
+          (setq color candidate))))
+    (or color
+        (format "#%02x%02x%02x"
+                (+ 60 (random 170))
+                (+ 60 (random 170))
+                (+ 60 (random 170))))))
+
 (defun org-auto-scheduler--assign-project-colors (tasks)
-  "Build `org-auto-scheduler--project-colors' from TASKS."
+  "Build `org-auto-scheduler--project-colors' from TASKS.
+Uses `org-auto-scheduler--project-color-palette' first, then picks a
+random unique hex color for each remaining distinct project."
   (setq org-auto-scheduler--project-colors (make-hash-table :test 'equal))
-  (let ((idx 0))
+  (let ((palette-len (length org-auto-scheduler--project-color-palette))
+        (used-colors (make-hash-table :test 'equal))
+        (idx 0))
     (dolist (task tasks)
       (let* ((marker (nth 7 task))
              (proj-name (or (org-auto-scheduler--get-project-name marker) "—"))
              (proj-trunc (org-auto-scheduler--truncate proj-name 18)))
         (when (and proj-trunc (not (string= proj-trunc "—"))
                    (not (gethash proj-trunc org-auto-scheduler--project-colors)))
-          (puthash proj-trunc
-                   (nth (% idx (length org-auto-scheduler--project-color-palette))
-                        org-auto-scheduler--project-color-palette)
-                   org-auto-scheduler--project-colors)
-          (cl-incf idx))))))
+          (let ((color (if (< idx palette-len)
+                           (nth idx org-auto-scheduler--project-color-palette)
+                         (org-auto-scheduler--random-unique-color used-colors))))
+            (puthash (downcase color) t used-colors)
+            (when-let* ((rgb (color-name-to-rgb color)))
+              (puthash (downcase (apply #'color-rgb-to-hex (append rgb '(2))))
+                       t used-colors))
+            (puthash proj-trunc color org-auto-scheduler--project-colors)
+            (cl-incf idx)))))))
 
 (defun org-auto-scheduler--project-dot (project-name)
   "Return a propertized '●' for PROJECT-NAME, or a dim '·' for no-project."
@@ -4191,7 +4220,7 @@ matching the display used in the review buffer."
          :start (org-auto-scheduler--timegrid-minutes start)
          :end (org-auto-scheduler--timegrid-minutes end)
          :all-day nil
-         :color (if non-blocking "#98c379" "#5c6370")
+         :color "#5c6370"
          :source (list :marker marker :task-id ev-id :event-id ev-id :event-p t))))))
 
 (defun org-auto-scheduler--timegrid-list (review-buffer start end)
