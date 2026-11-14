@@ -2974,13 +2974,25 @@ SCHEDULED: <%s %s 16:26-18:26>\n\
       (assert-true (string-match-p "PRIORITY SCORE BREAKDOWN" (buffer-string))
                    "Test 26.7c: Task Inspector contains Priority Score Breakdown")
       (assert-true (string-match-p "SLOT PLACEMENT TRACE" (buffer-string))
-                   "Test 26.7d: Task Inspector contains Slot Placement Trace"))
+                   "Test 26.7d: Task Inspector contains Slot Placement Trace")
+      (assert-true (string-match-p "PROJECT HIERARCHY & SEQUENCE" (buffer-string))
+                   "Test 26.7d1a: Task Inspector contains Project Hierarchy & Sequence")
+      (assert-true (string-match-p "TREE.*│.*SEQUENCE & WHY" (buffer-string))
+                   "Test 26.7d1b: Task Inspector renders two-column tree and sequence table")
+      (assert-true (string-match-p "▶.*Design Auth Schema.*│ #1 .*First in :ORDERED:" (buffer-string))
+                   "Test 26.7d1c: Task Inspector highlights ui-task-1 as #1 with :ORDERED: reason")
+      (assert-true (string-match-p "Implement Token Refresh.*│ #2 .*After #1 (:ORDERED:)" (buffer-string))
+                   "Test 26.7d1d: Task Inspector shows ui-task-2 as #2 after #1"))
     ;; Follow mode: moving across tasks updates the inspector
     (org-auto-scheduler--review-goto-task "ui-task-2")
     (org-auto-scheduler--review-maybe-update-inspector)
     (with-current-buffer "*Org Auto Scheduler Task Inspector*"
       (assert-true (string-match-p "Implement Token Refresh" (buffer-string))
-                   "Test 26.7d2: Task Inspector follow mode updates for task under point"))
+                   "Test 26.7d2: Task Inspector follow mode updates for task under point")
+      (assert-true (string-match-p "▶.*Implement Token Refresh" (buffer-string))
+                   "Test 26.7d2b: Follow mode moves ▶ highlight to ui-task-2")
+      (assert-true (string-match-p "Predecessors: #1 Design Auth Schema (:ORDERED: sibling)" (buffer-string))
+                   "Test 26.7d2c: Follow mode updates Predecessors summary for ui-task-2"))
     ;; Toggle 'I' on task row closes the inspector side window
     (org-auto-scheduler-review-inspect-task)
     (assert-true (null (get-buffer-window "*Org Auto Scheduler Task Inspector*" t))
@@ -3015,6 +3027,35 @@ SCHEDULED: <%s %s 16:26-18:26>\n\
                "*Org Auto Scheduler Task Inspector*"
                "*Org Auto Scheduler Dependencies*"
                "*Org Auto Scheduler End-of-Day*"))
+    (when (get-buffer b) (kill-buffer b)))
+  (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
+  (delete-directory temp-dir t))
+
+;; 26.8: Multi-Level Project Hierarchy & Sequence in Task Inspector
+(let* ((temp-dir (make-temp-file "org-ui-deep-test-" t))
+       (test-org (expand-file-name "test-deep.org" temp-dir))
+       (org-auto-scheduler-adherence-file (expand-file-name "adherence.el" temp-dir))
+       (org-auto-scheduler--adherence-snapshots nil)
+       (org-auto-scheduler-silent-mode t)
+       (org-auto-scheduler-sync-caldav nil))
+  (with-temp-file test-org
+    (insert "* Platform Migration :PROJECT:\n:PROPERTIES:\n:ORDERED: t\n:END:\n** Phase 1 :ORDERED:\n:PROPERTIES:\n:ORDERED: t\n:END:\n*** TODO [#A] Migrate DB :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: deep-task-1\n:END:\n*** TODO [#B] Verify DB :AUTOSCH:\n:PROPERTIES:\n:Effort: 1:00\n:ID: deep-task-2\n:END:\n** Phase 2\n:PROPERTIES:\n:PARALLEL: t\n:END:\n*** TODO [#C] Update Docs :AUTOSCH:\n:PROPERTIES:\n:Effort: 0:30\n:ID: deep-task-3\n:END:\n"))
+  (setq org-agenda-files (list test-org))
+  (org-auto-scheduler-review-and-apply)
+  (with-current-buffer "*Org Auto Scheduler Review*"
+    (org-auto-scheduler--review-goto-task "deep-task-2")
+    (org-auto-scheduler-review-inspect-task)
+    (with-current-buffer "*Org Auto Scheduler Task Inspector*"
+      (let ((txt (buffer-string)))
+        (assert-true (string-match-p "Phase 1.*│ —   \\[Sequential :ORDERED:\\]" txt)
+                     "Test 26.8a: Multi-level container heading Phase 1 shows [Sequential :ORDERED:]")
+        (assert-true (string-match-p "Phase 2.*│ —   \\[Parallel :PARALLEL:\\]" txt)
+                     "Test 26.8b: Multi-level container heading Phase 2 shows [Parallel :PARALLEL:]")
+        (assert-true (string-match-p "│  └── ▶ \\[TODO\\] Verify DB" txt)
+                     "Test 26.8c: Deeply nested inspected task renders with multi-level tree connector and ▶")
+        (assert-true (string-match-p "Update Docs.*│ #[0-9]+ .*:PARALLEL:" txt)
+                     "Test 26.8d: Child under :PARALLEL: Phase 2 shows :PARALLEL: reason"))))
+  (dolist (b '("*Org Auto Scheduler Review*" "*Org Auto Scheduler Task Inspector*"))
     (when (get-buffer b) (kill-buffer b)))
   (when (get-file-buffer test-org) (kill-buffer (get-file-buffer test-org)))
   (delete-directory temp-dir t))

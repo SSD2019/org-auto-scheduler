@@ -4983,6 +4983,352 @@ Can be a float (fraction of the frame, e.g. 0.45) or an integer (number of colum
           (error nil))
         (display-buffer buf))))
 
+(defun org-auto-scheduler--inspector-critical-float-p (float-hrs)
+  "Return non-nil if FLOAT-HRS is within the critical-path float threshold."
+  (and (numberp float-hrs)
+       (<= float-hrs (or (bound-and-true-p org-auto-scheduler-critical-path-max-float-hours) 4.0))))
+
+(defun org-auto-scheduler--inspector-collect-project-tree (root-marker)
+  "Collect hierarchy and scheduling metadata for all headings under ROOT-MARKER.
+Returns a plist (:root-headline STR :root-seq BOOL :nodes LIST)."
+  (let ((nodes '())
+        (score-map (make-hash-table :test 'equal))
+        (last-by-parent (make-hash-table :test 'equal))
+        (root-hl "")
+        (root-seq nil))
+    (when (boundp 'org-auto-scheduler--last-sorted-tasks-info)
+      (dolist (info org-auto-scheduler--last-sorted-tasks-info)
+        (when (nth 5 info)
+          (puthash (nth 5 info) (nth 1 info) score-map))))
+    (org-with-point-at root-marker
+      (org-back-to-heading t)
+      (let* ((root-m (point-marker))
+             (root-id (org-id-get))
+             (root-level (org-current-level))
+             (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+             (idx 0))
+        (setq root-hl (org-get-heading t t t t))
+        (setq root-seq (org-auto-scheduler--siblings-sequential-p (cons (current-buffer) (point)) root-id))
+        (while (and (< (point) subtree-end) (not (eobp)))
+          (let* ((m (point-marker))
+                 (pos (point))
+                 (lvl (org-current-level))
+                 (rel-depth (max 0 (- lvl root-level)))
+                 (todo (org-get-todo-state))
+                 (done-p (and todo (member todo org-done-keywords)))
+                 (hl (org-get-heading t t t t))
+                 (tid (org-id-get))
+                 (parent-pos (when (> rel-depth 0)
+                               (save-excursion
+                                 (if (org-up-heading-safe) (point) (marker-position root-m)))))
+                 (parent-seq (if (= rel-depth 0)
+                                 root-seq
+                               (save-excursion
+                                 (if (org-up-heading-safe)
+                                     (org-auto-scheduler--siblings-sequential-p
+                                      (cons (current-buffer) (point)) root-id)
+                                   root-seq))))
+                 (own-seq (org-auto-scheduler--siblings-sequential-p
+                           (cons (current-buffer) (point)) root-id))
+                 (has-children (save-excursion
+                                 (let ((sub-end (save-excursion (org-end-of-subtree t t) (point))))
+                                   (and (outline-next-heading) (< (point) sub-end)))))
+                 (is-ind (org-auto-scheduler-task-independent-p m))
+                 (sched-task (and tid (assoc tid org-auto-scheduler-completed-tasks)))
+                 (start (and sched-task (nth 1 sched-task)))
+                 (end (and sched-task (nth 2 sched-task)))
+                 (status (and sched-task (nth 9 sched-task)))
+                 (pinned (org-auto-scheduler-task-pinned-p m tid))
+                 (blockers-info (org-auto-scheduler--get-task-blockers-info m))
+                 (blocker-ids (delq nil
+                                    (mapcar (lambda (bm)
+                                              (org-with-point-at bm (org-id-get)))
+                                            (org-auto-scheduler-get-blockers m))))
+                 (trace (and tid (boundp 'org-auto-scheduler--placement-traces)
+                             (hash-table-p org-auto-scheduler--placement-traces)
+                             (gethash tid org-auto-scheduler--placement-traces)))
+                 (float-hrs (and tid (fboundp 'org-auto-scheduler-task-float-hours)
+                                 (org-auto-scheduler-task-float-hours tid)))
+                 (base-score (or (and tid (gethash tid score-map))
+                                 (let ((s (car (org-auto-scheduler-calculate-score m)))
+                                       (boost (if (org-auto-scheduler--inspector-critical-float-p float-hrs)
+                                                  (or (bound-and-true-p org-auto-scheduler-critical-path-boost) 50.0)
+                                                0.0)))
+                                   (and s (+ s boost)))))
+                 (node (list :index idx
+                             :pos pos
+                             :rel-depth rel-depth
+                             :todo todo
+                             :done-p done-p
+                             :headline hl
+                             :id tid
+                             :parent-pos parent-pos
+                             :parent-seq parent-seq
+                             :own-seq own-seq
+                             :has-children has-children
+                             :is-ind is-ind
+                             :sched-task sched-task
+                             :start start
+                             :end end
+                             :status status
+                             :pinned pinned
+                             :blockers-info blockers-info
+                             :blocker-ids blocker-ids
+                             :trace trace
+                             :float-hrs float-hrs
+                             :score base-score
+                             :is-last-sibling nil :rank nil :why nil
+                             :seq-prev-node nil :seq-next-node nil
+                             :explicit-succs nil)))
+            (when (> rel-depth 0)
+              (puthash (cons parent-pos rel-depth) idx last-by-parent))
+            (push node nodes)
+            (set-marker m nil)
+            (setq idx (1+ idx)))
+          (outline-next-heading))
+        (set-marker root-m nil)))
+    (setq nodes (nreverse nodes))
+    (dolist (node nodes)
+      (let ((d (plist-get node :rel-depth))
+            (p (plist-get node :parent-pos))
+            (i (plist-get node :index)))
+        (when (and (> d 0) (eql i (gethash (cons p d) last-by-parent)))
+          (plist-put node :is-last-sibling t))))
+    (list :root-headline root-hl :root-seq root-seq :nodes nodes)))
+
+(defun org-auto-scheduler--inspector-assign-sequence-and-reasons (nodes)
+  "Assign chronological `:rank' and `:why' strings to project tree NODES.
+Returns a plist (:scheduled-count N :id-to-node HT)."
+  (let ((id-to-node (make-hash-table :test 'equal))
+        (parent-prev (make-hash-table :test 'eql))
+        (scheduled '())
+        (rank 0))
+    (dolist (n nodes)
+      (when (plist-get n :id)
+        (puthash (plist-get n :id) n id-to-node))
+      (when (and (plist-get n :start) (not (plist-get n :done-p)))
+        (push n scheduled)))
+    (setq scheduled
+          (sort (nreverse scheduled)
+                (lambda (a b)
+                  (let ((sa (plist-get a :start))
+                        (sb (plist-get b :start)))
+                    (if (not (equal sa sb))
+                        (time-less-p sa sb)
+                      (< (plist-get a :index) (plist-get b :index)))))))
+    (dolist (n scheduled)
+      (setq rank (1+ rank))
+      (plist-put n :rank rank))
+    ;; Track per-parent sequential sibling chains and explicit successor links
+    (dolist (n nodes)
+      (let ((tid (plist-get n :id))
+            (ppos (plist-get n :parent-pos))
+            (pseq (plist-get n :parent-seq))
+            (is-ind (plist-get n :is-ind))
+            (done-p (plist-get n :done-p))
+            (todo (plist-get n :todo))
+            (start (plist-get n :start)))
+        (when (and ppos pseq (not is-ind) (not done-p) (or todo start))
+          (let ((prev-node (gethash ppos parent-prev)))
+            (when prev-node
+              (plist-put n :seq-prev-node prev-node)
+              (plist-put prev-node :seq-next-node n))
+            (puthash ppos n parent-prev)))
+        (dolist (bid (plist-get n :blocker-ids))
+          (let ((bnode (gethash bid id-to-node)))
+            (when bnode
+              (plist-put bnode :explicit-succs
+                         (append (plist-get bnode :explicit-succs) (list n))))))))
+    ;; Build concise :why explanation for each node
+    (dolist (n nodes)
+      (let* ((done-p (plist-get n :done-p))
+             (todo (plist-get n :todo))
+             (start (plist-get n :start))
+             (has-children (plist-get n :has-children))
+             (own-seq (plist-get n :own-seq))
+             (parent-seq (plist-get n :parent-seq))
+             (is-ind (plist-get n :is-ind))
+             (pinned (plist-get n :pinned))
+             (b-ids (plist-get n :blocker-ids))
+             (b-info (plist-get n :blockers-info))
+             (seq-prev (plist-get n :seq-prev-node))
+             (trace (plist-get n :trace))
+             (float-hrs (plist-get n :float-hrs))
+             (score (plist-get n :score))
+             (rel-depth (plist-get n :rel-depth))
+             (why
+              (cond
+               (done-p "DONE")
+               ((and (= rel-depth 0) (not start) (not todo))
+                (if own-seq "[Sequential :ORDERED:]" "[Parallel :PARALLEL:]"))
+               ((and (not start) has-children (not todo))
+                (if own-seq "[Sequential :ORDERED:]" "[Parallel :PARALLEL:]"))
+               ((not start)
+                (cond
+                 (b-info "Unscheduled (blocked)")
+                 (todo "Unscheduled")
+                 (t "(heading)")))
+               (t
+                (let ((parts '()))
+                  (when pinned
+                    (push "Pinned" parts))
+                  (when b-ids
+                    (let ((b-labels
+                           (mapcar (lambda (bid)
+                                     (let* ((bn (gethash bid id-to-node))
+                                            (br (and bn (plist-get bn :rank))))
+                                       (if br (format "#%d" br)
+                                         (or (and bn (org-auto-scheduler--truncate (plist-get bn :headline) 16))
+                                             "blocker"))))
+                                   b-ids)))
+                      (push (format "Blocked by %s" (mapconcat #'identity b-labels ", ")) parts)))
+                  (cond
+                   ((and (not b-ids) seq-prev)
+                    (let ((pr (plist-get seq-prev :rank)))
+                      (push (if pr (format "After #%d (:ORDERED:)" pr)
+                              "After prev (:ORDERED:)")
+                            parts)))
+                   ((and (not b-ids) parent-seq (not is-ind))
+                    (push (format "First in :ORDERED: (score %.0f)" (or score 0.0)) parts))
+                   ((not b-ids)
+                    (push (format "%s (score %.0f)"
+                                  (if is-ind ":INDEPENDENT:" ":PARALLEL:")
+                                  (or score 0.0))
+                          parts)))
+                  (when (org-auto-scheduler--inspector-critical-float-p float-hrs)
+                    (push "⚡Crit" parts))
+                  (when (plist-get trace :backfilled)
+                    (push "Backfilled" parts))
+                  (mapconcat #'identity (nreverse parts) ", "))))))
+        (plist-put n :why why)))
+    (list :scheduled-count rank :id-to-node id-to-node)))
+
+(defun org-auto-scheduler--inspector-render-project-hierarchy (marker task-id)
+  "Render Section 4 (Project Hierarchy & Sequence) into the current Inspector buffer."
+  (insert (propertize "4. PROJECT HIERARCHY & SEQUENCE (Why This Order?)\n" 'face 'bold))
+  (insert "   ───────────────────────────────────────────────────────────────\n")
+  (let ((root-marker (and marker (markerp marker) (marker-buffer marker)
+                          (org-auto-scheduler--find-project-root-marker marker))))
+    (if (not root-marker)
+        (insert "   • No enclosing project or heading hierarchy found.\n\n")
+      (let* ((tree-data (org-auto-scheduler--inspector-collect-project-tree root-marker))
+             (root-hl (plist-get tree-data :root-headline))
+             (root-seq (plist-get tree-data :root-seq))
+             (nodes (plist-get tree-data :nodes))
+             (seq-res (org-auto-scheduler--inspector-assign-sequence-and-reasons nodes))
+             (sched-count (plist-get seq-res :scheduled-count))
+             (id-to-node (plist-get seq-res :id-to-node))
+             (win (get-buffer-window (current-buffer) t))
+             (avail (max 80 (- (if (window-live-p win) (window-body-width win) 100) 6)))
+             (natural-left
+              (apply #'max 20
+                     (mapcar (lambda (n)
+                               (let ((d (plist-get n :rel-depth))
+                                     (todo (plist-get n :todo)))
+                                 (+ (if (= d 0) 2 (1+ (* 3 d)))
+                                    2
+                                    (if todo (+ 3 (string-width todo)) 0)
+                                    (string-width (or (plist-get n :headline) "")))))
+                             nodes)))
+             (left-width (max 28 (min natural-left (floor (* avail 0.6)))))
+             (right-width (max 20 (- avail left-width)))
+             (depth-last-vec (make-vector (1+ (apply #'max 1 (mapcar (lambda (n) (plist-get n :rel-depth)) nodes))) nil))
+             (focus-node (and task-id (gethash task-id id-to-node))))
+        (insert (format "   Project: %s [%s]\n\n"
+                        root-hl
+                        (if root-seq "Sequential Siblings: :ORDERED:"
+                          "Parallel Siblings: :PARALLEL:")))
+        (insert (propertize
+                 (concat "   " (truncate-string-to-width "TREE" left-width 0 ?\s)
+                         " │ SEQUENCE & WHY\n")
+                 'face 'bold))
+        (insert (format "   %s┼%s\n"
+                        (make-string (1+ left-width) ?─)
+                        (make-string (1+ right-width) ?─)))
+        (dolist (n nodes)
+          (let* ((d (plist-get n :rel-depth))
+                 (last-p (plist-get n :is-last-sibling))
+                 (todo (plist-get n :todo))
+                 (hl (plist-get n :headline))
+                 (nid (plist-get n :id))
+                 (focused (and task-id nid (equal task-id nid)))
+                 (rank (plist-get n :rank))
+                 (start (plist-get n :start))
+                 (end (plist-get n :end))
+                 (why (or (plist-get n :why) ""))
+                 (prefix
+                  (if (= d 0)
+                      "* "
+                    (let ((anc ""))
+                      (dotimes (k (1- d))
+                        (let ((lvl (1+ k)))
+                          (setq anc (concat anc (if (aref depth-last-vec lvl) "   " "│  ")))))
+                      (when (< d (length depth-last-vec))
+                        (aset depth-last-vec d last-p))
+                      (concat anc (if last-p "└── " "├── ")))))
+                 (focus-str (if focused "▶ " "  "))
+                 (todo-str (if todo (format "[%s] " todo) ""))
+                 (raw-left (concat prefix focus-str todo-str hl))
+                 (padded-left (truncate-string-to-width raw-left left-width 0 ?\s "…"))
+                 (slot-str (if (and start end)
+                               (format "%s–%s"
+                                       (format-time-string "%a %H:%M" start)
+                                       (format-time-string "%H:%M" end))
+                             nil))
+                 (right-col (if rank
+                                (format "#%-2d %-14s %s" rank (or slot-str "") why)
+                              (format "—   %s" why))))
+            (insert "   "
+                    (if focused (propertize padded-left 'face 'bold) padded-left)
+                    " │ "
+                    (let ((rc (truncate-string-to-width right-col right-width 0 nil "…")))
+                      (if focused (propertize rc 'face 'bold) rc))
+                    "\n")))
+        (when focus-node
+          (let* ((f-rank (plist-get focus-node :rank))
+                 (f-seq-prev (plist-get focus-node :seq-prev-node))
+                 (f-seq-next (plist-get focus-node :seq-next-node))
+                 (f-b-ids (plist-get focus-node :blocker-ids))
+                 (f-exp-succs (plist-get focus-node :explicit-succs))
+                 (preds '())
+                 (succs '()))
+            (dolist (bid f-b-ids)
+              (let ((bn (gethash bid id-to-node)))
+                (push (if bn
+                          (format "%s%s (explicit BLOCKER)"
+                                  (if (plist-get bn :rank) (format "#%d " (plist-get bn :rank)) "")
+                                  (plist-get bn :headline))
+                        (format "ID %s (external BLOCKER)" bid))
+                      preds)))
+            (when f-seq-prev
+              (push (format "%s%s (:ORDERED: sibling)"
+                            (if (plist-get f-seq-prev :rank) (format "#%d " (plist-get f-seq-prev :rank)) "")
+                            (plist-get f-seq-prev :headline))
+                    preds))
+            (dolist (sn f-exp-succs)
+              (push (format "%s%s (blocked by this)"
+                            (if (plist-get sn :rank) (format "#%d " (plist-get sn :rank)) "")
+                            (plist-get sn :headline))
+                    succs))
+            (when f-seq-next
+              (push (format "%s%s (:ORDERED: sibling)"
+                            (if (plist-get f-seq-next :rank) (format "#%d " (plist-get f-seq-next :rank)) "")
+                            (plist-get f-seq-next :headline))
+                    succs))
+            (setq preds (nreverse preds))
+            (setq succs (nreverse succs))
+            (insert "\n")
+            (insert (propertize
+                     (if f-rank
+                         (format "   Inspected Task (#%d of %d scheduled in project):\n" f-rank sched-count)
+                       (format "   Inspected Task (Unscheduled; %d scheduled in project):\n" sched-count))
+                     'face 'bold))
+            (insert (format "   • Predecessors: %s\n"
+                            (if preds (mapconcat #'identity preds "; ") "None")))
+            (insert (format "   • Successors:   %s\n"
+                            (if succs (mapconcat #'identity succs "; ") "None")))))
+        (insert "\n")))))
+
 (defun org-auto-scheduler--render-task-inspector-buffer (task-id &optional no-select)
   "Populate `*Org Auto Scheduler Task Inspector*' for TASK-ID."
   (let* ((task (and task-id (assoc task-id org-auto-scheduler-completed-tasks)))
@@ -5133,7 +5479,9 @@ Can be a float (fraction of the frame, e.g. 0.45) or an integer (number of colum
                                (format-time-string "%a %Y-%m-%d %H:%M" final-start)
                                (format-time-string "%H:%M" final-end))
                        'face 'success)))))
-        (insert "\nKeys: [I / q] Close Inspector  (Follow mode: move cursor in Review Buffer to inspect tasks)\n"))
+        (insert "\n")
+        (org-auto-scheduler--inspector-render-project-hierarchy marker task-id)
+        (insert "Keys: [I / q] Close Inspector  (Follow mode: move cursor in Review Buffer to inspect tasks)\n"))
       (goto-char (point-min)))
     (let ((win (get-buffer-window buf t)))
       (when (window-live-p win)
