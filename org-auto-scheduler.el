@@ -759,7 +759,7 @@ intraday drift from CPM float or gap backfilling.")
 (defvar org-auto-scheduler--backfilled-task-slots nil
   "Hash table mapping task-id to the SCHEDULED string where it was backfilled.")
 
-(defcustom org-auto-scheduler-preserve-future-scheduled t
+(defcustom org-auto-scheduler-preserve-future-scheduled nil
   "When non-nil, tasks already scheduled for future days with a specific time
 are preserved during scheduling runs, unless rescheduling is triggered by a
 title marker (such as -r- or -r-all-) or `force-replan'."

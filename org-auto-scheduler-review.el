@@ -114,6 +114,17 @@ table or the timegrid."
   :type 'integer
   :group 'org-auto-scheduler)
 
+(defcustom org-auto-scheduler-review-timegrid-drag-pins-task t
+  "If non-nil, dragging a task block in `*Org Time Grid*' pins it to the drop time.
+When non-nil (default), dropping a task at a specific time on the grid
+records that time as a review pin (`:pinned-time') so the task stays at
+the dropped clock time across recalculations.
+When nil, dragging an unpinned task only updates its relative order/day
+and lets the auto-scheduler pack it into the earliest available slot
+(only already-pinned or `FREESET' tasks stick to the exact drop time)."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
 (defvar-local org-auto-scheduler--timegrid-current-layout nil
   "Tracks whether the active timegrid split is 'side-by-side or 'horizontal.")
 
@@ -4150,12 +4161,20 @@ already passed the skip/fail/block filter in
 mark would have nothing left to distinguish -- the status icon alone
 carries the meaning here.  PROJECT-NAME's segment is left out entirely
 when there is no project (\"—\"), rather than printed as a bare dash."
-  (let* ((headline (or (nth 5 task) "Untitled"))
+  (let* ((task-id (nth 0 task))
+         (headline (or (nth 5 task) "Untitled"))
          (marker (nth 7 task))
          (status (nth 9 task))
          (start (nth 1 task))
          (end (nth 2 task))
          (status-icon (car (org-auto-scheduler--review-status-icon-info task marker)))
+         (is-pinned (org-auto-scheduler-task-pinned-p marker task-id))
+         (is-freeset (org-auto-scheduler-task-freeset-p marker task-id))
+         (badge-icons (concat (when is-pinned "📌")
+                              (when is-freeset "⚡")))
+         (icon-prefix (if (string-empty-p badge-icons)
+                          status-icon
+                        (concat status-icon " " badge-icons)))
          (is-split (or (eq status :split-today) (plist-get (nthcdr 9 task) :split-today)))
          (detail (cond
                   ((eq status :placeholder)
@@ -4172,7 +4191,7 @@ when there is no project (\"—\"), rather than printed as a bare dash."
                                    (unless (string= project-name "—") project-name)
                                    detail
                                    (format "★%.1f" score)))))
-    (format "%s %s" status-icon (mapconcat #'identity segments " · "))))
+    (format "%s %s" icon-prefix (mapconcat #'identity segments " · "))))
 
 (defun org-auto-scheduler--timegrid-event-from-task (task)
   "Convert TASK into an `org-timegrid-event', or nil if it should not appear.
@@ -4277,61 +4296,80 @@ since the calendar epoch back to an Emacs time value."
 
 (defun org-auto-scheduler--timegrid-apply-drop (task-id new-start)
   "Reposition TASK-ID's row to reflect a mouse-drag drop at NEW-START.
-Finds the first other task already in the review list, scheduled the
-same day as NEW-START, whose current start is at/after NEW-START, and
-moves TASK-ID to just before it -- the same effect as
-`org-auto-scheduler-review-move-before' (keyboard).  If none is found
-(dropped after everything that day, or the day has no other tasks),
-moves it to the end of that day via
-`org-auto-scheduler-review-move-to-day'.  Either way finishes by
-recalculating the schedule so nothing overlaps; the exact dropped time
-only decides ordering; the task's own effort still decides duration."
+When `org-auto-scheduler-review-timegrid-drag-pins-task' is non-nil, or
+when TASK-ID is already pinned or FREESET, records NEW-START as the
+task's `:pinned-time' override so it stays at the exact dropped time.
+Otherwise, only updates TASK-ID's relative order/day (via
+`org-auto-scheduler--review-move-before-id' or
+`org-auto-scheduler-review-move-to-day') and recalculates."
   (let* ((new-day (format-time-string "%Y-%m-%d" new-start))
          (today-str (format-time-string "%Y-%m-%d")))
     (when (string< new-day today-str)
       (user-error "Cannot schedule tasks in the past (before %s)" today-str))
-    ;; If the task is PINNED or FREESET, record new-start as its target time in review overrides
-    (let* ((task (assoc task-id org-auto-scheduler-completed-tasks))
+    (org-auto-scheduler--review-push-undo)
+    (let* ((pre-drag-snapshot (car org-auto-scheduler--review-undo-stack))
+           (task (assoc task-id org-auto-scheduler-completed-tasks))
            (marker (and task (nth 7 task)))
+           (headline (or (and task (nth 5 task)) "Task"))
            (is-pinned (org-auto-scheduler-task-pinned-p marker task-id))
-           (is-freeset (org-auto-scheduler-task-freeset-p marker task-id)))
-      (when (or is-pinned is-freeset)
-        (let ((over (or (gethash task-id org-auto-scheduler--review-overrides)
-                        (list :order nil :skipped nil :target-date new-day))))
-          (puthash task-id
-                   (plist-put (plist-put over :pinned-time (format-time-string "%Y-%m-%d %H:%M" new-start))
-                              :pinned (or is-pinned t))
-                   org-auto-scheduler--review-overrides))))
-    (let ((next-id
-           (catch 'found
-             (dolist (row tabulated-list-entries)
-               (let ((row-id (car row)))
-                 (unless (or (equal row-id task-id)
-                             (org-auto-scheduler--review-special-row-p row-id))
-                   (let* ((other (assoc row-id org-auto-scheduler-completed-tasks))
-                          (other-start (and other (nth 1 other))))
-                     (when (and other-start
-                                (equal (format-time-string "%Y-%m-%d" other-start) new-day)
-                                (not (time-less-p other-start new-start)))
-                       (throw 'found row-id))))))
-             nil)))
-      (org-auto-scheduler--review-goto-task task-id)
-      (if next-id
-          (org-auto-scheduler--review-move-before-id task-id next-id)
-        (org-auto-scheduler-review-move-to-day new-day)))))
+           (is-freeset (org-auto-scheduler-task-freeset-p marker task-id))
+           (should-pin (or org-auto-scheduler-review-timegrid-drag-pins-task
+                           is-pinned
+                           is-freeset)))
+      (when should-pin
+        (let ((over (copy-sequence
+                     (or (gethash task-id org-auto-scheduler--review-overrides)
+                         (list :order nil :skipped nil :target-date new-day))))
+              (time-str (format-time-string "%Y-%m-%d %H:%M" new-start)))
+          (setq over (plist-put over :pinned-time time-str))
+          (setq over (plist-put over :pinned-date new-day))
+          (setq over (plist-put over :pinned t))
+          (puthash task-id over org-auto-scheduler--review-overrides)))
+      (let ((next-id
+             (catch 'found
+               (dolist (row tabulated-list-entries)
+                 (let ((row-id (car row)))
+                   (unless (or (equal row-id task-id)
+                               (org-auto-scheduler--review-special-row-p row-id))
+                     (let* ((other (assoc row-id org-auto-scheduler-completed-tasks))
+                            (other-start (and other (nth 1 other))))
+                       (when (and other-start
+                                  (equal (format-time-string "%Y-%m-%d" other-start) new-day)
+                                  (not (time-less-p other-start new-start)))
+                         (throw 'found row-id))))))
+               nil)))
+        (org-auto-scheduler--review-goto-task task-id)
+        (if next-id
+            (org-auto-scheduler--review-move-before-id task-id next-id)
+          (org-auto-scheduler-review-move-to-day new-day))
+        ;; Collapse intermediate undo snapshot from move-before/move-to-day so a single undo reverts the whole drag
+        (when (and pre-drag-snapshot
+                   (not (eq (car org-auto-scheduler--review-undo-stack) pre-drag-snapshot))
+                   (eq (cadr org-auto-scheduler--review-undo-stack) pre-drag-snapshot))
+          (pop org-auto-scheduler--review-undo-stack))
+        (if should-pin
+            (message "Pinned '%s' to %s" headline (format-time-string "%Y-%m-%d %H:%M" new-start))
+          (message "Reordered '%s' (auto-packed; press P to pin to an exact time)" headline))))))
 
-(defun org-auto-scheduler--timegrid-update (review-buffer event start _end &rest _)
-  "org-timegrid backend update-function: apply a mouse drag of EVENT.
-Only AUTOSCH task blocks can be dragged (fixed agenda events and
-placeholder chunks are rejected with a clear message).  Resizing (only
-the block's END changes) is intentionally a no-op beyond a reorder: a
-task's duration always comes from its Org EFFORT property via
-recalculation, never from how tall its block was dragged, so nothing
-happens beyond what the (unchanged) START implies."
+(defun org-auto-scheduler--timegrid-apply-resize (task-id new-effort)
+  "Update TASK-ID's estimated effort to NEW-EFFORT minutes after a grid resize."
+  (let ((clamped-effort (max 5 (round new-effort))))
+    (org-auto-scheduler--review-goto-task task-id)
+    (org-auto-scheduler-review-edit-effort clamped-effort)
+    (when org-auto-scheduler-review-auto-recalculate-on-move
+      (org-auto-scheduler--review-maybe-auto-recalculate task-id))))
+
+(defun org-auto-scheduler--timegrid-update (review-buffer event start end &rest _)
+  "org-timegrid backend update-function: apply a drag or resize of EVENT.
+Only AUTOSCH task blocks can be modified (fixed agenda events and
+placeholder chunks are rejected with a clear message).
+When only END changes (START matches the event's original start),
+updates the task's estimated effort to (- END START) minutes.
+Otherwise, repositions/pins the task to START."
   (let* ((source (org-timegrid-event-source event))
          (task-id (plist-get source :task-id)))
     (unless task-id
-      (user-error "Only proposed tasks can be dragged here, not fixed events"))
+      (user-error "Only proposed tasks can be modified here, not fixed events"))
     (unless (and review-buffer (buffer-live-p review-buffer))
       (user-error "The source review buffer no longer exists"))
     (with-current-buffer review-buffer
@@ -4339,9 +4377,15 @@ happens beyond what the (unchanged) START implies."
         (unless (and task (assoc task-id tabulated-list-entries))
           (user-error "Task no longer present in the review table"))
         (when (eq (nth 9 task) :placeholder)
-          (user-error "Placeholder chunks can't be dragged; move the source task instead")))
-      (org-auto-scheduler--timegrid-apply-drop
-       task-id (org-auto-scheduler--timegrid-time-from-minutes start)))))
+          (user-error "Placeholder chunks can't be modified; edit the source task instead")))
+      (let ((orig-start (and (fboundp 'org-timegrid-event-start)
+                             (org-timegrid-event-start event)))
+            (orig-end (and (fboundp 'org-timegrid-event-end)
+                           (org-timegrid-event-end event))))
+        (if (and orig-start orig-end (= start orig-start) (/= end orig-end))
+            (org-auto-scheduler--timegrid-apply-resize task-id (- end start))
+          (org-auto-scheduler--timegrid-apply-drop
+           task-id (org-auto-scheduler--timegrid-time-from-minutes start)))))))
 
 (defun org-auto-scheduler--timegrid-backend (review-buffer)
   "Return a fresh org-timegrid backend previewing REVIEW-BUFFER.
