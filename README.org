@@ -28,6 +28,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
   - [[#fixed-agenda-events-and-non-blocking-tasks][Fixed Agenda Events & Non-Blocking Tasks]]
   - [[#in-buffer-task-slicer-chop][In-Buffer Task Slicer ("Chop")]]
   - [[#visual-what-if-diff-buffer][Visual What-If Diff Buffer]]
+  - [[#task-inspector-mode][Task Inspector Mode ("Why Is This Scheduled Here?")]]
   - [[#persistent-review-decisions-and-state-file][Persistent Review Decisions & State File]]
   - [[#smart-restore--merge][Smart Restore & Merge]]
   - [[#multi-instance-and-file-synchronization][Multi-Instance & File Synchronization]]
@@ -576,6 +577,21 @@ Before committing changes to your Org files with =x=, inspect a complete What-If
   - =  Task Name (UNCHANGED)=: Preserved tasks.
 - *Direct Navigation:* Press =RET= or =TAB= on any diff entry to jump directly to that task in the review buffer. Press =q= to dismiss.
 
+*** Task Inspector Mode ("Why Is This Scheduled Here?")
+<<task-inspector-mode>>
+
+#+CAPTION: Review Buffer with Task Inspector Side Window (Follow Mode Active)
+[[file:screenshots/review-buffer-inspect.png]]
+
+Pressing =I= on any task row in the review buffer opens (or toggles) the =*Org Auto Scheduler Task Inspector*= side window, giving a complete explanation of why that task received its score, duration, day/time slot, and project order:
+
+- *Live Follow Mode:* By default (=org-auto-scheduler-review-inspector-follow= = =t=), moving the cursor across tasks in the review buffer automatically updates the inspector side window in place. Killing the review buffer closes the inspector automatically.
+- *1. Priority Score Breakdown:* Lists every scoring component (Effort, Priority, Deadline Urgency, Category Priority, TODO State Weight, plus Tag Weight, Urgent Days Boost, and Large Task Weight when non-zero), CPM Total Float (highlighting =⚡ [CRITICAL PATH]= or =⛔ [DEADLINE INFEASIBLE!]=), and the Total Effective Score.
+- *2. Effort & Duration Calculation:* Shows the explicit =:Effort:= property, Category historical multiplier, already clocked time, effective scheduled duration in minutes, and active modifiers (=SPLITTABLE=, =FREESET=, =PINNED=).
+- *3. Slot Placement Trace (Why This Day & Time?):* Shows the search cursor floor (and whether the task was backfilled into an earlier open gap), =NOT_BEFORE= constraint, upstream blocker finish floor, hard time-block / soft energy-block constraints, any skipped/occupied windows with conflict reasons, and the final =✓ Selected Slot=.
+- *4. Project Hierarchy & Sequence (Why This Order?):* Renders the enclosing project tree indicating =:ORDERED:= (sequential) vs. =:PARALLEL:= siblings, each sibling's sequence rank (=#1=, =#2=, …), scheduled slot, placement reason, and explicit Predecessors / Successors for the inspected task.
+- *Keybindings:* Press =I= in the review buffer to toggle the inspector, or =I= / =q= inside =*Org Auto Scheduler Task Inspector*= to close it.
+
 *** Persistent Review Decisions and State File
 <<persistent-review-decisions-and-state-file>>
 
@@ -637,6 +653,7 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | *Move Down / Later*                   | =J=                           | =J=                  | Move later in scheduling order (crosses days)           |
 | *Chop / Slice Task*                   | =c=, =C-c c=                  |                      | Keep chosen duration today, defer rest to subsequent days |
 | *What-If Diff Buffer*                 | =D=, =C-c C-v=                |                      | Inspect diff of proposed changes against disk state      |
+| *Inspect Task ("Why Here?")*          | =I=                           |                      | Toggle Task Inspector side window (with follow mode)     |
 | *Shift Day Next / Prev*               | =>=, =+= / =<=, =-=           | =>=, =+= / =<=, =-=  | Move task across scheduled days                         |
 | *Recalculate Schedule*                | =r=, =C-c C-r=                | =r=, =C-c C-r=       | Recalculate and compact schedule                        |
 | *Refresh Scheduler*                   | =R=                           | =R=                  | Re-run auto-scheduler from scratch                      |
@@ -1290,6 +1307,9 @@ Backward-compatible aliases:
 | =org-auto-scheduler-review-auto-recalculate-on-move= | =t=                                             | When non-nil, reordering tasks automatically recalculates schedule times.                       |
 | =org-auto-scheduler-review-recalculate-delay=       | =3.0=                                           | Idle seconds after moving tasks before recalculating (debounces rapid moves and mouse drags).   |
 | =org-auto-scheduler-review-order-on-score-change=   | ='reset-task=                                   | How to handle saved manual review order (=:order=) when a task's score inputs change (priority, effort weight, TODO state, tags/category weights, or an edited =DEADLINE= date; the daily growth of deadline urgency does *not* count): ='reset-task= (re-rank only the modified task by its new score and mark with =[RE-RANKED]=), ='reset-all= (clear all saved orders and re-sort from scratch), or ='keep= (always preserve manual order). |
+| =org-auto-scheduler-review-inspector-side=          | ='right=                                        | Side where the Task Inspector window appears: ='right=, ='left=, ='above=, or ='below=.        |
+| =org-auto-scheduler-review-inspector-width=         | =0.45=                                          | Width of the Task Inspector side window (fraction of frame or column count).                    |
+| =org-auto-scheduler-review-inspector-follow=        | =t=                                             | When non-nil, automatically updates the Task Inspector as point moves across tasks in Review.   |
 
 Example configuration:
 
