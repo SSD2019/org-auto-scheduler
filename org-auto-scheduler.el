@@ -3332,6 +3332,21 @@ Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date
 
 ;; Note: `org-auto-scheduler--task-clocked-p' is defined earlier near `org-auto-scheduler-get-clocked-time'.
 
+;; Without this, preserving future slots keeps a task booked after a deadline
+;; that was added or moved up since it was scheduled.
+(defun org-auto-scheduler--slot-misses-deadline-p (marker task-id start-time &optional today-str)
+  "Return non-nil if START-TIME is on a day after the DEADLINE of the task at MARKER.
+Only deadlines on or after TODAY-STR count, since an earlier one can no
+longer be met.  Pinned and clocked-in tasks never count."
+  (let* ((deadline (org-auto-scheduler-get-deadline marker))
+         (deadline-day (and deadline (format-time-string "%Y-%m-%d" deadline)))
+         (target-today (or today-str (format-time-string "%Y-%m-%d")))
+         (is-deadline-reachable (and deadline-day (not (string< deadline-day target-today)))))
+    (and is-deadline-reachable
+         (string< deadline-day (format-time-string "%Y-%m-%d" start-time))
+         (not (org-auto-scheduler-task-pinned-p marker task-id))
+         (not (org-auto-scheduler--task-clocked-p marker)))))
+
 (defun org-auto-scheduler--task-unscheduled-p (task-info)
   "Return non-nil if TASK-INFO represents an unscheduled task eligible for today.
 A task is unscheduled if it has no SCHEDULED property, or its SCHEDULED property
@@ -3658,6 +3673,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                      (not (memq org-auto-scheduler--current-run-type
                                                 '(background-async background-sync)))))
                  (lapsed-ids (make-hash-table :test 'equal)) ; task-id -> 'clocked / 'lapsed
+                 (has-slot-past-deadline nil)
                  (run-backfilled-slots (make-hash-table :test 'equal)))
 
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
@@ -3715,10 +3731,16 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d")))
                            (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
                       (setf (nth 10 task-info) (org-auto-scheduler-parse-time-string not-before-time))))
-                  (let* ((sched-times (when preserve-today
-                                        (if org-auto-scheduler-preserve-future-scheduled
-                                            (org-auto-scheduler--task-scheduled-time marker today-str)
-                                          (org-auto-scheduler--task-scheduled-today-p marker today-str))))
+                  (let* ((kept-times (when preserve-today
+                                       (if org-auto-scheduler-preserve-future-scheduled
+                                           (org-auto-scheduler--task-scheduled-time marker today-str)
+                                         (org-auto-scheduler--task-scheduled-today-p marker today-str))))
+                         (is-kept-past-deadline (and kept-times
+                                                     (org-auto-scheduler--slot-misses-deadline-p
+                                                      marker task-id (car kept-times) today-str)))
+                         (_ (when is-kept-past-deadline (setq has-slot-past-deadline t)))
+                         ;; A slot after a still-reachable deadline is re-placed, not kept
+                         (sched-times (unless is-kept-past-deadline kept-times))
                          (lapsed-kind
                           (when sched-times
                             (let* ((st (car sched-times))
@@ -3838,7 +3860,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                             today-scheduled)))))
                    (has-unscheduled
                     (and preserve-today
-                         (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule)))
+                         (or has-slot-past-deadline
+                             (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule))))
                    (has-lapsed
                     (> (hash-table-count lapsed-ids) 0))
                    (has-priority-reorder (or has-priority-or-indep-trigger
