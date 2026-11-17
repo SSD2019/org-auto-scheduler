@@ -435,6 +435,16 @@ and org-auto-scheduler-recurring-look-days-ahead."
 (defvaralias 'org-auto-scheduler-habit-integration 'org-auto-scheduler-repeater-integration)
 (defvaralias 'org-auto-scheduler-habit-look-days-ahead 'org-auto-scheduler-repeater-look-days-ahead)
 
+(defvar org-auto-scheduler--replan-ids (make-hash-table :test 'equal)
+  "Task IDs to re-place even if they have a slot that would normally be kept.
+Set when a task is edited from the deadline-risk list.  Every run honours
+it; a real (non-preview) run clears it once it has placed the tasks.")
+
+(defvar org-auto-scheduler--deadline-candidates nil
+  "Task infos with the data the last run computed deadline risks from.
+Lets the review buffer refresh `org-auto-scheduler--deadline-risks' after it
+re-plans in place (recalculate, undo).")
+
 (defvar org-auto-scheduler--deadline-risks nil
   "Tasks the last run could not finish before their DEADLINE.
 A list of plists (:id :headline :marker :deadline :planned-end :reason),
@@ -1833,9 +1843,11 @@ Hash table with date strings as keys and lists of items as values.")
 
 (defvar org-auto-scheduler--completed-index nil
   "Index over `org-auto-scheduler-completed-tasks' for slot probes.
-A list (HEAD COUNT BY-DAY IDS): HEAD is the list object last indexed,
-COUNT its length, BY-DAY a hash from day-start seconds to the entries
-starting that day (in list order), IDS a hash of the entry IDs.")
+A list (HEAD COUNT BY-DAY IDS HEAD-CDR): HEAD is the list object last
+indexed, COUNT its length, BY-DAY a hash from day-start seconds to the
+entries starting that day (in list order), IDS a hash of the entry IDs,
+and HEAD-CDR the `cdr' HEAD had then.  An in-place `nreverse' keeps cells
+but rewires their `cdr's, so HEAD-CDR (and COUNT) detect it.")
 
 (defun org-auto-scheduler--day-key (time)
   "Return the start of TIME's local day as integer seconds."
@@ -1844,34 +1856,41 @@ starting that day (in list order), IDS a hash of the entry IDs.")
 
 (defun org-auto-scheduler--completed-index ()
   "Return the current index of `org-auto-scheduler-completed-tasks'.
-Entries are only ever pushed onto the list or the list is replaced, so new
-entries are found by walking from the front to the previously indexed head.
-Anything else (a new list, `nreverse', removals) triggers a full rebuild,
-detected by the length no longer adding up."
+Entries pushed since the last call are found by walking from the front to
+the previously indexed head.  Any other change (a new list, `nreverse',
+removals) rebuilds the index: the indexed head must still have the same
+`cdr' and the length must add up.  Code that reverses or resets the list
+should also clear `org-auto-scheduler--completed-index'."
   (let* ((lst org-auto-scheduler-completed-tasks)
          (idx org-auto-scheduler--completed-index))
-    (if (and idx (eq (nth 0 idx) lst))
+    (if (and idx
+             (eq (nth 0 idx) lst)
+             (eq (cdr lst) (nth 4 idx))
+             (= (length lst) (nth 1 idx)))
         idx
       (let ((new '()) (cell lst) (n 0))
         (when idx
           (while (and cell (not (eq cell (nth 0 idx))))
             (push (car cell) new)
             (setq cell (cdr cell) n (1+ n))))
-        (if (and idx cell (= (+ n (nth 1 idx)) (length lst)))
+        (if (and idx cell
+                 (eq (cdr cell) (nth 4 idx))
+                 (= (+ n (nth 1 idx)) (length lst)))
             ;; NEW is oldest-first; pushing each keeps per-day lists in list order.
             (let ((by-day (nth 2 idx)) (ids (nth 3 idx)))
               (dolist (task new)
                 (let ((key (org-auto-scheduler--day-key (or (nth 1 task) (current-time)))))
                   (puthash key (cons task (gethash key by-day)) by-day))
                 (puthash (nth 0 task) t ids))
-              (setq org-auto-scheduler--completed-index (list lst (+ n (nth 1 idx)) by-day ids)))
+              (setq org-auto-scheduler--completed-index
+                    (list lst (+ n (nth 1 idx)) by-day ids (cdr lst))))
           (let ((by-day (make-hash-table)) (ids (make-hash-table :test 'equal)))
             (dolist (task (reverse lst))
               (let ((key (org-auto-scheduler--day-key (or (nth 1 task) (current-time)))))
                 (puthash key (cons task (gethash key by-day)) by-day))
               (puthash (nth 0 task) t ids))
             (setq org-auto-scheduler--completed-index
-                  (list lst (length lst) by-day ids))))))))
+                  (list lst (length lst) by-day ids (cdr lst)))))))))
 
 (defun org-auto-scheduler-get-agenda-items (date)
   "Get agenda items for DATE.  Includes tasks with active timestamps and projected habit occurrences."
@@ -3018,7 +3037,7 @@ Excludes TASK-ID and non-blocking items."
         (cond
          ((org-auto-scheduler--day-off-p current-time)
           (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Day %d is a day off, moving to next day" day-of-week)
-          (setq current-time (org-auto-scheduler-next-day current-time)))
+          (setq current-time (org-auto-scheduler-next-day-start current-time)))
          ((time-less-p current-time day-start)
           (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Current time is before day start, setting to day start")
           (setq current-time day-start))
@@ -3555,16 +3574,22 @@ Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date
 
 ;; Without this, preserving future slots keeps a task booked after a deadline
 ;; that was added or moved up since it was scheduled.
-(defun org-auto-scheduler--slot-misses-deadline-p (marker task-id start-time &optional today-str)
-  "Return non-nil if START-TIME is on a day after the DEADLINE of the task at MARKER.
-Only deadlines on or after TODAY-STR count, since an earlier one can no
-longer be met.  Pinned and clocked-in tasks never count."
+(defun org-auto-scheduler--slot-misses-deadline-p (marker task-id start-time &optional today-str end-time)
+  "Return non-nil if a kept slot misses the DEADLINE of the task at MARKER.
+That is: START-TIME is on a day after the deadline, or the deadline has a
+time of day and END-TIME is after it.  Only deadlines on or after TODAY-STR
+count, since an earlier one can no longer be met.  Pinned and clocked-in
+tasks never count."
   (let* ((deadline (org-auto-scheduler-get-deadline marker))
          (deadline-day (and deadline (format-time-string "%Y-%m-%d" deadline)))
          (target-today (or today-str (format-time-string "%Y-%m-%d" (current-time))))
          (is-deadline-reachable (and deadline-day (not (string< deadline-day target-today)))))
     (and is-deadline-reachable
-         (string< deadline-day (format-time-string "%Y-%m-%d" start-time))
+         (or (string< deadline-day (format-time-string "%Y-%m-%d" start-time))
+             (and end-time
+                  (string-match-p "[0-9]\\{1,2\\}:[0-9]\\{2\\}"
+                                  (or (org-entry-get marker "DEADLINE") ""))
+                  (time-less-p deadline end-time)))
          (not (org-auto-scheduler-task-pinned-p marker task-id))
          (not (org-auto-scheduler--task-clocked-p marker)))))
 
@@ -3826,7 +3851,12 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
   (let ((today-scheduled '())
         (tasks-to-schedule '())
         (has-r-all nil)
-        (has-slot-past-deadline nil))
+        (has-slot-past-deadline nil)
+        ;; Tasks the previous run already found late.  Re-placing them again
+        ;; cannot help and would re-plan today's other tasks on every run.
+        (prev-late (cl-loop for r in org-auto-scheduler--deadline-risks
+                            when (eq (plist-get r :reason) 'late)
+                            collect (plist-get r :id))))
     ;; 1. Process title markers and classify tasks
     (dolist (task-info sorted-tasks-info)
       (let* ((task-id (nth 5 task-info))
@@ -3870,11 +3900,19 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
                                    (org-auto-scheduler--task-scheduled-time marker today-str)
                                  (org-auto-scheduler--task-scheduled-today-p marker today-str))))
                  (is-kept-past-deadline (and kept-times
+                                             (not (member task-id prev-late))
                                              (org-auto-scheduler--slot-misses-deadline-p
-                                              marker task-id (car kept-times) today-str)))
+                                              marker task-id (car kept-times) today-str
+                                              (cdr kept-times))))
                  (_ (when is-kept-past-deadline (setq has-slot-past-deadline t)))
+                 ;; A kept slot on a day off (e.g. a vacation added later) moves.
+                 (is-on-day-off (and kept-times
+                                     (org-auto-scheduler--day-off-p (car kept-times))
+                                     (not (org-auto-scheduler-task-pinned-p marker task-id))))
+                 (is-replan (and task-id (gethash task-id org-auto-scheduler--replan-ids)))
                  ;; A slot after a still-reachable deadline is re-placed, not kept
-                 (sched-times (unless is-kept-past-deadline kept-times))
+                 (sched-times (unless (or is-kept-past-deadline is-on-day-off is-replan)
+                                kept-times))
                  (lapsed-kind
                   (when sched-times
                     (let* ((st (car sched-times))
@@ -4194,7 +4232,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
       (when (and org-auto-scheduler-sync-caldav
                  (not org-auto-scheduler--preview-mode))
         (org-auto-scheduler--caldav-pull))
-      (let ((cleaned-placeholders (org-auto-scheduler-cleanup-placeholders force-replan)))
+      (let ((cleaned-placeholders (if org-auto-scheduler--preview-mode
+                                         0 ; previews never write files
+                                       (org-auto-scheduler-cleanup-placeholders force-replan))))
         (setq org-auto-scheduler--session-cleaned-placeholders (or cleaned-placeholders 0))
         (when (and (not org-auto-scheduler--preview-mode)
                    (> org-auto-scheduler--session-cleaned-placeholders 0))
@@ -4203,7 +4243,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
         (condition-case err
             (progn
               (org-auto-scheduler-validate-config)              ; Validate config at runtime
-              (setq org-auto-scheduler-completed-tasks '())  ; Clear the completed tasks list
+              (setq org-auto-scheduler-completed-tasks '()  ; Clear the completed tasks list
+                    org-auto-scheduler--completed-index nil)
               (setq org-auto-scheduler--pomodoro-continuous-minutes 0)
               (unless (hash-table-p org-auto-scheduler--placement-traces)
                 (setq org-auto-scheduler--placement-traces (make-hash-table :test 'equal)))
@@ -4513,10 +4554,14 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                       tasks-scheduled (cdr placed)))
 
               ;; Normalize completed-tasks to chronological order (built via push)
-              (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
+              (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks)
+                    org-auto-scheduler--completed-index nil)
               ;; Forecast deadline misses and tell the user on interactive runs.
-              (setq org-auto-scheduler--deadline-risks
+              (setq org-auto-scheduler--deadline-candidates sorted-tasks-info
+                    org-auto-scheduler--deadline-risks
                     (org-auto-scheduler--compute-deadline-risks sorted-tasks-info now))
+              (unless org-auto-scheduler--preview-mode
+                (clrhash org-auto-scheduler--replan-ids))
               (when (and org-auto-scheduler--deadline-risks
                          (not org-auto-scheduler-silent-mode))
                 (message "⚠ %s  [M-x org-auto-scheduler-deadline-risks]"
@@ -6723,6 +6768,7 @@ parts count towards their parent; deadlines already past at NOW are left
 to the agenda's own overdue display."
   (let ((last-end (make-hash-table :test 'equal))
         (status (make-hash-table :test 'equal))
+        (chunked (make-hash-table :test 'equal))
         (risks '()))
     (dolist (tk org-auto-scheduler-completed-tasks)
       (let* ((id (nth 0 tk))
@@ -6732,6 +6778,8 @@ to the agenda's own overdue display."
                       id))
              (st (nth 9 tk))
              (end (nth 2 tk)))
+        (when (and owner (not (equal owner id)))
+          (puthash owner t chunked))
         (when owner
           (if (memq st '(:failed :blocked :skipped))
               (unless (gethash owner status) (puthash owner st status))
@@ -6745,6 +6793,19 @@ to the agenda's own overdue display."
              (deadline (and id (org-auto-scheduler--deadline-time marker)))
              (st (and id (gethash id status)))
              (end (and id (gethash id last-end))))
+        ;; A split task kept from an earlier run has only its first chunk in
+        ;; this run's list; its later chunks are placeholder children in the file.
+        (when (and deadline (eq st 'placed)
+                   (not (gethash id chunked))
+                   (org-auto-scheduler--kept-slot-p id marker))
+          (dolist (ph (org-auto-scheduler--find-child-placeholders marker id))
+            (let ((pm (plist-get ph :marker)))
+              (when (and pm (plist-get ph :scheduled)
+                         (not (org-with-point-at pm (org-entry-is-done-p))))
+                (let ((ph-end (org-with-point-at pm
+                                (org-auto-scheduler-calculate-task-end-time))))
+                  (when (and ph-end (or (null end) (time-less-p end ph-end)))
+                    (setq end ph-end)))))))
         (when (and deadline (time-less-p now deadline) (not (eq st :skipped)))
           (cond
            ((and end (time-less-p deadline end))
@@ -6757,6 +6818,21 @@ to the agenda's own overdue display."
                   risks))))))
     (sort (nreverse risks)
           (lambda (a b) (time-less-p (plist-get a :deadline) (plist-get b :deadline))))))
+
+(defun org-auto-scheduler--kept-slot-p (id marker)
+  "Return non-nil if this run kept task ID's existing slot (MARKER's SCHEDULED)."
+  (let ((entry (assoc id org-auto-scheduler-completed-tasks))
+        (sched (org-entry-get marker "SCHEDULED")))
+    (and entry sched (stringp (nth 6 entry))
+         (org-auto-scheduler--timestamps-equal-p (nth 6 entry) sched))))
+
+(defun org-auto-scheduler--refresh-deadline-risks ()
+  "Recompute `org-auto-scheduler--deadline-risks' from the current placements.
+For callers that re-plan in place, such as the review buffer."
+  (when org-auto-scheduler--deadline-candidates
+    (setq org-auto-scheduler--deadline-risks
+          (org-auto-scheduler--compute-deadline-risks
+           org-auto-scheduler--deadline-candidates (current-time)))))
 
 (defun org-auto-scheduler--deadline-risk-summary ()
   "Return a one-line summary of `org-auto-scheduler--deadline-risks', or nil."
@@ -6872,7 +6948,10 @@ Leave point on the task KEEP-ID if it is still listed, else on the first task."
     m))
 
 (defun org-auto-scheduler--deadline-risks-after-edit (risk what)
-  "Re-plan after WHAT was changed on RISK's task, redraw, and report the outcome."
+  "Re-plan after WHAT was changed on RISK's task, redraw, and report the outcome.
+The task is marked for re-placement (`org-auto-scheduler--replan-ids'), so
+its current slot is not simply kept; the next real run writes the new one."
+  (puthash (plist-get risk :id) t org-auto-scheduler--replan-ids)
   (org-auto-scheduler--deadline-risks-rerun)
   (org-auto-scheduler--deadline-risks-render (plist-get risk :id))
   (let* ((id (plist-get risk :id))
@@ -6925,13 +7004,14 @@ Leave point on the task KEEP-ID if it is still listed, else on the first task."
   (let* ((r (org-auto-scheduler--deadline-risks-at-point))
          (m (org-auto-scheduler--deadline-risks-marker r))
          (new (org-with-point-at m
-                (let ((cookie (and (looking-at org-complex-heading-regexp)
-                                   (match-string 3))))
-                  (when (and cookie
-                             (equal (org-entry-get nil "PRIORITY")
-                                    (char-to-string org-priority-highest)))
+                ;; PRIORITY is the effective priority (the default when there
+                ;; is no cookie); set the next one up explicitly, since
+                ;; `org-priority' `up' on a cookie-less heading only inserts
+                ;; the default.
+                (let ((cur (string-to-char (org-entry-get nil "PRIORITY"))))
+                  (when (<= cur org-priority-highest)
                     (user-error "%s already has the highest priority" (plist-get r :headline)))
-                  (org-priority 'up)
+                  (org-priority (1- cur))
                   (org-entry-get nil "PRIORITY")))))
     (org-auto-scheduler--deadline-risks-after-edit r (format "priority %s" new))))
 

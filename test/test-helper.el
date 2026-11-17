@@ -76,11 +76,14 @@
 (defun oas-test--record (ok desc detail)
   "Record one assertion result.  OK non-nil means pass; DESC and DETAIL describe it."
   (cl-incf oas-test-assertion-count)
-  (if ok
-      (when oas-test-verbose (message "PASS: %s" desc))
-    (cl-incf test-failures)
-    (push (concat desc detail) oas-test-failure-descriptions)
-    (message "FAIL: %s%s" desc detail)))
+  ;; Suites often bind `inhibit-message' to quiet the scheduler; results must
+  ;; still be printed.
+  (let ((inhibit-message nil))
+    (if ok
+        (when oas-test-verbose (message "PASS: %s" desc))
+      (cl-incf test-failures)
+      (push (concat desc detail) oas-test-failure-descriptions)
+      (message "FAIL: %s%s" desc detail))))
 
 (defun assert-equal (actual expected desc)
   "Assert that ACTUAL is `equal' to EXPECTED; DESC names the check."
