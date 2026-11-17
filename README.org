@@ -1428,7 +1428,10 @@ make bench                        # time a preview run on 500 generated tasks
 =EMACS= must point at a real Emacs binary (for example =make test EMACS=/snap/bin/emacs=).
 =log4e= is found automatically in =~/.emacs.d/elpa=; set =LOG4E_DIR= otherwise. The CalDAV
 suites only run when =org-caldav= is on the load path
-(=make test EXTRA_LOAD_PATH=/path/to/org-caldav=).
+(=make test EXTRA_LOAD_PATH=/path/to/org-caldav=). The Focus HUD suites need
+=org-focus-hud= checked out next to this repository (=../org-focus-hud=) and are skipped,
+with a note, when it is missing. =make test-compiled= runs every suite against
+byte-compiled modules, which catches bugs that only exist in compiled code.
 
 Tests never touch your own data: state files, the org-id database, and the agenda list
 are redirected to a scratch directory. =test/suites/32-golden-demo-schedule.el= pins the

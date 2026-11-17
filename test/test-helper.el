@@ -107,18 +107,29 @@ Suites change options with `setq'; this keeps one suite from affecting the next.
   (dolist (cell oas-test--default-options)
     (set (car cell) (copy-tree (cdr cell)))))
 
+(defun oas-test-clock-out ()
+  "Stop any running Org clock, so one suite's clock cannot leak into the next.
+A running clock changes the scheduler's start buffer, shifting later suites."
+  (when (and (fboundp 'org-clocking-p) (org-clocking-p))
+    (let ((inhibit-message t))
+      (ignore-errors (org-clock-out nil t))))
+  (when (boundp 'org-clock-current-task)
+    (setq org-clock-current-task nil)))
+
 (defun oas-test-run-suite-file (file)
   "Load suite FILE and signal an ERT failure listing every failed assertion."
   (setq test-failures 0
         oas-test-failure-descriptions nil)
   (oas-test-reset-options)
+  (oas-test-clock-out)
   (let ((agenda-files (copy-sequence org-agenda-files)))
     (unwind-protect
         (if oas-test--eln-load-path
             (let ((native-comp-eln-load-path oas-test--eln-load-path))
               (load file nil t))
           (load file nil t))
-      (setq org-agenda-files agenda-files)))
+      (setq org-agenda-files agenda-files)
+      (oas-test-clock-out)))
   (when oas-test-failure-descriptions
     (ert-fail (list (format "%d assertion(s) failed" test-failures)
                     (reverse oas-test-failure-descriptions)))))

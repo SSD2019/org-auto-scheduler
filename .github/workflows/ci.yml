@@ -15,6 +15,15 @@ jobs:
         emacs: ['28.2', '29.4', '30.1', 'snapshot']
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: org-auto-scheduler
+
+      # Optional companion package; its suites are skipped when it is missing.
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: SSD2019/org-focus-hud
+          path: org-focus-hud
 
       - uses: purcell/setup-emacs@master
         with:
@@ -30,7 +39,9 @@ jobs:
             (package-install 'log4e))"
 
       - name: Test
+        working-directory: org-auto-scheduler
         run: make test
 
       - name: Test byte-compiled
+        working-directory: org-auto-scheduler
         run: make test-compiled
