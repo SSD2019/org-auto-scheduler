@@ -86,3 +86,24 @@ BINDINGS is a plist of option symbols and values.  Return its SCHEDULED string."
                (condition-case nil (progn (org-auto-scheduler-validate-config) t)
                  (error nil)))
              "Test 35.13: validate-config accepts well-formed entries")
+
+;; The working-hours bounds are cached per day.  Changing an option must be
+;; picked up at once, even between runs (callers such as the review buffer and
+;; the Task Inspector ask outside a run).
+(let ((mon (encode-time 0 0 8 5 1 2026))
+      (hh (lambda (tm) (format-time-string "%H:%M" tm))))
+  (let ((org-auto-scheduler-day-hours nil))
+    (assert-equal (funcall hh (org-auto-scheduler--day-start mon)) "09:00"
+                  "Test 35.14a: Default start before any override"))
+  (let ((org-auto-scheduler-day-hours '((1 . ("13:00" . "17:00")))))
+    (assert-equal (funcall hh (org-auto-scheduler--day-start mon)) "13:00"
+                  "Test 35.14b: A new weekday override is used immediately"))
+  (let ((org-auto-scheduler-day-hours nil)
+        (org-auto-scheduler-start-time "07:30"))
+    (assert-equal (funcall hh (org-auto-scheduler--day-start mon)) "07:30"
+                  "Test 35.14c: A changed start time is used immediately"))
+  (let ((org-auto-scheduler-day-hours nil))
+    (assert-equal (list (funcall hh (org-auto-scheduler--day-start mon))
+                        (funcall hh (org-auto-scheduler--day-end (time-add mon (days-to-time 1)))))
+                  '("09:00" "17:00")
+                  "Test 35.14d: Back to defaults, and a different day is not served from the cache")))

@@ -245,13 +245,45 @@ See `org-auto-scheduler-day-hours'."
                              org-auto-scheduler-day-hours)))))
       (cons org-auto-scheduler-start-time org-auto-scheduler-end-time)))
 
+(defvar org-auto-scheduler--day-bounds-cache nil
+  "Last computed working-hours bounds, reused while probing the same day.
+A list (DAY-BEG NEXT-DAY-BEG START END START-OPT END-OPT HOURS-OPT DAYS-OFF-OPT).
+The last four are the option values it was computed from; a hit requires
+them to be `eq' to the current values, so changing any option recomputes.
+Cleared at the start of every run.")
+
+(defun org-auto-scheduler--day-bounds (time)
+  "Return (START . END) of working hours on TIME's day.
+Slot search asks for the same day thousands of times in a row, so the last
+day's answer is cached (see `org-auto-scheduler--day-bounds-cache')."
+  (let ((c org-auto-scheduler--day-bounds-cache))
+    (if (and c
+             (eq (nth 4 c) org-auto-scheduler-start-time)
+             (eq (nth 5 c) org-auto-scheduler-end-time)
+             (eq (nth 6 c) org-auto-scheduler-day-hours)
+             (eq (nth 7 c) org-auto-scheduler-days-off)
+             (not (time-less-p time (nth 0 c)))
+             (time-less-p time (nth 1 c)))
+        (cons (nth 2 c) (nth 3 c))
+      (let* ((d (decode-time time))
+             (beg (encode-time 0 0 0 (nth 3 d) (nth 4 d) (nth 5 d)))
+             (next (encode-time 0 0 0 (1+ (nth 3 d)) (nth 4 d) (nth 5 d)))
+             (hours (org-auto-scheduler--day-hours time))
+             (start (org-auto-scheduler-time-with-time-string time (car hours)))
+             (end (org-auto-scheduler-time-with-time-string time (cdr hours))))
+        (setq org-auto-scheduler--day-bounds-cache
+              (list beg next start end
+                    org-auto-scheduler-start-time org-auto-scheduler-end-time
+                    org-auto-scheduler-day-hours org-auto-scheduler-days-off))
+        (cons start end)))))
+
 (defun org-auto-scheduler--day-start (time)
   "Return the start of working hours on TIME's day."
-  (org-auto-scheduler-time-with-time-string time (car (org-auto-scheduler--day-hours time))))
+  (car (org-auto-scheduler--day-bounds time)))
 
 (defun org-auto-scheduler--day-end (time)
   "Return the end of working hours on TIME's day."
-  (org-auto-scheduler-time-with-time-string time (cdr (org-auto-scheduler--day-hours time))))
+  (cdr (org-auto-scheduler--day-bounds time)))
 
 (defcustom org-auto-scheduler-time-interval 15
   "The interval in minutes for checking time slots. This determines the granularity of the scheduling."
@@ -2197,6 +2229,8 @@ Returns integer minutes or nil if invalid."
       (string-to-number (match-string 1 str)))
      (t nil))))
 
+(defvar org-auto-scheduler--saved-decision-cache) ; defined in org-auto-scheduler-review.el
+
 (defvar org-auto-scheduler--siblings-sequential-cache nil
   "When a hash table, memoizes `org-auto-scheduler--siblings-sequential-p'.
 Bound by `org-auto-scheduler-sort-tasks' for the length of one sort, during
@@ -2574,6 +2608,7 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
       (org-with-point-at marker
         (or (org-id-get) (org-id-get-create)))))
   (let* ((org-auto-scheduler--siblings-sequential-cache (make-hash-table :test 'equal))
+         (org-auto-scheduler--saved-decision-cache (make-hash-table :test 'equal))
          (sibling-pos-cache (make-hash-table :test 'equal))
          (tasks-with-info
           (mapcar (lambda (marker)
@@ -4173,6 +4208,9 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
               (unless (hash-table-p org-auto-scheduler--placement-traces)
                 (setq org-auto-scheduler--placement-traces (make-hash-table :test 'equal)))
               (clrhash org-auto-scheduler--placement-traces)
+              ;; Per-run caches: settings or `calendar-holidays' may have changed.
+              (setq org-auto-scheduler--day-bounds-cache nil)
+              (clrhash org-auto-scheduler--holiday-cache)
               (org-auto-scheduler--build-agenda-cache)       ; Build agenda items cache upfront
               (unless org-auto-scheduler--preview-mode
                 (org-auto-scheduler-create-report-buffer))      ; Create the report buffer

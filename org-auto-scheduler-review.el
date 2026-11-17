@@ -575,10 +575,25 @@ Persists the decision according to `org-auto-scheduler-non-blocking-backend`."
       (org-auto-scheduler-save-non-blocking-state))
     nil))
 
+(defvar org-auto-scheduler--saved-decision-cache nil
+  "When a hash table, memoizes `org-auto-scheduler-get-saved-decision' by task ID.
+Bound by `org-auto-scheduler-sort-tasks' for one sort, which only reads
+decisions (they are merged and saved before the sort starts).")
+
 (defun org-auto-scheduler-get-saved-decision (task-id &optional marker)
   "Get saved decision plist for TASK-ID.
 If MARKER is provided and backend is `org-properties` or `both`, also checks
 the task's Org properties."
+  (if (and task-id (hash-table-p org-auto-scheduler--saved-decision-cache))
+      (let ((hit (gethash task-id org-auto-scheduler--saved-decision-cache 'miss)))
+        (if (eq hit 'miss)
+            (puthash task-id (org-auto-scheduler--get-saved-decision-1 task-id marker)
+                     org-auto-scheduler--saved-decision-cache)
+          hit))
+    (org-auto-scheduler--get-saved-decision-1 task-id marker)))
+
+(defun org-auto-scheduler--get-saved-decision-1 (task-id &optional marker)
+  "Uncached body of `org-auto-scheduler-get-saved-decision' (same arguments)."
   (let ((entry (and task-id (cdr (assoc task-id org-auto-scheduler--saved-review-decisions)))))
     (if (and marker (markerp marker) (marker-buffer marker)
              (memq org-auto-scheduler-review-persistence-backend '(org-properties both)))
