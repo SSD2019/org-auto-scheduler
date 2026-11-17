@@ -4564,6 +4564,13 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (org-auto-scheduler-add-to-report t-info st))
                   (setq tasks-scheduled (1+ tasks-scheduled))))
 
+              ;; 4b. A kept split task's later chunks live in placeholder children.
+              ;; Re-place them now, after every kept slot is registered and before
+              ;; other tasks, so they follow effort/clock changes, merge when a
+              ;; larger gap opens, and are seen as occupied by later placements.
+              (dolist (e preserved-entries)
+                (org-auto-scheduler--rebalance-kept-split-parts e now))
+
               ;; Clocked task first so it gets the slot starting right after the running clock
               (when (> (hash-table-count lapsed-ids) 0)
                 (let ((clocked-first '()) (others '()))
@@ -5408,6 +5415,80 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
                       (org-auto-scheduler--insert-clock-entries (nreverse clocks)))))))))))
     last-today-end))
 
+(defun org-auto-scheduler--clocked-minutes-in-window (marker start end)
+  "Return minutes clocked on the task at MARKER that fall between START and END.
+Counts closed CLOCK lines in its LOGBOOK and a clock running on it now."
+  (let ((total 0.0)
+        (clip (lambda (a b)
+                (let ((s (if (time-less-p a start) start a))
+                      (e (if (time-less-p end b) end b)))
+                  (if (time-less-p s e) (/ (float-time (time-subtract e s)) 60.0) 0.0)))))
+    (org-with-point-at marker
+      (org-back-to-heading t)
+      (let ((task-end (save-excursion (or (outline-next-heading) (point-max)))))
+        (save-excursion
+          (while (re-search-forward
+                  "^[ \t]*CLOCK:[ \t]*\\[\\([^]]+\\)\\]--\\[\\([^]]+\\)\\]" task-end t)
+            (let ((a (ignore-errors (org-time-string-to-time (match-string 1))))
+                  (b (ignore-errors (org-time-string-to-time (match-string 2)))))
+              (when (and a b)
+                (setq total (+ total (funcall clip a b)))))))))
+    (when (and (org-auto-scheduler--task-clocked-p marker)
+               (boundp 'org-clock-start-time) org-clock-start-time)
+      (setq total (+ total (funcall clip org-clock-start-time (current-time)))))
+    (round total)))
+
+(defun org-auto-scheduler--rebalance-kept-split-parts (entry now)
+  "Re-place the placeholder chunks of kept split task ENTRY at NOW.
+ENTRY is a preserved today-entry whose own slot was kept.  Its remaining
+effort beyond that slot is placed again from the next day on, reusing the
+existing placeholder children, so chunks follow effort and clock changes,
+merge when a larger gap opens, and register as occupied for later tasks.
+Pomodoro tasks get their later intervals re-placed the same way.
+Does nothing for tasks without placeholder children."
+  (let* ((m (plist-get entry :marker))
+         (tid (plist-get entry :task-id))
+         (st (plist-get entry :start-time))
+         (et (plist-get entry :end-time))
+         (pomo (and tid m (markerp m) (marker-buffer m)
+                    (org-auto-scheduler-get-task-pomodoro-spec m tid))))
+    (when (and tid st et m (markerp m) (marker-buffer m)
+               (org-auto-scheduler--find-child-placeholders m tid))
+      (if (not (or pomo (org-auto-scheduler-task-splittable-p m tid)))
+          ;; No longer split (e.g. a review override): its parts are stale.
+          (unless org-auto-scheduler--preview-mode
+            (org-auto-scheduler--cleanup-task-placeholders m tid))
+      (let* ((t-info (plist-get entry :task-info))
+             (hd (or (nth 6 t-info) (org-with-point-at m (org-get-heading t t t t))))
+             (td (nth 14 t-info))
+             (tags (org-get-tags m))
+             (active-gap (if (member "buffertime" tags) 15 org-auto-scheduler-task-gap))
+             (total (round (* (or (org-auto-scheduler-get-effort m) 60)
+                              (org-auto-scheduler-get-effort-multiplier m))))
+             (remaining (max 0 (- total (org-auto-scheduler-get-clocked-time m))))
+             ;; Time still planned in the kept slot: its length less what was
+             ;; already clocked inside it (that is counted in REMAINING).
+             (slot-min (round (/ (float-time (time-subtract et st)) 60.0)))
+             (slot-left (max 0 (- slot-min (org-auto-scheduler--clocked-minutes-in-window m st et))))
+             (rem (- remaining slot-left)))
+        (cond
+         ((<= rem 0)
+          (unless org-auto-scheduler--preview-mode
+            (org-auto-scheduler--cleanup-task-placeholders m tid)))
+         (pomo
+          (let ((work (plist-get pomo :work)))
+            (org-auto-scheduler--place-pomodoro-placeholders
+             tid hd m td rem work (plist-get pomo :break) tags
+             (org-auto-scheduler-get-task-tag-block m)
+             (if (time-less-p et now) now et)
+             (+ 1 (/ (+ rem work -1) work)))))
+         (t
+          (org-auto-scheduler--place-split-placeholders
+           tid hd m td rem (org-auto-scheduler-get-min-chunk m) tags
+           (org-auto-scheduler-get-task-tag-block m) active-gap
+           (org-auto-scheduler-next-day-start (if (time-less-p et now) now et))
+           (format-time-string "%Y-%m-%d" st)))))))))
+
 (defun org-auto-scheduler--place-pomodoro-placeholders (origin-id headline marker topo-depth rem-effort work-mins break-mins tags time-block start-time total-parts)
   "Place REM-EFFORT across subsequent Pomodoro intervals as placeholder subtasks.
 Each interval has WORK-MINS work separated by BREAK-MINS gaps.
@@ -5634,7 +5715,8 @@ When ALL-PLACEHOLDERS is non-nil (or called interactively), removes ALL placehol
 When ALL-PLACEHOLDERS is nil, only removes:
 1. Placeholders with clock entries (clocks transferred to parent task).
 2. Placeholders marked DONE (parent task marked DONE as well).
-3. Orphaned placeholders whose parent task no longer exists, is DONE, or is no longer splittable.
+3. Orphaned placeholders whose parent task no longer exists, is DONE, is
+   waiting, lost its AUTOSCH tag, or is no longer splittable.
 Active valid placeholders of TODO splittable tasks are preserved to avoid churn.
 
 Safeguards:
@@ -5682,6 +5764,15 @@ Safeguards:
                                              (org-with-point-at parent-marker
                                                (org-get-todo-state))))
                              (parent-is-done (and parent-state (member parent-state org-done-keywords)))
+                             ;; A parent the scheduler no longer places (waiting, or
+                             ;; AUTOSCH removed) never re-places its parts, and parts
+                             ;; do not block time, so they would sit there stale.
+                             (parent-unscheduled
+                              (when parent-exists
+                                (or (and parent-state
+                                         (member parent-state org-auto-scheduler-waiting-states))
+                                    (not (member "AUTOSCH"
+                                                 (org-with-point-at parent-marker (org-get-tags)))))))
                              (parent-is-splittable (when parent-exists
                                                      (org-with-point-at parent-marker
                                                        (or (member org-auto-scheduler-splittable-tag (org-get-tags))
@@ -5705,6 +5796,7 @@ Safeguards:
                                    is-done
                                    (not parent-exists)
                                    parent-is-done
+                                   parent-unscheduled
                                    (not parent-is-splittable))))
                           (when should-delete
                             ;; Delete the placeholder subtree FIRST
