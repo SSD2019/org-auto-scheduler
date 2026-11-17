@@ -31,10 +31,14 @@
      ,@body))
 
 ;; 34.1-34.3: an edit made during the dry run blocks the commit and the save.
+;; As in real use, the job runs in a worker thread and the user types in the
+;; main thread while the dry run yields.
 (let* ((dir (make-temp-file "oas-t34a-" t))
        (file (t34-setup dir))
        (buf (find-file-noselect file))
-       (committed nil))
+       (committed nil)
+       (dry-done nil)
+       (typed nil))
   (unwind-protect
       (t34-with-daemon file
         (cl-letf* ((orig (symbol-function 'org-auto-scheduler-schedule-tasks))
@@ -42,13 +46,18 @@
                     (lambda (&rest args)
                       (if org-auto-scheduler--preview-mode
                           (prog1 (apply orig args)
-                            ;; The user types while the dry run yields.
-                            (with-current-buffer buf
-                              (goto-char (point-max))
-                              (insert "user note\n")))
+                            ;; Yield until the user has typed.
+                            (setq dry-done t)
+                            (while (not typed) (thread-yield)))
                         (setq committed t)
                         (apply orig args)))))
-          (org-auto-scheduler--execute-background-job))
+          (let ((job (make-thread #'org-auto-scheduler--execute-background-job "t34-job")))
+            (while (not dry-done) (thread-yield))
+            (with-current-buffer buf
+              (goto-char (point-max))
+              (insert "user note\n"))
+            (setq typed t)
+            (thread-join job)))
         (assert-true (not committed)
                      "Test 34.1: Commit is skipped when a buffer was edited during the dry run")
         (assert-true (buffer-modified-p buf)

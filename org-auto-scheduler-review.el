@@ -25,6 +25,7 @@
 (defvar org-auto-scheduler--ignore-target-dates-p)
 (defvar org-auto-scheduler--reordering-p)
 (defvar org-auto-scheduler-max-days-to-check)
+(defvar org-auto-scheduler--completed-index)
 (require 'tabulated-list)
 (require 'color)
 
@@ -881,6 +882,9 @@ Returns a plist (:pruned N :new N :kept N)."
     ;; Uses a drift-free signature (see `org-auto-scheduler--score-signature') so the
     ;; daily deadline-urgency growth does not invalidate manual ordering.
     (let ((reranked-ids (make-hash-table :test 'equal))
+          ;; Of those, the ones whose order the scheduler generated itself
+          ;; (:auto-order): re-slotted silently, never written as a property.
+          (auto-reranked (make-hash-table :test 'equal))
           (any-score-changed nil))
       (dolist (entry org-auto-scheduler--saved-review-decisions)
         (let* ((tid (car entry))
@@ -889,13 +893,23 @@ Returns a plist (:pruned N :new N :kept N)."
                (live-sig (and info (plist-get info :sig)))
                (saved-sig (plist-get dec :saved-sig))
                (prev-reranked (plist-get dec :reranked-from))
-               (has-saved-order (and (not (plist-get dec :is-new))
+               (auto (plist-get dec :auto-order))
+               ;; A generated order is checked even while the task is still
+               ;; new: it came from the old score, so a changed score must
+               ;; re-slot it on the very next run.
+               (has-saved-order (and (or auto (not (plist-get dec :is-new)))
                                      (or (plist-get dec :order) prev-reranked))))
           (when (and info live-sig has-saved-order)
             (cond
              ;; No signature recorded yet (older state file): record it silently.
              ((null saved-sig)
               (setcdr entry (plist-put dec :saved-sig live-sig)))
+             ((and auto (org-auto-scheduler--score-signature-changed-p saved-sig live-sig))
+              (puthash tid t reranked-ids)
+              (puthash tid t auto-reranked)
+              (setq dec (plist-put dec :order nil))
+              (setq dec (plist-put dec :saved-sig live-sig))
+              (setcdr entry dec))
              ((org-auto-scheduler--score-signature-changed-p saved-sig live-sig)
               (let ((old-score (car saved-sig))
                     (new-score (car live-sig)))
@@ -994,6 +1008,7 @@ Returns a plist (:pruned N :new N :kept N)."
                 (setq r-info (plist-put r-info :order new-ord))
                 (plist-put (gethash r-tid live-map) :order new-ord)
                 (when (and (gethash r-tid reranked-ids)
+                           (not (gethash r-tid auto-reranked))
                            (not (bound-and-true-p org-auto-scheduler--preview-mode))
                            (memq org-auto-scheduler-review-persistence-backend '(org-properties both)))
                   (let ((m (plist-get r-info :marker)))
@@ -3041,7 +3056,8 @@ tasks are constrained to start on or after their current day section."
             (current-time (org-auto-scheduler-get-start-time))
             (current-day nil))
         (org-auto-scheduler--build-agenda-cache)
-        (setq org-auto-scheduler-completed-tasks '())
+        (setq org-auto-scheduler-completed-tasks '()
+              org-auto-scheduler--completed-index nil)
         (dolist (item ordered-tasks)
           (let* ((checked-state (nth 0 item))
                  (task (nth 1 item))
@@ -3074,7 +3090,8 @@ tasks are constrained to start on or after their current day section."
                 (setq current-time
                       (org-auto-scheduler-schedule-single-task marker current-time depth))))))
         ;; Normalize completed tasks to chronological order
-        (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
+        (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks)
+              org-auto-scheduler--completed-index nil)
         (let ((check-map (make-hash-table :test 'equal)))
           (dolist (item ordered-tasks)
             (puthash (nth 0 (nth 1 item)) (nth 0 item) check-map))
@@ -3087,6 +3104,7 @@ tasks are constrained to start on or after their current day section."
         (setq org-auto-scheduler--review-all-entries (copy-sequence tabulated-list-entries))
         (setq tabulated-list-sort-key nil)
         (tabulated-list-print t)
+        (org-auto-scheduler--refresh-deadline-risks)
         (setq header-line-format
               (org-auto-scheduler--review-header-line tabulated-list-entries))
         (message "Recalculation complete (%s)!" (if compact "compact" "rigid day sections"))))))
@@ -3516,11 +3534,13 @@ With prefix ARG (C-u p) or empty input, unpins the task."
             (when (plist-get snapshot :overrides)
               (setq org-auto-scheduler--review-overrides (plist-get snapshot :overrides)))
             (when (plist-get snapshot :completed-tasks)
-              (setq org-auto-scheduler-completed-tasks (plist-get snapshot :completed-tasks))))
+              (setq org-auto-scheduler-completed-tasks (plist-get snapshot :completed-tasks)
+                    org-auto-scheduler--completed-index nil)))
         ;; Legacy snapshot format (plain entries list)
         (setq tabulated-list-entries snapshot))
       (setq org-auto-scheduler--pinned-cache nil)
       (tabulated-list-print t)
+      (org-auto-scheduler--refresh-deadline-risks)
       (setq header-line-format
             (org-auto-scheduler--review-header-line tabulated-list-entries))
       (org-auto-scheduler--timegrid-maybe-refresh)

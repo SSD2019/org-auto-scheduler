@@ -290,13 +290,51 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
 
 (defvar org-auto-scheduler--inhibit-yield)
 
+(defvar org-auto-scheduler--job-thread nil
+  "Thread running the current background job, or nil when none is running.")
+
+(defvar org-auto-scheduler--foreign-edits nil
+  "Agenda buffers edited by someone other than the running background job.")
+
+(defun org-auto-scheduler--note-foreign-edit (&rest _)
+  "Record the current buffer as edited by the user during a background job.
+On `after-change-functions' while a job runs.  The job's own edits (e.g. new
+:ID: properties added by the dry run) happen in the job's thread and are not
+recorded; an async job only lets the user type at its yield points, which
+run other threads."
+  (when (and org-auto-scheduler--job-thread
+             buffer-file-name
+             (fboundp 'current-thread)
+             (not (eq (current-thread) org-auto-scheduler--job-thread)))
+    (cl-pushnew (current-buffer) org-auto-scheduler--foreign-edits)))
+
+(defun org-auto-scheduler--daemon-snapshot-valid-p (mtime-snapshot)
+  "Return non-nil if no one but this job touched the agenda since MTIME-SNAPSHOT.
+Fails if a file changed on disk, a buffer was edited by the user, or another
+session holds a lock.  Unsaved edits made by the job itself are fine; treating
+them as user edits would block every later run."
+  (let ((ok t))
+    (when (hash-table-p mtime-snapshot)
+      (maphash
+       (lambda (file old-mtime)
+         (when ok
+           (let* ((buf (get-file-buffer file))
+                  (attrs (ignore-errors (file-attributes file)))
+                  (cur-mtime (and attrs (file-attribute-modification-time attrs))))
+             (when (or (and buf (memq buf org-auto-scheduler--foreign-edits))
+                       (and old-mtime cur-mtime (not (time-equal-p old-mtime cur-mtime)))
+                       (org-auto-scheduler--lockfile-active-p file))
+               (setq ok nil)))))
+       mtime-snapshot))
+    ok))
+
 (defun org-auto-scheduler--daemon-write (mtime-snapshot fn)
   "Call FN to write Org buffers, as one uninterrupted step.
-First re-check MTIME-SNAPSHOT: if a file changed on disk, a buffer has
-unsaved edits, or a lockfile appeared since the snapshot, do nothing and
-return nil.  Otherwise call FN with yielding disabled, so in an async run
-the user cannot edit a buffer while it is half-written, and return t."
-  (if (not (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
+First re-check MTIME-SNAPSHOT (see `org-auto-scheduler--daemon-snapshot-valid-p'):
+if anyone else touched the agenda since, do nothing and return nil.
+Otherwise call FN with yielding disabled, so in an async run the user cannot
+edit a buffer while it is half-written, and return t."
+  (if (not (org-auto-scheduler--daemon-snapshot-valid-p mtime-snapshot))
       (progn
         (org-auto-scheduler--log-info*
          "Background run: agenda files or buffers changed since the dry run; not writing.")
@@ -320,6 +358,9 @@ the user cannot edit a buffer while it is half-written, and return t."
     (org-auto-scheduler--log-info* "Starting background auto-scheduler run (async: %s, first-of-day: %s)..."
                                   (if is-async "yes" "no")
                                   (if is-first-run-of-day "yes" "no"))
+    (setq org-auto-scheduler--job-thread (and (fboundp 'current-thread) (current-thread))
+          org-auto-scheduler--foreign-edits nil)
+    (add-hook 'after-change-functions #'org-auto-scheduler--note-foreign-edit)
     (unwind-protect
         (condition-case err
             (let ((org-auto-scheduler-silent-mode t)
@@ -332,6 +373,17 @@ the user cannot edit a buffer while it is half-written, and return t."
                  (lambda ()
                    (when (org-auto-scheduler--caldav-pull)
                      (setq mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon)))
+                   ;; Phase 0: placeholder housekeeping (move clocks to the parent,
+                   ;; close finished splits).  Previews skip it so they never write
+                   ;; files, so the daemon does it here, then takes a fresh snapshot.
+                   (when mtime-snapshot
+                     (let ((cleaned 0))
+                       (when (org-auto-scheduler--daemon-write
+                              mtime-snapshot
+                              (lambda ()
+                                (setq cleaned (or (org-auto-scheduler-cleanup-placeholders) 0))))
+                         (when (> cleaned 0)
+                           (setq mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon))))))
                    (when mtime-snapshot
                      ;; Every step that writes Org buffers goes through
                      ;; `org-auto-scheduler--daemon-write': it re-checks the snapshot
@@ -389,12 +441,22 @@ the user cannot edit a buffer while it is half-written, and return t."
                      ;; Save agenda buffers if configured and this run wrote them.  Never
                      ;; save when the write was skipped: the buffers then hold the
                      ;; user's own unsaved edits.
-                     (when (and org-auto-scheduler-background-save-buffers wrote)
+                     ;; Also save edits the dry run made itself (new :ID:s): left
+                     ;; unsaved they would block every later run.
+                     (when (and org-auto-scheduler-background-save-buffers
+                                (or wrote
+                                    (cl-some (lambda (f)
+                                               (let ((b (get-file-buffer f)))
+                                                 (and b (buffer-modified-p b)
+                                                      (not (memq b org-auto-scheduler--foreign-edits)))))
+                                             (org-agenda-files t))))
                        (org-auto-scheduler--log-info* "Saving all org agenda buffers after background changes")
                        (let ((org-auto-scheduler--inhibit-yield t))
                          (save-some-buffers t (lambda ()
                                                 (and (buffer-file-name)
-                                                     (member (buffer-file-name) (org-agenda-files t)))))))
+                                                     (member (buffer-file-name) (org-agenda-files t))
+                                                     (not (memq (current-buffer)
+                                                                org-auto-scheduler--foreign-edits)))))))
                      ;; Notify user if changes were made
                      (when (and org-auto-scheduler-change-log-notify wrote)
                        (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
@@ -411,6 +473,8 @@ the user cannot edit a buffer while it is half-written, and return t."
               :run-type run-type
               :start-time start-time
               :error-message (error-message-string err)))))
+      (remove-hook 'after-change-functions #'org-auto-scheduler--note-foreign-edit)
+      (setq org-auto-scheduler--job-thread nil)
       (setq org-auto-scheduler--background-running nil)
       (org-auto-scheduler--log-info* "Background auto-scheduler run completed.")
       (org-auto-scheduler--maybe-schedule-idle-repeat))))
