@@ -1377,6 +1377,27 @@ You can also enable debug output permanently:
 
 Contributions, bug reports, and feature requests are welcome! Please open an issue or pull request on GitHub.
 
+*** Running the Tests
+
+The test suites live in =test/suites/= (one file per suite) and run under ERT:
+
+#+begin_src sh
+make test                         # every suite
+make test SELECTOR=oas-suite-13   # suites whose name matches
+make compile                      # byte-compile all modules
+make bench                        # time a preview run on 500 generated tasks
+#+end_src
+
+=EMACS= must point at a real Emacs binary (for example =make test EMACS=/snap/bin/emacs=).
+=log4e= is found automatically in =~/.emacs.d/elpa=; set =LOG4E_DIR= otherwise. The CalDAV
+suites only run when =org-caldav= is on the load path
+(=make test EXTRA_LOAD_PATH=/path/to/org-caldav=).
+
+Tests never touch your own data: state files, the org-id database, and the agenda list
+are redirected to a scratch directory. =test/suites/32-golden-demo-schedule.el= pins the
+schedule produced for =demo/demo-tasks.org=; if a change to placement is intended,
+regenerate it with =OAS_GOLDEN_PRINT=1 make test SELECTOR=oas-suite-32=.
+
 ** License
 
 This project is free software; you can redistribute it and/or modify it under

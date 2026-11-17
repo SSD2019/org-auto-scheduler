@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.emacs == 'snapshot' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ['28.2', '29.4', '30.1', 'snapshot']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs }}
+
+      - name: Install log4e
+        run: |
+          emacs -Q --batch --eval "(progn
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            (package-install 'log4e))"
+
+      - name: Test
+        run: make test
+
+      - name: Byte-compile
+        run: make compile

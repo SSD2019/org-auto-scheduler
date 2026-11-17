@@ -3190,7 +3190,7 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
               (when is-defer
                 (org-schedule '(4))
                 (org-delete-property org-auto-scheduler-scheduled-property)
-                (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d")))
+                (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d" (current-time))))
                        (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
                   (org-entry-put nil "NOT_BEFORE" (format "<%s>" not-before-time))))
 
@@ -3280,7 +3280,7 @@ Returns nil if not scheduled/pinned, scheduled in the past before MIN-DATE-STR,
 or scheduled date-only without a time."
   (when (and marker (markerp marker) (marker-buffer marker))
     (org-with-point-at marker
-      (let* ((target-min (or min-date-str (format-time-string "%Y-%m-%d")))
+      (let* ((target-min (or min-date-str (format-time-string "%Y-%m-%d" (current-time))))
              (sched-str (org-entry-get nil "SCHEDULED"))
              (pinned-time-str (org-entry-get nil org-auto-scheduler-pinned-time-property)))
         (or
@@ -3308,7 +3308,7 @@ TODAY-STR defaults to today's date in YYYY-MM-DD format.
 Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date-only without a time."
   (when (and marker (markerp marker) (marker-buffer marker))
     (org-with-point-at marker
-      (let* ((target-today (or today-str (format-time-string "%Y-%m-%d")))
+      (let* ((target-today (or today-str (format-time-string "%Y-%m-%d" (current-time))))
              (sched-str (org-entry-get nil "SCHEDULED"))
              (pinned-time-str (org-entry-get nil org-auto-scheduler-pinned-time-property)))
         (or
@@ -3340,7 +3340,7 @@ Only deadlines on or after TODAY-STR count, since an earlier one can no
 longer be met.  Pinned and clocked-in tasks never count."
   (let* ((deadline (org-auto-scheduler-get-deadline marker))
          (deadline-day (and deadline (format-time-string "%Y-%m-%d" deadline)))
-         (target-today (or today-str (format-time-string "%Y-%m-%d")))
+         (target-today (or today-str (format-time-string "%Y-%m-%d" (current-time))))
          (is-deadline-reachable (and deadline-day (not (string< deadline-day target-today)))))
     (and is-deadline-reachable
          (string< deadline-day (format-time-string "%Y-%m-%d" start-time))
@@ -3352,7 +3352,7 @@ longer be met.  Pinned and clocked-in tasks never count."
 A task is unscheduled if it has no SCHEDULED property, or its SCHEDULED property
 is for today or in the past without a specific time (HH:MM)."
   (let ((sched (nth 8 task-info))
-        (today-str (format-time-string "%Y-%m-%d")))
+        (today-str (format-time-string "%Y-%m-%d" (current-time))))
     (cond
      ;; No SCHEDULED property at all -> unscheduled!
      ((or (null sched) (string-empty-p (string-trim sched)))
@@ -3728,7 +3728,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                   (when (plist-get m-res :effort)
                     (setf (nth 12 task-info) (plist-get m-res :effort)))
                   (when (plist-get m-res :defer)
-                    (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d")))
+                    (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d" (current-time))))
                            (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
                       (setf (nth 10 task-info) (org-auto-scheduler-parse-time-string not-before-time))))
                   (let* ((kept-times (when preserve-today
@@ -4506,7 +4506,7 @@ If only HH:MM is specified, uses the date from MARKER, review override, or today
                             (let ((sched (org-entry-get nil "SCHEDULED")))
                               (when (and sched (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" sched))
                                 (match-string 1 sched)))))))
-                  (format-time-string "%Y-%m-%d"))))
+                  (format-time-string "%Y-%m-%d" (current-time)))))
         (org-auto-scheduler-parse-time-string (concat base-date " " time-part))))
      (date-part
       (org-auto-scheduler-parse-time-string (concat date-part " " org-auto-scheduler-start-time)))
@@ -6411,7 +6411,7 @@ SCOPE specifies the search scope for `org-map-entries' (defaults to \='agenda wh
 agenda files exist, or nil for current buffer).
 Returns the number of tasks rescheduled."
   (interactive)
-  (let* ((today-str (or target-date (format-time-string "%Y-%m-%d")))
+  (let* ((today-str (or target-date (format-time-string "%Y-%m-%d" (current-time))))
          (search-scope (or scope (if (org-agenda-files t) 'agenda nil)))
          (done-states (or org-done-keywords '("DONE" "CANCELLED" "DROPPED")))
          (waiting-states (bound-and-true-p org-auto-scheduler-waiting-states))
@@ -6477,7 +6477,7 @@ Returns the number of tasks rescheduled."
   "Return a list of AUTOSCH tasks scheduled for DATE-STR (default today).
 Each item is a plist: (:id ID :marker MARKER :headline HEADLINE :start START
 :end END :effort EFFORT :tags TAGS :state STATE :is-done DONE-P)."
-  (let* ((target-date (or date-str (format-time-string "%Y-%m-%d")))
+  (let* ((target-date (or date-str (format-time-string "%Y-%m-%d" (current-time))))
          (tasks '()))
     (org-map-entries
      (lambda ()
