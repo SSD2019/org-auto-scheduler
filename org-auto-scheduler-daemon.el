@@ -17,6 +17,16 @@
 
 (require 'org)
 (require 'cl-lib)
+(require 'org-auto-scheduler-log)
+
+;; Defined in org-auto-scheduler.el.  This file let-binds them, so they must be
+;; declared special here too: without the declaration the byte compiler makes
+;; those bindings lexical, and e.g. the background dry run (preview mode) would
+;; write to Org files when this file is compiled.
+(defvar org-auto-scheduler--current-run-type)
+(defvar org-auto-scheduler--preview-mode)
+(defvar org-auto-scheduler--run-start-time)
+(defvar org-auto-scheduler-silent-mode)
 
 (declare-function org-auto-scheduler-reschedule-past-tasks-to-today "org-auto-scheduler" (&optional target-date scope))
 (declare-function org-auto-scheduler-schedule-tasks "org-auto-scheduler" (&optional force-replan))
@@ -124,7 +134,7 @@ Used to detect stale remote `.#' lockfiles even when `file-attributes' returns n
         (dolist (cf conflicts)
           (unless (gethash cf org-auto-scheduler--warned-conflict-files)
             (puthash cf t org-auto-scheduler--warned-conflict-files)
-            (org-auto-scheduler--log-warn
+            (org-auto-scheduler--log-warn*
              "Dropbox conflicted copy detected (non-blocking): %s" cf)))))))
 
 (defun org-auto-scheduler--prepare-agenda-buffers-for-daemon ()
@@ -142,16 +152,16 @@ Used to detect stale remote `.#' lockfiles even when `file-attributes' returns n
         (let ((buf (get-file-buffer file)))
           (cond
            ((org-auto-scheduler--lockfile-active-p file)
-            (org-auto-scheduler--log-debug
+            (org-auto-scheduler--log-debug*
              "Background daemon aborted: active lockfile on %s" file)
             (setq safe nil))
            ((and buf (buffer-modified-p buf))
-            (org-auto-scheduler--log-debug
+            (org-auto-scheduler--log-debug*
              "Background daemon aborted: unsaved local buffer modifications in %s" (buffer-name buf))
             (setq safe nil))
            (t
             (when (and buf (not (verify-visited-file-modtime buf)))
-              (org-auto-scheduler--log-info
+              (org-auto-scheduler--log-info*
                "Auto-reverting unmodified agenda buffer %s after external disk update" (buffer-name buf))
               (with-current-buffer buf
                 (ignore-errors (revert-buffer t t t))))
@@ -195,7 +205,7 @@ Returns non-nil if lease is held by this host, or nil if another host holds a fr
                  (not (string-equal-ignore-case holder my-host))
                  (< (- now ts) lease-ttl))
             (progn
-              (org-auto-scheduler--log-debug
+              (org-auto-scheduler--log-debug*
                "Background daemon skipped: active lease held by %s (age %.0fs)"
                holder (- now ts))
               nil)
@@ -225,7 +235,7 @@ Returns non-nil if lease is held by this host, or nil if another host holds a fr
              org-auto-scheduler-eod-auto-trigger)
     (let* ((today-str (format-time-string "%Y-%m-%d" now))
            (now-mins (org-auto-scheduler-time-to-minutes (format-time-string "%H:%M" now)))
-           (end-mins (org-auto-scheduler-time-to-minutes org-auto-scheduler-end-time)))
+           (end-mins (org-auto-scheduler-time-to-minutes (cdr (org-auto-scheduler--day-hours now)))))
       (when (and (>= now-mins end-mins)
                  (not (equal org-auto-scheduler--last-eod-run-date today-str)))
         (setq org-auto-scheduler--last-eod-run-date today-str)
@@ -248,27 +258,27 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
   (interactive)
   (cond
    ((not org-auto-scheduler-background-enabled)
-    (org-auto-scheduler--log-debug "Background scheduler skipped: not enabled."))
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: not enabled."))
    ((not (org-auto-scheduler-allowed-on-this-computer-p))
-    (org-auto-scheduler--log-debug "Background scheduler skipped: not allowed on hostname %s." (system-name)))
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: not allowed on hostname %s." (system-name)))
    ((and org-auto-scheduler-background-pause-on-review
          (or (get-buffer-window "*Org Auto Scheduler Review*" t)
              (and (boundp 'org-timegrid-buffer-name)
                   (get-buffer-window org-timegrid-buffer-name t))))
-    (org-auto-scheduler--log-debug "Background scheduler skipped: review buffer is active."))
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: review buffer is active."))
    ((or org-auto-scheduler--background-running
         (and org-auto-scheduler--background-thread
              (threadp org-auto-scheduler--background-thread)
              (thread-live-p org-auto-scheduler--background-thread))
         (bound-and-true-p org-auto-scheduler--active-operation))
-    (org-auto-scheduler--log-debug "Background scheduler skipped: operation '%s' or run already in progress."
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: operation '%s' or run already in progress."
                                   (or (bound-and-true-p org-auto-scheduler--active-operation) "background")))
    ((minibufferp)
-    (org-auto-scheduler--log-debug "Background scheduler skipped: minibuffer active."))
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: minibuffer active."))
    ((and org-auto-scheduler-background-pause-on-clock
          (boundp 'org-clock-current-task)
          org-clock-current-task)
-    (org-auto-scheduler--log-debug "Background scheduler skipped: task currently clocked in."))
+    (org-auto-scheduler--log-debug* "Background scheduler skipped: task currently clocked in."))
    (t
     (if (and org-auto-scheduler-background-async
              (fboundp 'make-thread))
@@ -277,6 +287,23 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
                #'org-auto-scheduler--execute-background-job
                "org-auto-scheduler-worker"))
       (org-auto-scheduler--execute-background-job)))))
+
+(defvar org-auto-scheduler--inhibit-yield)
+
+(defun org-auto-scheduler--daemon-write (mtime-snapshot fn)
+  "Call FN to write Org buffers, as one uninterrupted step.
+First re-check MTIME-SNAPSHOT: if a file changed on disk, a buffer has
+unsaved edits, or a lockfile appeared since the snapshot, do nothing and
+return nil.  Otherwise call FN with yielding disabled, so in an async run
+the user cannot edit a buffer while it is half-written, and return t."
+  (if (not (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
+      (progn
+        (org-auto-scheduler--log-info*
+         "Background run: agenda files or buffers changed since the dry run; not writing.")
+        nil)
+    (let ((org-auto-scheduler--inhibit-yield t))
+      (funcall fn))
+    t))
 
 (defun org-auto-scheduler--execute-background-job ()
   "Worker function executing a background scheduler run."
@@ -290,7 +317,7 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
          (is-first-run-of-day (not (equal org-auto-scheduler--last-background-run-date today-str)))
          (resched-past-count 0))
     (setq org-auto-scheduler--last-background-run-date today-str)
-    (org-auto-scheduler--log-info "Starting background auto-scheduler run (async: %s, first-of-day: %s)..."
+    (org-auto-scheduler--log-info* "Starting background auto-scheduler run (async: %s, first-of-day: %s)..."
                                   (if is-async "yes" "no")
                                   (if is-first-run-of-day "yes" "no"))
     (unwind-protect
@@ -306,62 +333,86 @@ runs asynchronously in a worker thread so the Emacs UI remains fully responsive.
                    (when (org-auto-scheduler--caldav-pull)
                      (setq mtime-snapshot (org-auto-scheduler--prepare-agenda-buffers-for-daemon)))
                    (when mtime-snapshot
-                     ;; On first background run of the day, optionally reschedule uncompleted past tasks
-                     (when (and (bound-and-true-p org-auto-scheduler-background-reschedule-yesterday-tasks-once)
-                                is-first-run-of-day
-                                (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today))
-                       (setq resched-past-count
-                             (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
+                     ;; Every step that writes Org buffers goes through
+                     ;; `org-auto-scheduler--daemon-write': it re-checks the snapshot
+                     ;; and runs without yielding, so edits cannot interleave.
+                     (let* ((resched-wanted
+                             (and (bound-and-true-p org-auto-scheduler-background-reschedule-yesterday-tasks-once)
+                                  is-first-run-of-day
+                                  (fboundp 'org-auto-scheduler-reschedule-past-tasks-to-today)))
+                            (direct-wanted (or resched-wanted
+                                               (org-auto-scheduler--agenda-has-title-markers-p)))
+                            (direct-done nil)
+                            (direct-blocked nil)
+                            (wrote nil))
+                       ;; Past-task rescheduling and title markers edit headings, so
+                       ;; that run writes directly instead of starting with a dry run.
+                       (when direct-wanted
+                         (setq direct-blocked
+                               (not (org-auto-scheduler--daemon-write
+                                     mtime-snapshot
+                                     (lambda ()
+                                       (when resched-wanted
+                                         (setq resched-past-count
+                                               (org-auto-scheduler-reschedule-past-tasks-to-today today-str)))
+                                       (when (or (> resched-past-count 0)
+                                                 (org-auto-scheduler--agenda-has-title-markers-p))
+                                         (org-auto-scheduler-schedule-tasks)
+                                         (setq direct-done t))))))
+                         (setq wrote (or (and direct-done org-auto-scheduler--last-run-changes t)
+                                         (> resched-past-count 0))))
                      ;; Two-Phase Execution:
-                     ;; Phase 1: Pure in-memory dry-run (when no inline title markers require stripping)
-                     (if (or (> resched-past-count 0)
-                             (org-auto-scheduler--agenda-has-title-markers-p))
-                         (org-auto-scheduler-schedule-tasks)
+                     ;; Phase 1: in-memory dry run (may yield to the UI).
+                     (unless (or direct-done direct-blocked)
                        (let ((org-auto-scheduler--preview-mode t))
                          (org-auto-scheduler-schedule-tasks))
-                       ;; Phase 2: Fast atomic commit ONLY if Phase 1 detected actual schedule changes
+                       ;; Phase 2: commit ONLY if Phase 1 detected actual schedule changes
                        ;; and disk mtimes / buffer clean state remain unchanged.
                        (if (and org-auto-scheduler--last-run-changes
-                                (> (length org-auto-scheduler--last-run-changes) 0)
-                                (org-auto-scheduler--agenda-mtimes-unchanged-p mtime-snapshot))
-                           (let ((org-auto-scheduler--preview-mode nil))
-                             (org-auto-scheduler-schedule-tasks))
+                                (> (length org-auto-scheduler--last-run-changes) 0))
+                           ;; Count it as written only if the commit itself changed
+                           ;; something; that drives saving and the notification.
+                           (setq wrote
+                                 (and (org-auto-scheduler--daemon-write
+                                       mtime-snapshot
+                                       (lambda ()
+                                         (let ((org-auto-scheduler--preview-mode nil))
+                                           (org-auto-scheduler-schedule-tasks))))
+                                      org-auto-scheduler--last-run-changes
+                                      t))
                          ;; Only push when nothing changed locally during the dry-run.
                          ;; If changes were detected but disk mtimes moved, skip: the
                          ;; next run re-evaluates against the fresh files.
                          (unless (and org-auto-scheduler--last-run-changes
                                       (> (length org-auto-scheduler--last-run-changes) 0))
                            (org-auto-scheduler--caldav-push))))
-                     ;; Save agenda buffers if configured and changes were made
-                     (when (and org-auto-scheduler-background-save-buffers
-                                (or (and org-auto-scheduler--last-run-changes
-                                         (> (length org-auto-scheduler--last-run-changes) 0))
-                                    (> resched-past-count 0)))
-                       (org-auto-scheduler--log-info "Saving all org agenda buffers after background changes")
-                       (save-some-buffers t (lambda ()
-                                              (and (buffer-file-name)
-                                                   (member (buffer-file-name) (org-agenda-files t))))))
+                     ;; Save agenda buffers if configured and this run wrote them.  Never
+                     ;; save when the write was skipped: the buffers then hold the
+                     ;; user's own unsaved edits.
+                     (when (and org-auto-scheduler-background-save-buffers wrote)
+                       (org-auto-scheduler--log-info* "Saving all org agenda buffers after background changes")
+                       (let ((org-auto-scheduler--inhibit-yield t))
+                         (save-some-buffers t (lambda ()
+                                                (and (buffer-file-name)
+                                                     (member (buffer-file-name) (org-agenda-files t)))))))
                      ;; Notify user if changes were made
-                     (when (and org-auto-scheduler-change-log-notify
-                                (or (and org-auto-scheduler--last-run-changes
-                                         (> (length org-auto-scheduler--last-run-changes) 0))
-                                    (> resched-past-count 0)))
+                     (when (and org-auto-scheduler-change-log-notify wrote)
                        (message "Org Auto Scheduler [background]: %d task(s) updated%s. [M-x org-auto-scheduler-show-change-log]"
                                 (length (or org-auto-scheduler--last-run-changes '()))
                                 (if (> resched-past-count 0)
                                     (format " (%d from past days rescheduled)" resched-past-count)
                                   "")))
                      ;; Server-only End-of-Day adherence check
-                     (org-auto-scheduler--maybe-run-server-eod-check (current-time)))))))
+                     (org-auto-scheduler--maybe-run-server-eod-check (current-time))))))))
           (error
-           (org-auto-scheduler--log-error "Error in background scheduler: %s" err)
+           (org-auto-scheduler--log-error* "Error in background scheduler: %s" err)
            (when (org-auto-scheduler--should-log-changes-p)
              (org-auto-scheduler--record-run-error
               :run-type run-type
               :start-time start-time
               :error-message (error-message-string err)))))
       (setq org-auto-scheduler--background-running nil)
-      (org-auto-scheduler--log-info "Background auto-scheduler run completed.")
+      (org-auto-scheduler--log-info* "Background auto-scheduler run completed.")
       (org-auto-scheduler--maybe-schedule-idle-repeat))))
 
 (defun org-auto-scheduler--maybe-schedule-idle-repeat ()
@@ -406,17 +457,17 @@ if the current system's hostname (short or FQDN, case-insensitive) is in the lis
 (defun org-auto-scheduler-setup-background ()
   "Set up or cancel the background auto-scheduling timer based on the current setting."
   (interactive)
-  (org-auto-scheduler--log-info "Setting up background scheduler. Enabled: %s"
+  (org-auto-scheduler--log-info* "Setting up background scheduler. Enabled: %s"
                                 (bound-and-true-p org-auto-scheduler-background-enabled))
 
   ;; Cancel existing timers if present
   (when (bound-and-true-p org-auto-scheduler--idle-timer)
-    (org-auto-scheduler--log-debug "Canceling existing background timer")
+    (org-auto-scheduler--log-debug* "Canceling existing background timer")
     (cancel-timer org-auto-scheduler--idle-timer)
     (setq org-auto-scheduler--idle-timer nil))
 
   (when (bound-and-true-p org-auto-scheduler--repeat-idle-timer)
-    (org-auto-scheduler--log-debug "Canceling existing background repeat timer")
+    (org-auto-scheduler--log-debug* "Canceling existing background repeat timer")
     (cancel-timer org-auto-scheduler--repeat-idle-timer)
     (setq org-auto-scheduler--repeat-idle-timer nil))
 
@@ -425,7 +476,7 @@ if the current system's hostname (short or FQDN, case-insensitive) is in the lis
     (let ((idle-time (if (boundp 'org-auto-scheduler-idle-time) org-auto-scheduler-idle-time 300))
           (interval (if (boundp 'org-auto-scheduler-background-interval) org-auto-scheduler-background-interval 300))
           (async (if (boundp 'org-auto-scheduler-background-async) org-auto-scheduler-background-async t)))
-      (org-auto-scheduler--log-info "Creating new background timer. Idle time: %d seconds, Interval: %d seconds, Async: %s"
+      (org-auto-scheduler--log-info* "Creating new background timer. Idle time: %d seconds, Interval: %d seconds, Async: %s"
                                     idle-time interval async)
       (setq org-auto-scheduler--idle-timer
             (run-with-idle-timer
@@ -547,7 +598,12 @@ Returns a list of change plists."
              (file (or (and init-entry (plist-get init-entry :file))
                        (and (markerp marker) (buffer-file-name (marker-buffer marker)))))
              (m-res (and tid marker-data (gethash tid marker-data)))
-             (sched-changed (not (org-auto-scheduler--timestamps-equal-p orig-sched final-sched)))
+             ;; Failed, blocked and skipped entries are only recorded for display
+             ;; (e.g. the review buffer's "FAILED" rows); no SCHEDULED is written
+             ;; for them, so they never change a task's schedule.
+             (no-write (memq (nth 9 ct) '(:failed :blocked :skipped)))
+             (sched-changed (and (not no-write)
+                                 (not (org-auto-scheduler--timestamps-equal-p orig-sched final-sched))))
              (sched-change-type
               (when sched-changed
                 (cond
@@ -972,7 +1028,7 @@ CHANGES is a list of change plists."
                 (org-auto-scheduler--prune-change-log-buffer (current-buffer) org-auto-scheduler-change-log-max-entries)
                 (write-region (point-min) (point-max) org-auto-scheduler-change-log-file nil 'silent)))))
       (error
-       (org-auto-scheduler--log-warn "Failed to write change log file %s: %s"
+       (org-auto-scheduler--log-warn* "Failed to write change log file %s: %s"
                                      org-auto-scheduler-change-log-file err)))))
 
 (defun org-auto-scheduler--append-change-log (entry-text)
@@ -1008,7 +1064,7 @@ CHANGES is a list of change plists."
            org-auto-scheduler-change-log-file
            org-auto-scheduler-change-log-max-entries))
       (error
-       (org-auto-scheduler--log-warn "Failed to write change log file %s: %s"
+       (org-auto-scheduler--log-warn* "Failed to write change log file %s: %s"
                                      org-auto-scheduler-change-log-file err)))))
 
 (defun org-auto-scheduler--record-run-changes (&rest run-info)

@@ -12,6 +12,7 @@
 
 (require 'org)
 (require 'cl-lib)
+(require 'org-auto-scheduler-log)
 (require 'org-clock)
 (require 'tabulated-list)
 (require 'color)
@@ -1203,7 +1204,7 @@ Normalizes the Y-axis based on the maximum score in the 30-day window."
         (when (and (> clocked 0) (< rem-effort effort))
           (org-set-property "Effort" (org-auto-scheduler-minutes-to-time rem-effort)))
         (org-set-property "NOT_BEFORE" (format "[%s]" tomorrow-str))
-        (org-auto-scheduler--set-scheduled (format "<%s %s>" tomorrow-str org-auto-scheduler-start-time))
+        (org-auto-scheduler--set-scheduled (format "<%s %s>" tomorrow-str (car (org-auto-scheduler--day-hours tomorrow-str))))
         (save-buffer)))))
 
 (defun org-auto-scheduler-eod-roll-tomorrow ()

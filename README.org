@@ -222,6 +222,7 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-overrun-mode-line-disable=      | Disable overrun indicator in the mode line.                                                |
 | =org-auto-scheduler-cleanup-placeholders=           | Clean up temporary placeholder subtasks and migrate any clock lines to parent tasks.       |
 | =org-auto-scheduler-validate-config=                | Verify configuration consistency.                                                          |
+| =org-auto-scheduler-deadline-risks=                 | List tasks the last run could not finish before their deadline (=R= in dispatch).          |
 | =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
 | =org-auto-scheduler-adherence-mode-line-disable=    | Remove adherence score from the mode line.                                                 |
 | =org-auto-scheduler-adherence-generate=             | Regenerate adherence scores for all available snapshot dates.                               |
@@ -1065,6 +1066,55 @@ Long uninterrupted blocks of deep work lead to cognitive fatigue, yet global Pom
   (setq org-auto-scheduler-pomodoro-break-minutes 5)      ;; Default break duration when omitted
   #+end_src
 
+** Deadline-Risk Warnings
+
+Every run (including the review preview) checks each task that has a =DEADLINE=
+against where it was actually placed. A task is at risk when its last chunk ends
+after the deadline, or when no slot was found for it at all. A date-only deadline
+means the end of working hours on that date; deadlines already past are left to the
+agenda's own overdue display.
+
+- After a manual run the echo area says, for example,
+  =⚠ 2 tasks will miss their deadline: Long report, Release notes=.
+- The review buffer header shows =⚠ N will miss deadline=.
+- =M-x org-auto-scheduler-deadline-risks= (or =R= in the dispatch menu) re-plans
+  (a preview; nothing is written) and lists each task with its deadline, planned
+  finish and how late it is. Fix a task right from the list:
+
+  | Key       | Action                                                        |
+  |-----------+---------------------------------------------------------------|
+  | =RET=, =TAB= | Jump to the task                                           |
+  | =+=       | Raise its priority one step (C → B → A)                       |
+  | =e=       | Set its Effort (=1:30= or =90=)                               |
+  | =d=       | Move its deadline (Org date prompt)                           |
+  | =s=       | Toggle SPLITTABLE, so it can use free gaps across days        |
+  | =g=       | Re-plan and redraw                                            |
+  | =n= / =p= | Next / previous task                                          |
+
+  Each change edits the task in its Org file (left unsaved, like any edit),
+  re-plans, and says whether the task is still at risk, for example
+  =Report: priority A — no longer at risk.= If fixing one task pushes another past
+  its deadline, that task appears in the list instead.
+
+This complements the =⛔ DEADLINE INFEASIBLE= badge, which only covers tasks in a
+dependency chain (critical-path float).
+
+** Days Off & Per-Day Working Hours
+
+#+begin_src emacs-lisp
+;; Vacation and one-off days off (dates or inclusive ranges)
+(setq org-auto-scheduler-days-off '("2026-12-24" ("2026-12-28" . "2027-01-02")))
+;; Also skip public holidays from `calendar-holidays'
+(setq org-auto-scheduler-skip-holidays t)
+;; Short Fridays, and a one-off late start
+(setq org-auto-scheduler-day-hours '((5 . ("09:00" . "13:00"))
+                                     ("2026-12-03" . ("11:00" . "19:00"))))
+#+end_src
+
+Days off apply to every task except pinned ones (a pin is an explicit time). A date
+entry in =org-auto-scheduler-day-hours= wins over a weekday entry; days without an
+entry use =org-auto-scheduler-start-time= / =org-auto-scheduler-end-time=.
+
 ** Protected Daily Catch-Up / Slack Window
 <<protected-daily-catchup--slack-window>>
 
@@ -1088,6 +1138,9 @@ Access all options via =M-x customize-group RET org-auto-scheduler=.
 | =org-auto-scheduler-start-time=      | ="09:00"=  | Daily scheduling window start (24 h =HH:MM=).                              |
 | =org-auto-scheduler-end-time=        | ="17:00"=  | Daily scheduling window end.                                                |
 | =org-auto-scheduler-excluded-days=   | ='()=      | Day-of-week integers to skip (0 = Sun … 6 = Sat).                          |
+| =org-auto-scheduler-days-off=        | ='()=      | Dates (="YYYY-MM-DD"=) or inclusive ranges (=(FROM . TO)=) to skip.         |
+| =org-auto-scheduler-skip-holidays=   | =nil=      | Also skip days in =calendar-holidays=.                                      |
+| =org-auto-scheduler-day-hours=       | ='()=      | Per-weekday or per-date hours: =((5 . ("09:00" . "13:00")))=.               |
 | =org-auto-scheduler-time-interval=   | =15=       | Slot granularity in minutes (for collision scanning).                       |
 | =org-auto-scheduler-task-gap=        | =5=        | Minimum gap in minutes between consecutive tasks.                           |
 | =org-auto-scheduler-daily-catchup-block= | =nil=   | Daily protected catch-up slack window (e.g. '("16:00" . "17:00")) skipped by regular tasks. |
@@ -1376,6 +1429,30 @@ You can also enable debug output permanently:
 ** Contributing
 
 Contributions, bug reports, and feature requests are welcome! Please open an issue or pull request on GitHub.
+
+*** Running the Tests
+
+The test suites live in =test/suites/= (one file per suite) and run under ERT:
+
+#+begin_src sh
+make test                         # every suite
+make test SELECTOR=oas-suite-13   # suites whose name matches
+make compile                      # byte-compile all modules
+make bench                        # time a preview run on 500 generated tasks
+#+end_src
+
+=EMACS= must point at a real Emacs binary (for example =make test EMACS=/snap/bin/emacs=).
+=log4e= is found automatically in =~/.emacs.d/elpa=; set =LOG4E_DIR= otherwise. The CalDAV
+suites only run when =org-caldav= is on the load path
+(=make test EXTRA_LOAD_PATH=/path/to/org-caldav=). The Focus HUD suites need
+=org-focus-hud= checked out next to this repository (=../org-focus-hud=) and are skipped,
+with a note, when it is missing. =make test-compiled= runs every suite against
+byte-compiled modules, which catches bugs that only exist in compiled code.
+
+Tests never touch your own data: state files, the org-id database, and the agenda list
+are redirected to a scratch directory. =test/suites/32-golden-demo-schedule.el= pins the
+schedule produced for =demo/demo-tasks.org=; if a change to placement is intended,
+regenerate it with =OAS_GOLDEN_PRINT=1 make test SELECTOR=oas-suite-32=.
 
 ** License
 

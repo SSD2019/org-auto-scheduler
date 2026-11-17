@@ -13,6 +13,18 @@
 
 (require 'org)
 (require 'cl-lib)
+(require 'org-auto-scheduler-log)
+
+;; Defined in org-auto-scheduler.el.  This file let-binds them, so they must be
+;; declared special here too: without the declaration the byte compiler makes
+;; those bindings lexical, and e.g. the review preview would write to Org files
+;; when this file is compiled.
+(defvar org-auto-scheduler--preview-mode)
+(defvar org-auto-scheduler--ignore-blockers-p)
+(defvar org-auto-scheduler--ignore-saved-skips-p)
+(defvar org-auto-scheduler--ignore-target-dates-p)
+(defvar org-auto-scheduler--reordering-p)
+(defvar org-auto-scheduler-max-days-to-check)
 (require 'tabulated-list)
 (require 'color)
 
@@ -27,7 +39,11 @@
 (defvar org-auto-scheduler-sync-caldav)
 (defvar org-auto-scheduler--caldav-pull-done)
 
-(unless (fboundp 'org-auto-scheduler--with-active-operation)
+;; `eval-and-compile' so the byte compiler knows this is a macro: inside a plain
+;; `unless' it never saw the definition and compiled every use as a function
+;; call, which fails at run time with `invalid-function'.
+(eval-and-compile
+ (unless (fboundp 'org-auto-scheduler--with-active-operation)
   (defmacro org-auto-scheduler--with-active-operation (op-name &rest body)
     "Execute BODY with `org-auto-scheduler--active-operation` bound to OP-NAME."
     (declare (indent 1) (debug t))
@@ -38,7 +54,7 @@
              (progn
                (setq org-auto-scheduler--active-operation ,op-name)
                ,@body)
-           (setq org-auto-scheduler--active-operation ,prev-op))))))
+           (setq org-auto-scheduler--active-operation ,prev-op)))))))
 
 (defcustom org-auto-scheduler-review-show-agenda-events t
   "If non-nil, display existing fixed agenda events (non-AUTOSCH) in the review buffer."
@@ -144,12 +160,6 @@ Values can be:
 
 
 
-(unless (fboundp 'org-auto-scheduler--log-debug)
-  (defun org-auto-scheduler--log-debug (&rest _args) nil))
-(unless (fboundp 'org-auto-scheduler--log-warn)
-  (defun org-auto-scheduler--log-warn (&rest _args) nil))
-(unless (fboundp 'org-auto-scheduler--log-error)
-  (defun org-auto-scheduler--log-error (&rest _args) nil))
 
 (defsubst org-auto-scheduler--review-special-row-p (id)
   "Return t if ID represents a non-task row (day separator or header shortcuts)."
@@ -335,7 +345,7 @@ or nil on failure."
                         :non-blocking org-auto-scheduler--non-blocking-tasks
                         :mtime mtime))))))
       (error
-       (org-auto-scheduler--log-warn "Failed to read state file %s: %s"
+       (org-auto-scheduler--log-warn* "Failed to read state file %s: %s"
                                      org-auto-scheduler-review-state-file
                                      (error-message-string err))
        nil))))
@@ -435,7 +445,7 @@ and reconcile state from disk."
                         (org-auto-scheduler--merge-decision-alists
                          org-auto-scheduler--non-blocking-tasks disk-nb)))
                 (setq org-auto-scheduler--state-file-last-mtime (or mtime current-mtime))
-                (org-auto-scheduler--log-debug
+                (org-auto-scheduler--log-debug*
                  "org-auto-scheduler: loaded review decisions from %s (mtime: %s)"
                  org-auto-scheduler-review-state-file
                  (format-time-string "%Y-%m-%d %H:%M:%S" org-auto-scheduler--state-file-last-mtime)))
@@ -565,10 +575,25 @@ Persists the decision according to `org-auto-scheduler-non-blocking-backend`."
       (org-auto-scheduler-save-non-blocking-state))
     nil))
 
+(defvar org-auto-scheduler--saved-decision-cache nil
+  "When a hash table, memoizes `org-auto-scheduler-get-saved-decision' by task ID.
+Bound by `org-auto-scheduler-sort-tasks' for one sort, which only reads
+decisions (they are merged and saved before the sort starts).")
+
 (defun org-auto-scheduler-get-saved-decision (task-id &optional marker)
   "Get saved decision plist for TASK-ID.
 If MARKER is provided and backend is `org-properties` or `both`, also checks
 the task's Org properties."
+  (if (and task-id (hash-table-p org-auto-scheduler--saved-decision-cache))
+      (let ((hit (gethash task-id org-auto-scheduler--saved-decision-cache 'miss)))
+        (if (eq hit 'miss)
+            (puthash task-id (org-auto-scheduler--get-saved-decision-1 task-id marker)
+                     org-auto-scheduler--saved-decision-cache)
+          hit))
+    (org-auto-scheduler--get-saved-decision-1 task-id marker)))
+
+(defun org-auto-scheduler--get-saved-decision-1 (task-id &optional marker)
+  "Uncached body of `org-auto-scheduler-get-saved-decision' (same arguments)."
   (let ((entry (and task-id (cdr (assoc task-id org-auto-scheduler--saved-review-decisions)))))
     (if (and marker (markerp marker) (marker-buffer marker)
              (memq org-auto-scheduler-review-persistence-backend '(org-properties both)))
@@ -606,7 +631,8 @@ the task's Org properties."
                  (pinned-time (or prop-pinned-time (plist-get entry :pinned-time))))
             (list :order order :skipped skipped :target-date target-date
                   :freeset freeset :pinnable freeset :pinned pinned :pinned-time pinned-time
-                  :is-new is-new :saved-sig saved-sig :reranked-from reranked-from)))
+                  :is-new is-new :saved-sig saved-sig :reranked-from reranked-from
+                  :auto-order (plist-get entry :auto-order))))
       entry)))
 
 (defun org-auto-scheduler-review-save-decisions (&optional silent)
@@ -1062,6 +1088,13 @@ Returns a plist (:pruned N :new N :kept N)."
                           (saved-sig (or (and existing (plist-get existing-dec :saved-sig))
                                          (plist-get info :sig)))
                           (reranked-from (and existing (plist-get existing-dec :reranked-from)))
+                          ;; An order this merge generated (new task, or re-slotted after a
+                          ;; score change) is the scheduler's, not the user's.  It stays
+                          ;; marked until the user saves from the review buffer, so later
+                          ;; runs do not mistake it for an explicit sequence.
+                          (auto-order (or (null existing)
+                                          (gethash tid reranked-ids)
+                                          (plist-get existing-dec :auto-order)))
                           (decision (list :order (or order (setq max-rank (+ max-rank 100.0)))
                                           :skipped skipped
                                           :target-date target-date
@@ -1073,6 +1106,7 @@ Returns a plist (:pruned N :new N :kept N)."
                                           :is-new is-new
                                           :saved-sig saved-sig
                                           :reranked-from reranked-from
+                                          :auto-order auto-order
                                           :updated-at (current-time))))
                      (if existing
                          (setcdr existing decision)
@@ -1445,9 +1479,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
     (tabulated-list-print-entry id cols))))
 
 (defun org-auto-scheduler-workday-duration-minutes ()
-  "Return the total configured workday duration in minutes."
-  (let* ((start-m (condition-case nil (org-duration-to-minutes org-auto-scheduler-start-time) (error 540)))
-         (end-m (condition-case nil (org-duration-to-minutes org-auto-scheduler-end-time) (error 1020)))
+  "Return today's configured workday duration in minutes."
+  (let* ((hours (org-auto-scheduler--day-hours (current-time)))
+         (start-m (condition-case nil (org-duration-to-minutes (car hours)) (error 540)))
+         (end-m (condition-case nil (org-duration-to-minutes (cdr hours)) (error 1020)))
          (diff (- (or end-m 1020) (or start-m 540))))
     (if (> diff 0) diff 480)))
 
@@ -1530,6 +1565,13 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                     (propertize (format "⛔ %d DEADLINE INFEASIBLE" neg-float-count)
                                                 'face 'error))
                           ""))
+             (risk-count (length (bound-and-true-p org-auto-scheduler--deadline-risks)))
+             (risk-badge (if (> risk-count 0)
+                             (format " │ %s"
+                                     (propertize (format "⚠ %d will miss deadline" risk-count)
+                                                 'face 'warning
+                                                 'help-echo "M-x org-auto-scheduler-deadline-risks"))
+                           ""))
              (marked-badge (if (and (boundp 'org-auto-scheduler--review-marked-ids)
                                     org-auto-scheduler--review-marked-ids)
                                (format " │ %s"
@@ -1546,8 +1588,9 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                            (format " │ %s"
                                    (propertize "📸 Snapshot: None [A]"
                                                'face 'shadow))))
-             (legend (format " %s │ %d scheduled (%.1fh)%s%s%s%s │%s"
-                             gauge total hours waiting-badge neg-badge marked-badge snap-badge proj-legend)))
+             (legend (format " %s │ %d scheduled (%.1fh)%s%s%s%s%s │%s"
+                             gauge total hours waiting-badge neg-badge risk-badge marked-badge snap-badge
+                             proj-legend)))
         (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
 ;;; Interactive Review Mode
@@ -2025,20 +2068,22 @@ Works across Org buffers, Org Agenda, the Review buffer, and Calendar."
   "Return the next non-excluded day's date string YYYY-MM-DD after DATE-STR."
   (let* ((current (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
          (next (time-add current (days-to-time 1)))
-         (dow (string-to-number (format-time-string "%w" next))))
-    (while (member dow org-auto-scheduler-excluded-days)
-      (setq next (time-add next (days-to-time 1)))
-      (setq dow (string-to-number (format-time-string "%w" next))))
+         (guard 0))
+    ;; Skip days off; give up after a year in case every day is excluded.
+    (while (and (org-auto-scheduler--day-off-p next) (< guard 366))
+      (setq next (time-add next (days-to-time 1))
+            guard (1+ guard)))
     (format-time-string "%Y-%m-%d" next)))
 
 (defun org-auto-scheduler--prev-day-date-string (date-str)
   "Return the previous non-excluded day's date string YYYY-MM-DD before DATE-STR."
   (let* ((current (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
          (prev (time-subtract current (days-to-time 1)))
-         (dow (string-to-number (format-time-string "%w" prev))))
-    (while (member dow org-auto-scheduler-excluded-days)
-      (setq prev (time-subtract prev (days-to-time 1)))
-      (setq dow (string-to-number (format-time-string "%w" prev))))
+         (guard 0))
+    ;; Skip days off; give up after a year in case every day is excluded.
+    (while (and (org-auto-scheduler--day-off-p prev) (< guard 366))
+      (setq prev (time-subtract prev (days-to-time 1))
+            guard (1+ guard)))
     (format-time-string "%Y-%m-%d" prev)))
 
 (defun org-auto-scheduler--review-first-day-sep-p (sep-id)
@@ -3015,9 +3060,8 @@ tasks are constrained to start on or after their current day section."
                   (let* ((task-pinned-time (org-auto-scheduler-task-pinned-time marker task-id))
                          (day-start (if (string= task-day today-str)
                                        (org-auto-scheduler-get-start-time)
-                                     (org-auto-scheduler-time-with-time-string
-                                      (org-auto-scheduler-parse-time-string (concat task-day " 00:00"))
-                                      org-auto-scheduler-start-time))))
+                                     (org-auto-scheduler--day-start
+                                      (org-auto-scheduler-parse-time-string (concat task-day " 00:00"))))))
                     (if (and task-pinned-time
                              (string= (format-time-string "%Y-%m-%d" task-pinned-time) task-day))
                         (setq current-time task-pinned-time)
@@ -3227,7 +3271,7 @@ Automatically recalculates dependent times based on visual layout before executi
             (condition-case err
                 (org-auto-scheduler-review-save-decisions t)
               (error
-               (org-auto-scheduler--log-error "Failed to auto-save review decisions: %s" err))))
+               (org-auto-scheduler--log-error* "Failed to auto-save review decisions: %s" err))))
           (org-auto-scheduler-display-report)
           (message "Applied %d tasks from the auto-scheduler review!" applied-count))
       (kill-buffer (current-buffer)))
