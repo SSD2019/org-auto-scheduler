@@ -45,7 +45,6 @@
 (require 'org)
 (require 'cl-lib)
 (require 'org-id)
-(require 'log4e)
 (require 'parse-time)
 (require 'org-agenda)
 (require 'org-duration)
@@ -58,8 +57,7 @@
 
 
 
-(log4e:deflogger "org-auto-scheduler" "%t [%l] %m" "%H:%M:%S")
-(org-auto-scheduler--log-set-level 'debug)
+(require 'org-auto-scheduler-log)
 
 ;; Submodules (loaded before defcustoms so :set hooks can access daemon/review functions)
 (require 'org-auto-scheduler-daemon)
@@ -246,8 +244,12 @@ Returns nil if the task does not have a POMODORO property or if pomodoro is disa
            (t nil)))))))
 
 (defcustom org-auto-scheduler-debug nil
-  "When non-nil, enable debug logging for org-auto-scheduler."
+  "When non-nil, write debug logging for org-auto-scheduler.
+The log is in the buffer opened by `org-auto-scheduler--log-open-log'."
   :type 'boolean
+  :set (lambda (sym val)
+         (set-default sym val)
+         (org-auto-scheduler--log-sync-with-option))
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-inherited-priority-property "INHERITED_PRIORITY"
@@ -1263,7 +1265,7 @@ skipped if any agenda buffer has unsaved edits."
              (require 'org-caldav nil t))
     (cond
      ((not (org-auto-scheduler--caldav-needs-push-p force-dirty))
-      (org-auto-scheduler--log-info "Skipping post-schedule CalDAV push (no local or schedule changes)")
+      (org-auto-scheduler--log-info* "Skipping post-schedule CalDAV push (no local or schedule changes)")
       (when (and org-auto-scheduler--caldav-pull-results
                  (bound-and-true-p org-caldav-show-sync-results)
                  (not (bound-and-true-p org-auto-scheduler-silent-mode))
@@ -1276,12 +1278,12 @@ skipped if any agenda buffer has unsaved edits."
                       (let ((b (and f (get-file-buffer f))))
                         (and b (buffer-modified-p b))))
                     (ignore-errors (org-agenda-files t))))
-      (org-auto-scheduler--log-info
+      (org-auto-scheduler--log-info*
        "Skipping background CalDAV push: unsaved agenda buffers and background auto-save is disabled"))
      (t
       (when (or (not (org-auto-scheduler--caldav-background-run-p))
                 (bound-and-true-p org-auto-scheduler-background-save-buffers))
-        (org-auto-scheduler--log-info "Saving all org agenda buffers before CalDAV push")
+        (org-auto-scheduler--log-info* "Saving all org agenda buffers before CalDAV push")
         (save-some-buffers t (lambda ()
                                (and (buffer-file-name)
                                     (member (buffer-file-name) (org-agenda-files t))))))
@@ -1624,7 +1626,7 @@ Hash table with date strings as keys and lists of items as values.")
                      (puthash date-string (cons item existing) org-auto-scheduler--agenda-cache))))))))))
    nil 'agenda)
   (org-auto-scheduler--build-pinned-cache)
-  (org-auto-scheduler--log-info "Built agenda cache with %d days." (hash-table-count org-auto-scheduler--agenda-cache)))
+  (org-auto-scheduler--log-info* "Built agenda cache with %d days." (hash-table-count org-auto-scheduler--agenda-cache)))
 
 (defun org-auto-scheduler--fetch-base-agenda-items-for-date (date-string)
   "Fallback method to fetch native agenda items for DATE-STRING."
@@ -1693,6 +1695,48 @@ Hash table with date strings as keys and lists of items as values.")
           nil
           'agenda))))
 
+(defvar org-auto-scheduler--completed-index nil
+  "Index over `org-auto-scheduler-completed-tasks' for slot probes.
+A list (HEAD COUNT BY-DAY IDS): HEAD is the list object last indexed,
+COUNT its length, BY-DAY a hash from day-start seconds to the entries
+starting that day (in list order), IDS a hash of the entry IDs.")
+
+(defun org-auto-scheduler--day-key (time)
+  "Return the start of TIME's local day as integer seconds."
+  (let ((d (decode-time time)))
+    (time-convert (encode-time 0 0 0 (nth 3 d) (nth 4 d) (nth 5 d)) 'integer)))
+
+(defun org-auto-scheduler--completed-index ()
+  "Return the current index of `org-auto-scheduler-completed-tasks'.
+Entries are only ever pushed onto the list or the list is replaced, so new
+entries are found by walking from the front to the previously indexed head.
+Anything else (a new list, `nreverse', removals) triggers a full rebuild,
+detected by the length no longer adding up."
+  (let* ((lst org-auto-scheduler-completed-tasks)
+         (idx org-auto-scheduler--completed-index))
+    (if (and idx (eq (nth 0 idx) lst))
+        idx
+      (let ((new '()) (cell lst) (n 0))
+        (when idx
+          (while (and cell (not (eq cell (nth 0 idx))))
+            (push (car cell) new)
+            (setq cell (cdr cell) n (1+ n))))
+        (if (and idx cell (= (+ n (nth 1 idx)) (length lst)))
+            ;; NEW is oldest-first; pushing each keeps per-day lists in list order.
+            (let ((by-day (nth 2 idx)) (ids (nth 3 idx)))
+              (dolist (task new)
+                (let ((key (org-auto-scheduler--day-key (or (nth 1 task) (current-time)))))
+                  (puthash key (cons task (gethash key by-day)) by-day))
+                (puthash (nth 0 task) t ids))
+              (setq org-auto-scheduler--completed-index (list lst (+ n (nth 1 idx)) by-day ids)))
+          (let ((by-day (make-hash-table)) (ids (make-hash-table :test 'equal)))
+            (dolist (task (reverse lst))
+              (let ((key (org-auto-scheduler--day-key (or (nth 1 task) (current-time)))))
+                (puthash key (cons task (gethash key by-day)) by-day))
+              (puthash (nth 0 task) t ids))
+            (setq org-auto-scheduler--completed-index
+                  (list lst (length lst) by-day ids))))))))
+
 (defun org-auto-scheduler-get-agenda-items (date)
   "Get agenda items for DATE.  Includes tasks with active timestamps and projected habit occurrences."
   (condition-case err
@@ -1703,16 +1747,15 @@ Hash table with date strings as keys and lists of items as values.")
                   (copy-sequence (gethash date-string org-auto-scheduler--agenda-cache))
                 (org-auto-scheduler--fetch-base-agenda-items-for-date date-string))))
 
-        ;; Add completed AUTOSCH tasks for the current date
-        (dolist (task org-auto-scheduler-completed-tasks)
-          (let ((task-date (format-time-string "%Y-%m-%d" (nth 1 task))))
-            (when (string= task-date date-string)
-              (push task agenda-items))))
-
-        ;; Add reservations for pinned tasks not yet completed
-        (dolist (item (org-auto-scheduler--get-pinned-tasks-reservations date-string))
-          (let ((tid (nth 0 item)))
-            (unless (cl-some (lambda (tk) (equal (nth 0 tk) tid)) org-auto-scheduler-completed-tasks)
+        ;; Add completed AUTOSCH tasks for the current date, and reservations for
+        ;; pinned tasks not yet completed.  This runs for every slot probe, so it
+        ;; uses an index instead of scanning every placed task.
+        (let ((index (org-auto-scheduler--completed-index)))
+          ;; Same order as scanning the whole list front to back and pushing.
+          (dolist (task (gethash (org-auto-scheduler--day-key date) (nth 2 index)))
+            (push task agenda-items))
+          (dolist (item (org-auto-scheduler--get-pinned-tasks-reservations date-string))
+            (unless (gethash (nth 0 item) (nth 3 index))
               (push item agenda-items))))
 
         ;; Add projected repeater occurrences for the current date
@@ -1731,23 +1774,23 @@ Hash table with date strings as keys and lists of items as values.")
                    ((= (length repeater-item) 7)
                     (setq repeater-item (append repeater-item (list nil)))))
                   (push repeater-item agenda-items)
-                  (org-auto-scheduler--log-debug "Added projected repeater occurrence: %s at %s"
+                  (org-auto-scheduler--log-debug* "Added projected repeater occurrence: %s at %s"
                                                  (nth 5 repeater-item)
                                                  (format-time-string "%Y-%m-%d %H:%M" (nth 1 repeater-item))))))))
 
-        (org-auto-scheduler--log-debug "Agenda items considered for conflicts:")
+        (org-auto-scheduler--log-debug* "Agenda items considered for conflicts:")
         (dolist (item agenda-items)
-          (org-auto-scheduler--log-debug "Task: %s, ID: %s, Scheduled: %s, End: %s, Tags: %s, Task Name: %s"
+          (org-auto-scheduler--log-debug* "Task: %s, ID: %s, Scheduled: %s, End: %s, Tags: %s, Task Name: %s"
                                          (nth 5 item) ; Task name
                                          (nth 0 item) ; Task ID
                                          (format-time-string "%Y-%m-%d %H:%M" (nth 1 item))
                                          (when (nth 2 item) (format-time-string "%Y-%m-%d %H:%M" (nth 2 item)))
                                          (nth 3 item)
                                          (nth 5 item)))
-        (org-auto-scheduler--log-debug "Agenda items to be returned: %s" agenda-items)
+        (org-auto-scheduler--log-debug* "Agenda items to be returned: %s" agenda-items)
         agenda-items)
     (error
-     (org-auto-scheduler--log-error "Error getting agenda items: %s" err)
+     (org-auto-scheduler--log-error* "Error getting agenda items: %s" err)
      nil)))
 
 (defun org-auto-scheduler-parse-time-string (time-string)
@@ -1803,7 +1846,7 @@ Checks for what-if overrides in the review buffer if active."
         (when deadline-string
           (org-time-string-to-time deadline-string)))
     (error
-     (org-auto-scheduler--log-error "Error getting deadline for task: %s. Error: %s" task err)
+     (org-auto-scheduler--log-error* "Error getting deadline for task: %s. Error: %s" task err)
      nil)))
 
 (defun org-auto-scheduler-get-scheduled (task)
@@ -1867,13 +1910,13 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
             (if (re-search-forward ":END:" task-end t)
                 (setq logbook-end (match-beginning 0))
               (setq logbook-end task-end))
-            (org-auto-scheduler--log-debug "LOGBOOK found from %d to %d" logbook-start logbook-end)
+            (org-auto-scheduler--log-debug* "LOGBOOK found from %d to %d" logbook-start logbook-end)
 
             ;; First pass: find the last state change
             (goto-char logbook-start)
             (while (re-search-forward "- State \"\\(DONE\\|NOTE\\|DROPPED\\)\".*\\[\\([^]]+\\)\\]" logbook-end t)
               (setq last-state-change (org-auto-scheduler-parse-time-string (match-string 2))))
-            (org-auto-scheduler--log-debug "Last state change: %s"
+            (org-auto-scheduler--log-debug* "Last state change: %s"
                                            (and last-state-change (format-time-string "%Y-%m-%d %H:%M:%S" last-state-change)))
 
             ;; Second pass: sum up clock entries after the last state change
@@ -1888,10 +1931,10 @@ but only considering time after the last DONE, NOTE, or DROPPED state change."
                 (when (or (null last-state-change)
                           (time-less-p last-state-change start-time))
                   (setq clock-sum (+ clock-sum duration-minutes))
-                  (org-auto-scheduler--log-debug "Added clock entry: %s, duration: %d minutes, new sum: %f"
+                  (org-auto-scheduler--log-debug* "Added clock entry: %s, duration: %d minutes, new sum: %f"
                                                  start-str duration-minutes clock-sum))))))))
     (let ((total-time (floor (+ clock-sum (or (and current-clock-time (/ current-clock-time 60)) 0)))))
-      (org-auto-scheduler--log-debug "Total clocked time: %d minutes" total-time)
+      (org-auto-scheduler--log-debug* "Total clocked time: %d minutes" total-time)
       total-time)))
 
 (defun org-auto-scheduler-get-state (task)
@@ -1969,13 +2012,13 @@ Returns a list containing the total score and individual score components."
                              state-weight
                              tag-score
                              hard-deadline-score)))
-        (org-auto-scheduler--log-debug "Calculating score for task %s"
+        (org-auto-scheduler--log-debug* "Calculating score for task %s"
                                        (org-with-point-at marker (or (org-id-get) "NO-ID")))
         (list total-score effort-score priority-total urgency-score category-score state-weight
               effort priority-score inherited-priority days-to-deadline category-weight state
               tag-score urgent-days-score large-task-score))
     (error
-     (org-auto-scheduler--log-error "Error calculating score: %s\nMarker: %s\nBacktrace: %s"
+     (org-auto-scheduler--log-error* "Error calculating score: %s\nMarker: %s\nBacktrace: %s"
                                     err
                                     marker
                                     (with-output-to-string (backtrace)))
@@ -2049,10 +2092,26 @@ Returns integer minutes or nil if invalid."
       (string-to-number (match-string 1 str)))
      (t nil))))
 
+(defvar org-auto-scheduler--siblings-sequential-cache nil
+  "When a hash table, memoizes `org-auto-scheduler--siblings-sequential-p'.
+Bound by `org-auto-scheduler-sort-tasks' for the length of one sort, during
+which the Org buffers do not change.")
+
 (defun org-auto-scheduler--siblings-sequential-p (&optional parent-node project-id)
   "Return non-nil if siblings under PARENT-NODE should be scheduled sequentially.
 Checks parent node properties (:ORDERED:, :PARALLEL:), tags (:PARALLEL:), then project properties
 (:PROJECT_ORDERED:, :PROJECT_PARALLEL:) and tags, falling back to `org-auto-scheduler-siblings-sequential`."
+  (if (and (hash-table-p org-auto-scheduler--siblings-sequential-cache) parent-node)
+      (let* ((key (cons parent-node project-id))
+             (hit (gethash key org-auto-scheduler--siblings-sequential-cache 'miss)))
+        (if (not (eq hit 'miss))
+            hit
+          (puthash key (org-auto-scheduler--siblings-sequential-p-1 parent-node project-id)
+                   org-auto-scheduler--siblings-sequential-cache)))
+    (org-auto-scheduler--siblings-sequential-p-1 parent-node project-id)))
+
+(defun org-auto-scheduler--siblings-sequential-p-1 (&optional parent-node project-id)
+  "Uncached body of `org-auto-scheduler--siblings-sequential-p' (same arguments)."
   (let ((parent-node (or parent-node
                          (and (derived-mode-p 'org-mode)
                               (cons (current-buffer) (point)))))
@@ -2406,7 +2465,8 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
     (when (and (markerp marker) (marker-buffer marker))
       (org-with-point-at marker
         (or (org-id-get) (org-id-get-create)))))
-  (let* ((sibling-pos-cache (make-hash-table :test 'equal))
+  (let* ((org-auto-scheduler--siblings-sequential-cache (make-hash-table :test 'equal))
+         (sibling-pos-cache (make-hash-table :test 'equal))
          (tasks-with-info
           (mapcar (lambda (marker)
                     (let* ((task-id (org-with-point-at marker
@@ -2443,7 +2503,7 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
                            (position-info (cons parent-node task-position))
                            (dependency-depth 0) ; Overwritten during Topological Sort
                            (is-independent (org-auto-scheduler-task-independent-p marker)))
-                      (org-auto-scheduler--log-debug
+                      (org-auto-scheduler--log-debug*
                        "Task info: Name: %s, ID: %s, Project: %s, Score: %f, Position: %d"
                        task-name task-id project-id score task-position)
                       (list marker             ; 0
@@ -2553,7 +2613,7 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
                   (let ((current-max (gethash project-id project-max-scores -999999.0)))
                     (when (> new-score current-max)
                       (puthash project-id new-score project-max-scores))))
-                (org-auto-scheduler--log-debug
+                (org-auto-scheduler--log-debug*
                  "Critical path task boosted: ID %s, Name: %s (Float: %.1fh, +%.1f -> %.2f)"
                  task-id (nth 6 task) fl org-auto-scheduler-critical-path-boost new-score)))))))
 
@@ -2615,7 +2675,7 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
       (setq org-auto-scheduler--last-sorted-tasks-info sorted-tasks)
 
       (dolist (task sorted-tasks)
-        (org-auto-scheduler--log-debug
+        (org-auto-scheduler--log-debug*
          "  ID: %s, Name: %s, Tags: %s, Score: %f, Depth: %d, Project: %s, Position: %d, Scheduled: %s"
          (nth 5 task)  ; task-id
          (nth 6 task)  ; task-name
@@ -2670,7 +2730,7 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                                   (member "PINNABLE" proposed-tags)))))
          (is-pinned (or (member org-auto-scheduler-pinned-tag proposed-tags)
                         (and ignore-id (org-auto-scheduler-task-pinned-p nil ignore-id)))))
-    (org-auto-scheduler--log-debug "Checking time slot %s to %s"
+    (org-auto-scheduler--log-debug* "Checking time slot %s to %s"
                                    (format-time-string "%Y-%m-%d %H:%M" start-time)
                                    (format-time-string "%Y-%m-%d %H:%M" end-time))
     (or
@@ -2695,7 +2755,7 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
            (when (and c-start c-end
                       (time-less-p start-time c-end)
                       (time-less-p c-start end-time))
-             (org-auto-scheduler--log-debug "    Conflict detected with daily catch-up block: %s - %s"
+             (org-auto-scheduler--log-debug* "    Conflict detected with daily catch-up block: %s - %s"
                                             c-start-str c-end-str)
              (setq max-conflict-end c-end))))
        (dolist (item agenda-items)
@@ -2708,22 +2768,26 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                 (has-time (nth 6 item))
                 (marker (nth 7 item))
                 (is-autosch (member "AUTOSCH" tags))
-                (is-non-blocking (or (null consider-for-conflicts)
-                                     (org-auto-scheduler-task-non-blocking-p task-id marker task-name)))
                 (needs-buffer (or (member "buffertime" tags) (member "buffertime" proposed-tags)))
                 (active-gap (if needs-buffer 15 org-auto-scheduler-task-gap))
-                (task-start-with-gap (time-subtract task-start (seconds-to-time (* 60 active-gap))))
-                (task-end-with-gap (time-add task-end (seconds-to-time (* 60 active-gap)))))
+                (task-start-with-gap (and task-start
+                                          (time-subtract task-start (seconds-to-time (* 60 active-gap)))))
+                (task-end-with-gap (and task-end
+                                        (time-add task-end (seconds-to-time (* 60 active-gap))))))
+           ;; Cheap checks first; the non-blocking lookup reads Org properties and
+           ;; only matters for a non-AUTOSCH item that overlaps the slot.
            (when (and task-start  ; guard against nil timestamps from bad cache entries
                       task-end
                       ;; Without IGNORE-ID, (equal nil nil) would skip every event lacking an ID
                       (not (and ignore-id (equal task-id ignore-id)))
-                      (not (and (not is-autosch) is-non-blocking))
-                      (or (not is-autosch) (and is-autosch consider-for-conflicts))
+                      (or (not is-autosch) consider-for-conflicts)
                       has-time
                       (time-less-p start-time task-end-with-gap)
-                      (time-less-p task-start-with-gap end-time))
-             (org-auto-scheduler--log-debug "    Conflict detected with task: %s (ends %s)"
+                      (time-less-p task-start-with-gap end-time)
+                      (or is-autosch
+                          (not (or (null consider-for-conflicts)
+                                   (org-auto-scheduler-task-non-blocking-p task-id marker task-name)))))
+             (org-auto-scheduler--log-debug* "    Conflict detected with task: %s (ends %s)"
                                             task-name
                                             (format-time-string "%H:%M" task-end-with-gap))
              (when (or (null max-conflict-end)
@@ -2789,7 +2853,7 @@ Excludes TASK-ID and non-blocking items."
 
 (defun org-auto-scheduler-next-available-time (start-time duration &optional proposed-tags)
   "Find the next available time slot starting from START-TIME for DURATION minutes."
-  (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Finding next available time after %s for %d minutes"
+  (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Finding next available time after %s for %d minutes"
                                  (format-time-string "%Y-%m-%d %H:%M" start-time) duration)
   (let ((current-time start-time)
         (found-slot nil)
@@ -2800,30 +2864,30 @@ Excludes TASK-ID and non-blocking items."
              (day-of-week (string-to-number (format-time-string "%w" current-time)))
              (end-time (time-add current-time (seconds-to-time (* 60 duration))))
              (occupied-result (org-auto-scheduler-time-slot-occupied-p current-time duration nil proposed-tags)))
-        (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Attempting to find next available time slot starting from %s for %d minutes, original start %s"
+        (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Attempting to find next available time slot starting from %s for %d minutes, original start %s"
                                        (format-time-string "%Y-%m-%d %H:%M" current-time) duration (format-time-string "%Y-%m-%d %H:%M" start-time))
         (cond
          ((member day-of-week org-auto-scheduler-excluded-days)
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Day %d is excluded, moving to next day" day-of-week)
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Day %d is excluded, moving to next day" day-of-week)
           (setq current-time (org-auto-scheduler-next-day current-time)))
          ((time-less-p current-time day-start)
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Current time is before day start, setting to day start")
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Current time is before day start, setting to day start")
           (setq current-time day-start))
          ((time-less-p day-end end-time)
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] End time is after day end, moving to next day start")
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] End time is after day end, moving to next day start")
           (setq current-time (org-auto-scheduler-next-day-start current-time)))
          (occupied-result
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Time slot occupied, moving to %s"
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Time slot occupied, moving to %s"
                                          (format-time-string "%Y-%m-%d %H:%M" occupied-result))
           (setq current-time occupied-result))
          (t
           (setq found-slot current-time)))))
     (if found-slot
         (progn
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] Found available time slot: %s"
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Found available time slot: %s"
                                          (format-time-string "%Y-%m-%d %H:%M" found-slot))
           found-slot)
-      (org-auto-scheduler--log-debug "[org-auto-scheduler-next-available-time] No available time slot found within %d days"
+      (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] No available time slot found within %d days"
                                      org-auto-scheduler-max-days-to-check)
       nil)))
 
@@ -2863,7 +2927,7 @@ If no slot is found within blocks after max-days-to-check, returns nil."
       (setq days-checked (1+ days-checked)))
 
     (when found-time
-      (org-auto-scheduler--log-debug
+      (org-auto-scheduler--log-debug*
        "Found next available block time: %s"
        (format-time-string "%Y-%m-%d %H:%M" found-time)))
 
@@ -3248,7 +3312,7 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                       (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
                       (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))))
 
-              (org-auto-scheduler--log-info
+              (org-auto-scheduler--log-info*
                "Processed title marker '%s' on task '%s' -> flags: resched=%s, split-on=%s, split-off=%s, free-on=%s, free-off=%s, pin-on=%s, pin-off=%s, done=%s, kill=%s, defer=%s, effort=%s, pri=%s, pri-off=%s, indep-on=%s, indep-off=%s"
                match-grp cleaned-title is-resched is-split-on is-split-off is-free-on is-free-off is-pin-on is-pin-off is-done is-kill is-defer effort-minutes (and priority-char (char-to-string priority-char)) is-pri-off is-indep-on is-indep-off)
 
@@ -3613,11 +3677,11 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
              (thread-live-p org-auto-scheduler--background-thread)
              (fboundp 'current-thread)
              (not (eq (current-thread) org-auto-scheduler--background-thread)))
-    (org-auto-scheduler--log-info "Waiting for background scheduler thread to complete...")
+    (org-auto-scheduler--log-info* "Waiting for background scheduler thread to complete...")
     (thread-join org-auto-scheduler--background-thread))
   (org-auto-scheduler--with-active-operation (or org-auto-scheduler--current-run-type 'scheduling)
     (org-auto-scheduler--with-caldav-session
-      (org-auto-scheduler--log-info "Starting auto-scheduling process")
+      (org-auto-scheduler--log-info* "Starting auto-scheduling process")
       (when (and org-auto-scheduler-sync-caldav
                  (not org-auto-scheduler--preview-mode))
         (org-auto-scheduler--caldav-pull))
@@ -4273,14 +4337,14 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                  :cleaned-placeholders (or org-auto-scheduler--session-cleaned-placeholders 0)))
               (unless org-auto-scheduler--preview-mode
                 (org-auto-scheduler-display-report))
-              (org-auto-scheduler--log-info "Scheduled %d tasks (changes: %d)"
+              (org-auto-scheduler--log-info* "Scheduled %d tasks (changes: %d)"
                                             tasks-scheduled
                                             (length org-auto-scheduler--last-run-changes))
               (when (and org-auto-scheduler-sync-caldav
                          (not org-auto-scheduler--preview-mode))
                 (org-auto-scheduler--caldav-push))))
           (error
-           (org-auto-scheduler--log-error "Error in scheduling process: %s" err)
+           (org-auto-scheduler--log-error* "Error in scheduling process: %s" err)
            ;; Edits made before the failure (placeholder cleanup, marker
            ;; stripping, partial scheduling) still need to reach the calendar.
            (when (and org-auto-scheduler--caldav-session-dirty
@@ -4323,20 +4387,20 @@ Suppresses redundant buffer mutations if SCHEDULED already matches SCHEDULE-STR.
               (file (buffer-file-name)))
          ;; Check if the task is not in an archived state and not a placeholder
          (when (and is-autosch is-valid-state (not (member "ARCHIVE" tags)) (not is-placeholder))
-           (org-auto-scheduler--log-debug "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
+           (org-auto-scheduler--log-debug* "Found schedulable task: %s (State: %s, NOT_BEFORE: %s, RECURRING: %s) in file %s"
                                           headline state (or not-before "Not set") (or recurring "Not set") file)
            (if recurring
                (progn
-                 (org-auto-scheduler--log-debug "Creating instances for recurring task: %s in file %s" headline file)
+                 (org-auto-scheduler--log-debug* "Creating instances for recurring task: %s in file %s" headline file)
                  (let ((new-instances (org-auto-scheduler-create-recurring-instances headline recurring scheduled not-before)))
                    (setq tasks (append new-instances tasks))))
-             (org-auto-scheduler--log-debug "Adding non-recurring task: %s from file %s" headline file)
+             (org-auto-scheduler--log-debug* "Adding non-recurring task: %s from file %s" headline file)
              (let ((m (point-marker)))
                (set-marker-insertion-type m t)
                (push m tasks))))))
      nil
      'agenda)
-    (org-auto-scheduler--log-info "Found %d schedulable tasks across the agenda" (length tasks))
+    (org-auto-scheduler--log-info* "Found %d schedulable tasks across the agenda" (length tasks))
     (nreverse tasks)))
 
 (defun org-auto-scheduler--get-waiting-since (marker &optional state)
@@ -5360,17 +5424,17 @@ Safeguards:
                                 (org-with-point-at parent-marker
                                   (org-auto-scheduler--insert-clock-entries clock-lines))
                                 (setq total-clocks-preserved (+ total-clocks-preserved (length clock-lines)))
-                                (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Preserved %d clock entries from placeholder to parent task"
+                                (org-auto-scheduler--log-info* "[org-auto-scheduler-cleanup-placeholders] Preserved %d clock entries from placeholder to parent task"
                                                               (length clock-lines))))
                             ;; If placeholder was marked DONE, mark parent DONE
                             (when (and is-done parent-exists)
                               (org-with-point-at parent-marker
                                 (org-todo (or (car org-done-keywords) "DONE")))
-                              (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Marked parent task DONE based on completed placeholder"))))))))
+                              (org-auto-scheduler--log-info* "[org-auto-scheduler-cleanup-placeholders] Marked parent task DONE based on completed placeholder"))))))))
                 (when modified
                   (save-buffer))))))))
     (when (or (> total-deleted 0) (> total-clocks-preserved 0))
-      (org-auto-scheduler--log-info "[org-auto-scheduler-cleanup-placeholders] Cleaned up %d placeholders, preserved %d clock entries"
+      (org-auto-scheduler--log-info* "[org-auto-scheduler-cleanup-placeholders] Cleaned up %d placeholders, preserved %d clock entries"
                                     total-deleted total-clocks-preserved)
       (when (called-interactively-p 'interactive)
         (message "Cleaned up %d placeholders (preserved %d clock entries)"
@@ -5518,7 +5582,7 @@ respecting hard time blocks (`org-auto-scheduler-time-blocks') and soft energy
 preferences (`org-auto-scheduler-energy-blocks'), while avoiding conflicts with
 existing scheduled tasks.
 TOPO-DEPTH represents Kahn's Topological Sort computed depth."
-  (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Attempting to schedule task at marker %s" marker)
+  (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Attempting to schedule task at marker %s" marker)
   (when (markerp marker)
     (org-with-point-at marker
       (let* ((headline (org-get-heading t t t t))
@@ -5556,18 +5620,18 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
              (attempts 0)
              (max-attempts (* 7 24 60)) ; 7 days in minutes
              (is-currently-clocked (org-clock-is-active)))
-        (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Task: %s" headline)
-        (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
+        (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Task: %s" headline)
+        (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
                                        total-effort clocked-time remaining-effort time-block is-currently-clocked
                                        (if not-before (format-time-string "%Y-%m-%d %H:%M" not-before) "Not set"))
         (when (and time-block (null available-time))
           ;; Log that no available time slot was found
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] No available time slot found within the time block. Scheduling outside the time block.")
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] No available time slot found within the time block. Scheduling outside the time block.")
           ;; Reset time block since no available time was found
           (setq time-block nil)
           ;; Log task information
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] outside time block Task: %s" headline)
-          (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] outside time block Task: %s" headline)
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Total effort: %d minutes, Clocked time: %d minutes, Remaining effort: %d minutes, Time block: %s, Currently clocked: %s, Not before: %s"
                                          total-effort clocked-time remaining-effort time-block is-currently-clocked
                                          (if not-before (format-time-string "%Y-%m-%d %H:%M" not-before) "Not set"))
           (setq available-time start-time))
@@ -5583,7 +5647,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                  (reason (if has-waiting-blocker
                              (format "Blocked by WAITING: '%s'" (or first-waiting-title "task"))
                            "Blocked by unmet dependencies")))
-            (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is %s. %s." headline status-str reason)
+            (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Task '%s' is %s. %s." headline status-str reason)
             (when (and task-id (hash-table-p org-auto-scheduler--placement-traces))
               (puthash task-id (list :base-effort base-effort :multiplier multiplier :total-effort total-effort
                                      :clocked-time clocked-time :remaining-effort remaining-effort :category category
@@ -5597,7 +5661,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
           current-time) ; Return current-time unmodified since task wasn't scheduled
 
          (is-saved-skipped
-          (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Task '%s' is marked skipped in saved decisions." headline)
+          (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Task '%s' is marked skipped in saved decisions." headline)
           (when org-auto-scheduler--preview-mode
             (push (list task-id start-time start-time '("AUTOSCH") nil headline
                         "SKIPPED" marker (or topo-depth 0) :skipped '("Skipped in previous session"))
@@ -5679,7 +5743,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                               :clocked-time clocked-time :remaining-effort remaining-effort :category category
                                               :pinned t :selected-start eff-start :selected-end end-time)
                                  org-auto-scheduler--placement-traces))
-                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled PINNABLE task '%s' from %s to %s (Effort: %dm)"
+                      (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Scheduled PINNABLE task '%s' from %s to %s (Effort: %dm)"
                                                     headline
                                                     (format-time-string "%Y-%m-%d %H:%M" eff-start)
                                                     (format-time-string "%Y-%m-%d %H:%M" end-time)
@@ -5711,7 +5775,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                            (last-end (org-auto-scheduler--place-split-placeholders
                                       origin-id headline marker topo-depth rem-effort min-chunk
                                       tags time-block active-gap next-day-start start-date-str)))
-                      (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Split PINNABLE task '%s': today %dm (until midnight), remaining %dm across subsequent days"
+                      (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Split PINNABLE task '%s': today %dm (until midnight), remaining %dm across subsequent days"
                                                     headline today-chunk rem-effort)
                       (time-add last-end (seconds-to-time (* 60 active-gap))))))))
 
@@ -5771,7 +5835,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                          (last-end (org-auto-scheduler--place-split-placeholders
                                                     origin-id headline marker topo-depth rem-effort min-chunk
                                                     tags time-block active-gap next-day-start today-start-day)))
-                                    (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Split task '%s': today %dm (%s), remaining %dm across subsequent days"
+                                    (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Split task '%s': today %dm (%s), remaining %dm across subsequent days"
                                                                   headline today-chunk
                                                                   (format-time-string "%H:%M" available-time))
                                     (setq split-result (time-add last-end (seconds-to-time (* 60 active-gap))))))
@@ -5835,7 +5899,7 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                             (let ((last-end (org-auto-scheduler--place-pomodoro-placeholders
                                              origin-id headline marker topo-depth rem-effort pomo-work pomo-break
                                              tags time-block today-end total-parts)))
-                              (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Pomodoro split task '%s': initial chunk %dm (%s to %s), remaining %dm across Pomodoro intervals"
+                              (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Pomodoro split task '%s': initial chunk %dm (%s to %s), remaining %dm across Pomodoro intervals"
                                                             headline today-chunk
                                                             (format-time-string "%H:%M" available-time)
                                                             (format-time-string "%H:%M" today-end)
@@ -5883,21 +5947,21 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                       (org-set-property org-auto-scheduler-scheduled-property "t"))
                     (org-auto-scheduler--cleanup-task-placeholders marker (or task-id origin-id))
                     (push (list task-id available-time end-time '("AUTOSCH") t headline schedule-string nil topo-depth) org-auto-scheduler-completed-tasks))
-                  (org-auto-scheduler--log-info "[org-auto-scheduler-schedule-single-task] Scheduled task '%s' from %s to %s (Remaining effort: %d minutes, Gap: %dm)"
+                  (org-auto-scheduler--log-info* "[org-auto-scheduler-schedule-single-task] Scheduled task '%s' from %s to %s (Remaining effort: %d minutes, Gap: %dm)"
                                                 headline
                                                 (format-time-string "%Y-%m-%d %H:%M" available-time)
                                                 (format-time-string "%Y-%m-%d %H:%M" end-time)
                                                 remaining-effort active-gap)
-                  (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Adding task %s to the list of completed scheduling tasks"
+                  (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Adding task %s to the list of completed scheduling tasks"
                                                  task-id))
                 (let ((next-gap (if is-pomodoro
                                     (max active-gap pomo-break)
                                   active-gap)))
                   (time-add end-time (seconds-to-time (* 60 next-gap)))))
                (t
-                (org-auto-scheduler--log-warn "[org-auto-scheduler-schedule-single-task] Could not find available time slot within 7 days for task: %s" headline)
-                (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Scheduling failed after %d attempts" attempts)
-                (org-auto-scheduler--log-debug "[org-auto-scheduler-schedule-single-task] Last attempted time: %s" (format-time-string "%Y-%m-%d %H:%M" available-time))
+                (org-auto-scheduler--log-warn* "[org-auto-scheduler-schedule-single-task] Could not find available time slot within 7 days for task: %s" headline)
+                (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Scheduling failed after %d attempts" attempts)
+                (org-auto-scheduler--log-debug* "[org-auto-scheduler-schedule-single-task] Last attempted time: %s" (format-time-string "%Y-%m-%d %H:%M" available-time))
                 ;; Record failed tasks so they appear in the review buffer with error status
                 (when org-auto-scheduler--preview-mode
                   (push (list task-id current-time current-time '("AUTOSCH") nil headline
@@ -6012,10 +6076,10 @@ is the maximum end time of any blocker scheduled (or nil if none)."
 (defun org-auto-scheduler-debug ()
   "Run auto-scheduler and display debug information."
   (interactive)
-  (let ((org-auto-scheduler--log-level 'debug))
-    (org-auto-scheduler--log-clear-log)
-    (org-auto-scheduler-schedule-tasks)
-    (org-auto-scheduler--log-open-log)))
+  (org-auto-scheduler--log-clear-log)
+  (org-auto-scheduler--with-logging
+    (org-auto-scheduler-schedule-tasks))
+  (org-auto-scheduler--log-open-log))
 
 (defun org-auto-scheduler-time-with-time-string (time time-string)
   "Set the time of TIME to the time specified in TIME-STRING (HH:MM)."
@@ -6225,10 +6289,10 @@ Uses caching to improve performance when called multiple times with same end-dat
       (if (and cached-result (not cache-expired))
           ;; Return cached result
           (progn
-            (org-auto-scheduler--log-debug "Using cached repeater projections for %s" cache-key)
+            (org-auto-scheduler--log-debug* "Using cached repeater projections for %s" cache-key)
             (cdr cached-result))
         ;; Generate new projections
-        (org-auto-scheduler--log-debug "Generating new repeater projections for %s" cache-key)
+        (org-auto-scheduler--log-debug* "Generating new repeater projections for %s" cache-key)
         (let ((repeater-occurrences '()))
           (org-map-entries
            (lambda ()
@@ -6257,7 +6321,7 @@ to ensure fresh projections are generated."
   (interactive)
   (setq org-auto-scheduler--repeater-projections-cache nil)
   (setq org-auto-scheduler--repeater-cache-valid-until nil)
-  (org-auto-scheduler--log-info "Cleared repeater projections cache")
+  (org-auto-scheduler--log-info* "Cleared repeater projections cache")
   (when (called-interactively-p 'interactive)
     (message "Repeater projections cache cleared")))
 
@@ -6462,7 +6526,7 @@ Returns the number of tasks rescheduled."
                                     (match-string 1 sched-str))))
                (when (and sched-date (string< sched-date today-str))
                  (let ((headline (org-get-heading t t t t)))
-                   (org-auto-scheduler--log-info "Rescheduling past task '%s' (%s) to %s"
+                   (org-auto-scheduler--log-info* "Rescheduling past task '%s' (%s) to %s"
                                                  headline sched-str today-str)
                    (org-auto-scheduler--set-scheduled today-str)
                    ;; If task had a PINNED_TIME with a past date, update date portion to today-str
@@ -6478,7 +6542,7 @@ Returns the number of tasks rescheduled."
        nil
        search-scope))
     (when (> count 0)
-      (org-auto-scheduler--log-info "Rescheduled %d past AUTOSCH task(s) to %s: %s"
+      (org-auto-scheduler--log-info* "Rescheduled %d past AUTOSCH task(s) to %s: %s"
                                     count today-str (string-join (nreverse rescheduled-tasks) ", ")))
     (when (called-interactively-p 'interactive)
       (message "Rescheduled %d past AUTOSCH task(s) to %s." count today-str))
@@ -6750,7 +6814,7 @@ Finds current task via active clock, agenda point, or Org headline."
                               (when (get-buffer "*Org Agenda*")
                                 (with-current-buffer "*Org Agenda*" (org-agenda-redo)))
                               (message "Pulled %d upcoming tasks forward to close the %d-minute gap." cnt remaining-mins)))))))))))))
-    (error (org-auto-scheduler--log-warn "Error in early-done hook: %s" err))))
+    (error (org-auto-scheduler--log-warn* "Error in early-done hook: %s" err))))
 
 (add-hook 'org-after-todo-state-change-hook #'org-auto-scheduler--on-todo-state-change)
 
@@ -6801,7 +6865,7 @@ the `WAITING_SINCE' property."
           ;; Transitioning OUT of waiting state
           (when (org-entry-get nil org-auto-scheduler-waiting-since-property)
             (org-entry-delete nil org-auto-scheduler-waiting-since-property))))
-    (error (org-auto-scheduler--log-warn "Error in waiting state change hook: %s" err))))
+    (error (org-auto-scheduler--log-warn* "Error in waiting state change hook: %s" err))))
 
 (add-hook 'org-after-todo-state-change-hook #'org-auto-scheduler--on-waiting-state-change)
 

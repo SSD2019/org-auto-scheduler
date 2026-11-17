@@ -16,7 +16,7 @@ EMACS ?= emacs
 LOG4E_DIR ?= $(lastword $(sort $(wildcard $(HOME)/.emacs.d/elpa/log4e-* $(HOME)/.emacs.d/elpa/*/develop/log4e-*)))
 EXTRA_LOAD_PATH ?=
 
-SRC = org-auto-scheduler-daemon.el org-auto-scheduler-analytics.el \
+SRC = org-auto-scheduler-log.el org-auto-scheduler-daemon.el org-auto-scheduler-analytics.el \
       org-auto-scheduler-review.el org-auto-scheduler.el
 
 LOAD_PATH = -L . $(if $(LOG4E_DIR),-L $(LOG4E_DIR)) $(addprefix -L ,$(EXTRA_LOAD_PATH))

@@ -13,6 +13,7 @@
 
 (require 'org)
 (require 'cl-lib)
+(require 'org-auto-scheduler-log)
 (require 'tabulated-list)
 (require 'color)
 
@@ -144,12 +145,6 @@ Values can be:
 
 
 
-(unless (fboundp 'org-auto-scheduler--log-debug)
-  (defun org-auto-scheduler--log-debug (&rest _args) nil))
-(unless (fboundp 'org-auto-scheduler--log-warn)
-  (defun org-auto-scheduler--log-warn (&rest _args) nil))
-(unless (fboundp 'org-auto-scheduler--log-error)
-  (defun org-auto-scheduler--log-error (&rest _args) nil))
 
 (defsubst org-auto-scheduler--review-special-row-p (id)
   "Return t if ID represents a non-task row (day separator or header shortcuts)."
@@ -335,7 +330,7 @@ or nil on failure."
                         :non-blocking org-auto-scheduler--non-blocking-tasks
                         :mtime mtime))))))
       (error
-       (org-auto-scheduler--log-warn "Failed to read state file %s: %s"
+       (org-auto-scheduler--log-warn* "Failed to read state file %s: %s"
                                      org-auto-scheduler-review-state-file
                                      (error-message-string err))
        nil))))
@@ -435,7 +430,7 @@ and reconcile state from disk."
                         (org-auto-scheduler--merge-decision-alists
                          org-auto-scheduler--non-blocking-tasks disk-nb)))
                 (setq org-auto-scheduler--state-file-last-mtime (or mtime current-mtime))
-                (org-auto-scheduler--log-debug
+                (org-auto-scheduler--log-debug*
                  "org-auto-scheduler: loaded review decisions from %s (mtime: %s)"
                  org-auto-scheduler-review-state-file
                  (format-time-string "%Y-%m-%d %H:%M:%S" org-auto-scheduler--state-file-last-mtime)))
@@ -3236,7 +3231,7 @@ Automatically recalculates dependent times based on visual layout before executi
             (condition-case err
                 (org-auto-scheduler-review-save-decisions t)
               (error
-               (org-auto-scheduler--log-error "Failed to auto-save review decisions: %s" err))))
+               (org-auto-scheduler--log-error* "Failed to auto-save review decisions: %s" err))))
           (org-auto-scheduler-display-report)
           (message "Applied %d tasks from the auto-scheduler review!" applied-count))
       (kill-buffer (current-buffer)))

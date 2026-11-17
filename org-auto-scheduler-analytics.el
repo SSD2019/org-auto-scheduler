@@ -12,6 +12,7 @@
 
 (require 'org)
 (require 'cl-lib)
+(require 'org-auto-scheduler-log)
 (require 'org-clock)
 (require 'tabulated-list)
 (require 'color)
