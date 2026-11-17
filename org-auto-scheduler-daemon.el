@@ -19,6 +19,15 @@
 (require 'cl-lib)
 (require 'org-auto-scheduler-log)
 
+;; Defined in org-auto-scheduler.el.  This file let-binds them, so they must be
+;; declared special here too: without the declaration the byte compiler makes
+;; those bindings lexical, and e.g. the background dry run (preview mode) would
+;; write to Org files when this file is compiled.
+(defvar org-auto-scheduler--current-run-type)
+(defvar org-auto-scheduler--preview-mode)
+(defvar org-auto-scheduler--run-start-time)
+(defvar org-auto-scheduler-silent-mode)
+
 (declare-function org-auto-scheduler-reschedule-past-tasks-to-today "org-auto-scheduler" (&optional target-date scope))
 (declare-function org-auto-scheduler-schedule-tasks "org-auto-scheduler" (&optional force-replan))
 (declare-function org-auto-scheduler--call-with-caldav-session "org-auto-scheduler" (fn))

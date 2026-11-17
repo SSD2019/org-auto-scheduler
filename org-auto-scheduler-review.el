@@ -14,6 +14,17 @@
 (require 'org)
 (require 'cl-lib)
 (require 'org-auto-scheduler-log)
+
+;; Defined in org-auto-scheduler.el.  This file let-binds them, so they must be
+;; declared special here too: without the declaration the byte compiler makes
+;; those bindings lexical, and e.g. the review preview would write to Org files
+;; when this file is compiled.
+(defvar org-auto-scheduler--preview-mode)
+(defvar org-auto-scheduler--ignore-blockers-p)
+(defvar org-auto-scheduler--ignore-saved-skips-p)
+(defvar org-auto-scheduler--ignore-target-dates-p)
+(defvar org-auto-scheduler--reordering-p)
+(defvar org-auto-scheduler-max-days-to-check)
 (require 'tabulated-list)
 (require 'color)
 
@@ -28,7 +39,11 @@
 (defvar org-auto-scheduler-sync-caldav)
 (defvar org-auto-scheduler--caldav-pull-done)
 
-(unless (fboundp 'org-auto-scheduler--with-active-operation)
+;; `eval-and-compile' so the byte compiler knows this is a macro: inside a plain
+;; `unless' it never saw the definition and compiled every use as a function
+;; call, which fails at run time with `invalid-function'.
+(eval-and-compile
+ (unless (fboundp 'org-auto-scheduler--with-active-operation)
   (defmacro org-auto-scheduler--with-active-operation (op-name &rest body)
     "Execute BODY with `org-auto-scheduler--active-operation` bound to OP-NAME."
     (declare (indent 1) (debug t))
@@ -39,7 +54,7 @@
              (progn
                (setq org-auto-scheduler--active-operation ,op-name)
                ,@body)
-           (setq org-auto-scheduler--active-operation ,prev-op))))))
+           (setq org-auto-scheduler--active-operation ,prev-op)))))))
 
 (defcustom org-auto-scheduler-review-show-agenda-events t
   "If non-nil, display existing fixed agenda events (non-AUTOSCH) in the review buffer."

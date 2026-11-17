@@ -32,5 +32,5 @@ jobs:
       - name: Test
         run: make test
 
-      - name: Byte-compile
-        run: make compile
+      - name: Test byte-compiled
+        run: make test-compiled
