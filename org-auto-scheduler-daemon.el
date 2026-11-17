@@ -625,7 +625,13 @@ TASKS-INFO is a list of task-info structures from `org-auto-scheduler-sort-tasks
                                    (when (string-match "Part \\([0-9]+\\)" hd)
                                      (string-to-number (match-string 1 hd)))
                                    1))
-                     (ph-id (and origin-id (format "%s-remaining-%d" origin-id part-num)))
+                     ;; Same id the scheduler gives this part, so the run's
+                     ;; entry for it is matched (Pomodoro parts differ).
+                     (ph-id (and origin-id
+                                 (format (if (org-auto-scheduler-get-task-pomodoro-spec nil origin-id)
+                                             "%s-pomodoro-%d"
+                                           "%s-remaining-%d")
+                                         origin-id part-num)))
                      (sched (org-entry-get nil "SCHEDULED"))
                      (tags (org-get-tags))
                      (m (point-marker)))
@@ -746,6 +752,34 @@ Returns a list of change plists."
                         :marker-actions (nreverse marker-actions)
                         :split-today split-today)
                   changes)))))
+    ;; A placeholder part whose parent was placed this run but that the run no
+    ;; longer produced is deleted on commit (fewer parts needed, or none).
+    ;; Without recording it, a dry run that only drops parts finds no change
+    ;; and never commits, leaving the stale parts in place.
+    (when (hash-table-p initial-snapshot)
+      (let ((placed (make-hash-table :test 'equal)))
+        (dolist (ct completed-tasks)
+          (unless (memq (nth 9 ct) '(:failed :blocked :skipped :placeholder))
+            (puthash (nth 0 ct) t placed)))
+        (maphash
+         (lambda (tid entry)
+           (when (and (plist-get entry :is-placeholder)
+                      (not (gethash tid seen-ids))
+                      (gethash (plist-get entry :origin-id) placed))
+             (puthash tid t seen-ids)
+             (push (list :task-id tid
+                         :headline (plist-get entry :headline)
+                         :orig-headline (plist-get entry :headline)
+                         :file (plist-get entry :file)
+                         :marker nil
+                         :schedule-changed t
+                         :schedule-change-type :unscheduled
+                         :orig-scheduled (plist-get entry :scheduled)
+                         :final-scheduled nil
+                         :marker-actions '("Removed remaining split part")
+                         :split-today nil)
+                   changes)))
+         initial-snapshot)))
     (when (hash-table-p marker-data)
       (maphash
        (lambda (tid m-res)
