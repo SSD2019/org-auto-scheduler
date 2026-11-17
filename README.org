@@ -1077,8 +1077,24 @@ agenda's own overdue display.
 - After a manual run the echo area says, for example,
   =⚠ 2 tasks will miss their deadline: Long report, Release notes=.
 - The review buffer header shows =⚠ N will miss deadline=.
-- =M-x org-auto-scheduler-deadline-risks= (or =R= in the dispatch menu) lists each
-  task with its deadline and planned finish; =RET= jumps to the task.
+- =M-x org-auto-scheduler-deadline-risks= (or =R= in the dispatch menu) re-plans
+  (a preview; nothing is written) and lists each task with its deadline, planned
+  finish and how late it is. Fix a task right from the list:
+
+  | Key       | Action                                                        |
+  |-----------+---------------------------------------------------------------|
+  | =RET=, =TAB= | Jump to the task                                           |
+  | =+=       | Raise its priority one step (C → B → A)                       |
+  | =e=       | Set its Effort (=1:30= or =90=)                               |
+  | =d=       | Move its deadline (Org date prompt)                           |
+  | =s=       | Toggle SPLITTABLE, so it can use free gaps across days        |
+  | =g=       | Re-plan and redraw                                            |
+  | =n= / =p= | Next / previous task                                          |
+
+  Each change edits the task in its Org file (left unsaved, like any edit),
+  re-plans, and says whether the task is still at risk, for example
+  =Report: priority A — no longer at risk.= If fixing one task pushes another past
+  its deadline, that task appears in the list instead.
 
 This complements the =⛔ DEADLINE INFEASIBLE= badge, which only covers tasks in a
 dependency chain (critical-path float).

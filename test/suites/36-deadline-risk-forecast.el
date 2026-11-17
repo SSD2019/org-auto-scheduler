@@ -71,8 +71,7 @@
   (assert-equal (org-auto-scheduler--deadline-risk-summary)
                 "1 task will miss its deadline: Long report"
                 "Test 36.8: The end-of-run summary names the task")
-  (cl-letf (((symbol-function 'pop-to-buffer) #'ignore))
-    (org-auto-scheduler-deadline-risks))
+  (org-auto-scheduler--deadline-risks-render)
   (assert-true (with-current-buffer "*Org Auto Scheduler Deadline Risks*"
                  (string-match-p "Long report" (buffer-string)))
                "Test 36.9: The report buffer lists the task")
