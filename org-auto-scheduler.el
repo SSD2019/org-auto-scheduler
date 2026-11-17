@@ -663,7 +663,9 @@ to the next day in its entirety rather than being split into small fragments."
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-split-property "SPLITTABLE"
-  "Org headline property used to mark a task as splittable."
+  "Legacy Org property that older versions set to mark a task splittable.
+It no longer makes a task splittable: `org-auto-scheduler-splittable-tag'
+is the switch.  Turning splitting off still deletes this property."
   :type 'string
   :group 'org-auto-scheduler)
 
@@ -3447,7 +3449,6 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                 (let ((tags (delete org-auto-scheduler-splittable-tag (org-get-tags nil t))))
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
                (is-split-on
-                (org-set-property org-auto-scheduler-split-property "t")
                 (let ((tags (org-get-tags nil t)))
                   (cl-pushnew org-auto-scheduler-splittable-tag tags :test #'string=)
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))
@@ -4893,8 +4894,9 @@ If only HH:MM is specified, uses the date from MARKER, review override, or today
 
 (defun org-auto-scheduler-task-splittable-p (marker &optional task-id)
   "Return non-nil if task at MARKER or TASK-ID is marked as splittable.
-Checks review overrides, tags (`org-auto-scheduler-splittable-tag'),
-or property (`org-auto-scheduler-split-property')."
+Checks review overrides, then the tag (`org-auto-scheduler-splittable-tag').
+The tag is the switch: removing it by hand turns splitting off.  A leftover
+`org-auto-scheduler-split-property' no longer counts on its own."
   (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
                             (org-with-point-at marker (org-id-get)))))
          (override (org-auto-scheduler--get-review-override tid)))
@@ -4903,10 +4905,7 @@ or property (`org-auto-scheduler-split-property')."
       (plist-get override :splittable))
      ((and marker (markerp marker) (marker-buffer marker))
       (org-with-point-at marker
-        (let* ((tags (org-get-tags))
-               (prop (org-entry-get nil org-auto-scheduler-split-property)))
-          (or (member org-auto-scheduler-splittable-tag tags)
-              (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))))))
+        (and (member org-auto-scheduler-splittable-tag (org-get-tags)) t)))
      (t nil))))
 
 (defun org-auto-scheduler-task-freeset-p (marker &optional task-id)
@@ -4983,8 +4982,8 @@ Returns non-nil if now freeset."
 
 (defun org-auto-scheduler-task-toggle-splittable (&optional marker task-id)
   "Toggle SPLITTABLE status of task at MARKER or TASK-ID.
-Adds or removes `org-auto-scheduler-splittable-tag' and sets/clears
-`org-auto-scheduler-split-property'. Also updates review overrides.
+Adds or removes `org-auto-scheduler-splittable-tag'; turning it off also
+deletes a legacy `org-auto-scheduler-split-property'.  Also updates review overrides.
 Returns non-nil if task is now splittable, nil otherwise."
   (let* ((m (or marker
                 (when (and task-id (stringp task-id))
@@ -5010,8 +5009,7 @@ Returns non-nil if task is now splittable, nil otherwise."
             (cl-pushnew org-auto-scheduler-splittable-tag tags :test #'string=)
             (if (fboundp 'org-set-tags-to)
                 (org-set-tags-to tags)
-              (org-set-tags tags))
-            (org-set-property org-auto-scheduler-split-property "t")))
+              (org-set-tags tags))))
         (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
           (let ((over (gethash tid org-auto-scheduler--review-overrides)))
             (puthash tid (plist-put over :splittable new-split)
@@ -5776,7 +5774,6 @@ Safeguards:
                              (parent-is-splittable (when parent-exists
                                                      (org-with-point-at parent-marker
                                                        (or (member org-auto-scheduler-splittable-tag (org-get-tags))
-                                                           (org-entry-get nil "SPLITTABLE")
                                                            (org-auto-scheduler-get-task-pomodoro-spec parent-marker origin-id)))))
                              (clocks '()))
                         ;; Extract CLOCK lines from LOGBOOK if any

@@ -3998,10 +3998,8 @@ The remaining effort is scheduled for subsequent days via splittable placeholder
             ;; Mark parent task as splittable
             (when (and marker (markerp marker) (marker-buffer marker))
               (org-with-point-at marker
-                (unless (or (member org-auto-scheduler-splittable-tag (org-get-tags))
-                            (org-entry-get nil "SPLITTABLE"))
-                  (org-toggle-tag org-auto-scheduler-splittable-tag 'on)
-                  (org-set-property "SPLITTABLE" "t"))))
+                (unless (member org-auto-scheduler-splittable-tag (org-get-tags))
+                  (org-toggle-tag org-auto-scheduler-splittable-tag 'on))))
             ;; Record override for review recalculation
             (let ((over (or (gethash task-id org-auto-scheduler--review-overrides)
                             (list :order nil :skipped nil))))
