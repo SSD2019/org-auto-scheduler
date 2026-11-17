@@ -287,4 +287,28 @@ SCHEDULED: <2026-01-05 Mon 10:10-10:40>
   (assert-equal (t40-parts file) nil
                 "Test 40.10: parts are removed once the parent loses AUTOSCH"))
 
+;;; 40.11 The tag is the switch: removing it by hand turns splitting off even
+;;; when an older :SPLITTABLE: t property is still in the drawer.
+(defconst t40-untagged-with-prop
+  (concat (replace-regexp-in-string
+           ":SPLITTABLE:AUTOSCH:" ":AUTOSCH:"
+           (replace-regexp-in-string ":AUTOSCH_SCHEDULED: t\n" ":AUTOSCH_SCHEDULED: t\n:SPLITTABLE: t\n"
+                                     (t40-parent "11:00") t)
+           t)
+          t40-fragmented))
+
+(t40-with-file t40-untagged-with-prop
+  (assert-equal (t40-parts file) nil
+                "Test 40.11: parts are removed once the tag is gone (direct run)")
+  (assert-true (not (org-auto-scheduler-task-splittable-p
+                     (with-current-buffer (find-file-noselect file)
+                       (goto-char (point-min))
+                       (re-search-forward "^\\*\\* TODO Big")
+                       (point-marker))))
+               "Test 40.11: a leftover :SPLITTABLE: t property alone is not splittable"))
+
+(t40-with-daemon-file t40-untagged-with-prop
+  (assert-equal (t40-parts file) nil
+                "Test 40.11: parts are removed once the tag is gone (daemon run)"))
+
 ;;; 40-kept-split-parts-rebalance.el ends here

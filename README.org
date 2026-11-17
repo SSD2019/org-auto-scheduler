@@ -271,7 +271,6 @@ These properties go inside the task's =:PROPERTIES:= drawer.
 |---------------------------+-------------------------------------------------+------------------------------------------------------------------------------------|
 | =NOT_BEFORE=              | Org timestamp (e.g. =<2025-06-01 Sun 09:00>=)  | Earliest allowed scheduling time for this task.                                    |
 | =RECURRING=               | =daily= / =weekly= / =bi-weekly= / =monthly=   | Creates sub-task instances for each upcoming occurrence.                           |
-| =SPLITTABLE=              | =t= / =yes=                                     | Allows task to be split across days if remaining effort exceeds available time.    |
 | =MIN_CHUNK=               | Integer (minutes)                               | Minimum duration required for today's slice of a splittable task (default: 30).    |
 | =PINNABLE=                | =t= / =yes=                                     | Marks task as pinnable to a specific time during review reordering.                |
 | =PINNED_TIME=             | =HH:MM= or =YYYY-MM-DD HH:MM=                   | Pinned start time (allows exceeding day hours, splits at midnight if needed).     |
@@ -646,7 +645,7 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | *Pin Task*                            | =P=, =p=                      | =P=                  | Prompt for time; pre-filled with preview; =C-u= unpins  |
 | *Move Before Task*                    | =O=                           | =O=                  | Pick target task by name (keyboard drag)                |
 | *Toggle Non-Blocking (Fixed Events)*  | =B=, =b=                      | =B=                  | Toggle 🔒 on fixed agenda event                         |
-| *Toggle SPLITTABLE*                   | =s=                           | =s=                  | Toggle =[s]= property (splits across gaps/days)         |
+| *Toggle SPLITTABLE*                   | =s=                           | =s=                  | Toggle the =SPLITTABLE= tag (splits across gaps/days)   |
 | *Toggle FREESET*                      | =F=                           | =F=                  | Toggle ⚡ property (off-hours flexible; midnight split)  |
 | *Edit Effort (What-If)*               | =e=                           | =e=                  | Edit effort in minutes (redirects chunks to parent)     |
 | *Undo Review Action*                  | =U=, =u=                      | =U=                  | Restore overrides, entries, and tasks; refresh grid     |
@@ -806,8 +805,8 @@ You can add lightweight modifier markers directly to the task title in any calen
 | Marker | Flag | Effect |
 |--------+------+--------|
 | =-r-= or =(-r-)= | *Reschedule Cascade* | Reschedules this task and all subsequent tasks today in their previously scheduled relative order. Tasks scheduled before it remain preserved. Pinned tasks stay fixed at their =PINNED_TIME=. |
-| =-s-= or =(-s-)= | *Enable Splittable* | Marks the task as =SPLITTABLE= (sets =:SPLITTABLE: t= and adds =:SPLITTABLE:= tag). |
-| =-\s-= or =(-\s-)= | *Remove Splittable* | Unsets the =SPLITTABLE= behavior (deletes =:SPLITTABLE:= property and removes =:SPLITTABLE:= tag). |
+| =-s-= or =(-s-)= | *Enable Splittable* | Marks the task as =SPLITTABLE= (adds the =:SPLITTABLE:= tag). |
+| =-\s-= or =(-\s-)= | *Remove Splittable* | Unsets the =SPLITTABLE= behavior (removes the =:SPLITTABLE:= tag and any legacy =:SPLITTABLE:= property). |
 | =-f-= or =(-f-)= | *Enable Freeset* | Marks the task as =FREESET= (allows scheduling outside normal workday hours or across midnight; sets property and tag). |
 | =-\f-= or =(-\f-)= | *Remove Freeset* | Unsets the =FREESET= behavior (deletes =:FREESET:= and =:PINNABLE:= properties and removes tags). |
 | =-p-= or =(-p-)= | *Pin Task* | Pins the task to the incoming/updated scheduled time (sets =:PINNED: t=, records =:PINNED_TIME:=, adds =:PINNED:= tag), locking it from being moved. |
@@ -937,7 +936,7 @@ When a large task has more remaining effort than fits in an available time windo
 
 *** Enabling Splittable Tasks
 
-You can mark a task as splittable with the =:SPLITTABLE:= tag or property:
+You can mark a task as splittable with the =:SPLITTABLE:= tag:
 
 #+begin_src org
 * TODO Deep Research & Architecture Document :AUTOSCH:SPLITTABLE:
@@ -947,7 +946,7 @@ You can mark a task as splittable with the =:SPLITTABLE:= tag or property:
   :END:
 #+end_src
 
-- Tag =:SPLITTABLE:= (or property =:SPLITTABLE: t=) marks the task as splittable.
+- Tag =:SPLITTABLE:= marks the task as splittable. The tag is the switch: removing it (by hand, with =-\s-=, or =s= in the review buffer) turns splitting off and removes the task's remaining parts on the next run. A =:SPLITTABLE: t= property left by older versions is ignored.
 - =:MIN_CHUNK:= (optional) specifies the minimum minutes required to schedule a slice (defaults to =org-auto-scheduler-split-min-chunk=, 30m). If an available slot is smaller than this minimum chunk, the task skips that gap and seeks the next available slot meeting the minimum chunk threshold.
 
 *** Intra-Day & Multi-Day Rolling Split
@@ -1240,7 +1239,7 @@ Same format as time blocks, but these are preferences, not hard constraints.
 | Variable                                | Default                 | Description                                                                 |
 |-----------------------------------------+-------------------------+-----------------------------------------------------------------------------|
 | =org-auto-scheduler-splittable-tag=     | ="SPLITTABLE"=          | Tag marking a task as eligible for split scheduling across days.            |
-| =org-auto-scheduler-split-property=     | ="SPLITTABLE"=          | Property name marking a task as eligible for split scheduling.              |
+| =org-auto-scheduler-split-property=     | ="SPLITTABLE"=          | Legacy property: ignored (the tag decides), removed when unsplit.           |
 | =org-auto-scheduler-split-min-chunk=    | =30=                    | Minimum duration (in minutes) to schedule for a split task slice today.     |
 | =org-auto-scheduler-min-chunk-property= | ="MIN_CHUNK"=           | Property name specifying per-task minimum chunk duration in minutes.        |
 | =org-auto-scheduler-placeholder-tag=   | ="AUTOSCH_PLACEHOLDER"= | Tag assigned to temporary next-day/subsequent placeholder subtasks.         |
