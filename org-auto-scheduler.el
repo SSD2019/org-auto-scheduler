@@ -435,10 +435,11 @@ and org-auto-scheduler-recurring-look-days-ahead."
 (defvaralias 'org-auto-scheduler-habit-integration 'org-auto-scheduler-repeater-integration)
 (defvaralias 'org-auto-scheduler-habit-look-days-ahead 'org-auto-scheduler-repeater-look-days-ahead)
 
-(defvar org-auto-scheduler--replan-ids (make-hash-table :test 'equal)
-  "Task IDs to re-place even if they have a slot that would normally be kept.
-Set when a task is edited from the deadline-risk list.  Every run honours
-it; a real (non-preview) run clears it once it has placed the tasks.")
+(defconst org-auto-scheduler--replan-property "AUTOSCH_REPLAN"
+  "Property marking a task to re-place even if it has a slot that would be kept.
+Set when a task is edited from the deadline-risk list.  It is stored on the
+task, so it survives a restart; every run honours it and the next real
+(non-preview) run removes it once it has placed the task.")
 
 (defvar org-auto-scheduler--deadline-candidates nil
   "Task infos with the data the last run computed deadline risks from.
@@ -3847,13 +3848,19 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
   :today-scheduled   entries whose current slot may be kept, by start time
   :tasks-to-schedule task-infos that need a slot, in priority order
   :has-r-all         non-nil if a -r-all- marker was found
-  :past-deadline     non-nil if a kept slot falls after its deadline."
+  :past-deadline     non-nil if a kept slot falls after its deadline
+  :replan-until      latest deadline of tasks marked for re-placement,
+                     t if one has no deadline, nil if none is marked."
   (let ((today-scheduled '())
         (tasks-to-schedule '())
         (has-r-all nil)
         (has-slot-past-deadline nil)
-        ;; Tasks the previous run already found late.  Re-placing them again
-        ;; cannot help and would re-plan today's other tasks on every run.
+        ;; Latest deadline among tasks marked for re-placement (see
+        ;; `org-auto-scheduler--replan-property'), or t if one has none.
+        (replan-until nil)
+        ;; Tasks the previous run already found late.  They are still re-placed
+        ;; (so they move up as soon as time frees), but on their own: re-planning
+        ;; today's other tasks for them again would just repeat on every run.
         (prev-late (cl-loop for r in org-auto-scheduler--deadline-risks
                             when (eq (plist-get r :reason) 'late)
                             collect (plist-get r :id))))
@@ -3900,16 +3907,24 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
                                    (org-auto-scheduler--task-scheduled-time marker today-str)
                                  (org-auto-scheduler--task-scheduled-today-p marker today-str))))
                  (is-kept-past-deadline (and kept-times
-                                             (not (member task-id prev-late))
                                              (org-auto-scheduler--slot-misses-deadline-p
                                               marker task-id (car kept-times) today-str
                                               (cdr kept-times))))
-                 (_ (when is-kept-past-deadline (setq has-slot-past-deadline t)))
+                 ;; Only a newly late task re-plans today's other tasks.
+                 (_ (when (and is-kept-past-deadline (not (member task-id prev-late)))
+                      (setq has-slot-past-deadline t)))
                  ;; A kept slot on a day off (e.g. a vacation added later) moves.
                  (is-on-day-off (and kept-times
                                      (org-auto-scheduler--day-off-p (car kept-times))
                                      (not (org-auto-scheduler-task-pinned-p marker task-id))))
-                 (is-replan (and task-id (gethash task-id org-auto-scheduler--replan-ids)))
+                 (is-replan (org-entry-get marker org-auto-scheduler--replan-property))
+                 (_ (when is-replan
+                      (let ((dl (org-auto-scheduler--deadline-time marker)))
+                        (setq replan-until
+                              (cond ((null replan-until) (or dl t))
+                                    ((or (eq replan-until t) (null dl)) replan-until)
+                                    ((time-less-p replan-until dl) dl)
+                                    (t replan-until))))))
                  ;; A slot after a still-reachable deadline is re-placed, not kept
                  (sched-times (unless (or is-kept-past-deadline is-on-day-off is-replan)
                                 kept-times))
@@ -3962,7 +3977,8 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
     (list :today-scheduled today-scheduled
           :tasks-to-schedule tasks-to-schedule
           :has-r-all has-r-all
-          :past-deadline has-slot-past-deadline)))
+          :past-deadline has-slot-past-deadline
+          :replan-until replan-until)))
 
 (defun org-auto-scheduler--evict-invalid-preserved (preserved-entries final-schedule-list
                                                      sorted-tasks-info has-r-trigger now)
@@ -4299,6 +4315,7 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                                 '(background-async background-sync)))))
                  (lapsed-ids (make-hash-table :test 'equal)) ; task-id -> 'clocked / 'lapsed
                  (has-slot-past-deadline nil)
+                 (replan-until nil)
                  (run-backfilled-slots (make-hash-table :test 'equal)))
 
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
@@ -4324,7 +4341,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
               (setq today-scheduled (plist-get classified :today-scheduled)
                     tasks-to-schedule (plist-get classified :tasks-to-schedule))
               (when (plist-get classified :has-r-all) (setq has-r-all t))
-              (when (plist-get classified :past-deadline) (setq has-slot-past-deadline t)))
+              (when (plist-get classified :past-deadline) (setq has-slot-past-deadline t))
+  (setq replan-until (plist-get classified :replan-until)))
 
             ;; 3. Determine trigger mode:
             ;;    - has-priority-or-indep-trigger: priority (-#A-) or independent (-i-) marker set on task
@@ -4399,6 +4417,10 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                    (has-unscheduled
                     (and preserve-today
                          (or has-slot-past-deadline
+                             ;; A re-plan request (e.g. priority raised from the
+                             ;; deadline-risk list) re-plans the unpinned tasks
+                             ;; around it, so it can take their place.
+                             replan-until
                              (cl-some #'org-auto-scheduler--task-unscheduled-p tasks-to-schedule))))
                    (has-lapsed
                     (> (hash-table-count lapsed-ids) 0))
@@ -4475,7 +4497,12 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                    (plist-get e :pinned)
                                    (and org-auto-scheduler-preserve-future-scheduled
                                         (not has-lapsed)
-                                        (not (plist-get e :is-today)))))
+                                        (not (plist-get e :is-today))
+                                        ;; ...except unpinned slots a re-plan
+                                        ;; request may need: before its deadline.
+                                        (not (and replan-until st
+                                                  (or (eq replan-until t)
+                                                      (time-less-p st replan-until)))))))
                           (push e preserved-entries)
                         ;; Upcoming unpinned task for today OR conflicting task: mark as eligible for rescheduling
                         (puthash tid t reschedule-task-ids))))
@@ -4560,8 +4587,13 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
               (setq org-auto-scheduler--deadline-candidates sorted-tasks-info
                     org-auto-scheduler--deadline-risks
                     (org-auto-scheduler--compute-deadline-risks sorted-tasks-info now))
+              ;; A real run has now placed every task marked for re-placement.
               (unless org-auto-scheduler--preview-mode
-                (clrhash org-auto-scheduler--replan-ids))
+                (dolist (ti sorted-tasks-info)
+                  (let ((m (car ti)))
+                    (when (and (markerp m) (marker-buffer m)
+                               (org-entry-get m org-auto-scheduler--replan-property))
+                      (org-entry-delete m org-auto-scheduler--replan-property)))))
               (when (and org-auto-scheduler--deadline-risks
                          (not org-auto-scheduler-silent-mode))
                 (message "⚠ %s  [M-x org-auto-scheduler-deadline-risks]"
@@ -6949,9 +6981,11 @@ Leave point on the task KEEP-ID if it is still listed, else on the first task."
 
 (defun org-auto-scheduler--deadline-risks-after-edit (risk what)
   "Re-plan after WHAT was changed on RISK's task, redraw, and report the outcome.
-The task is marked for re-placement (`org-auto-scheduler--replan-ids'), so
-its current slot is not simply kept; the next real run writes the new one."
-  (puthash (plist-get risk :id) t org-auto-scheduler--replan-ids)
+The task is marked for re-placement (`org-auto-scheduler--replan-property'),
+so its current slot is not simply kept; the next real run writes the new one
+and removes the mark."
+  (let ((m (org-auto-scheduler--deadline-risks-marker risk)))
+    (org-entry-put m org-auto-scheduler--replan-property "t"))
   (org-auto-scheduler--deadline-risks-rerun)
   (org-auto-scheduler--deadline-risks-render (plist-get risk :id))
   (let* ((id (plist-get risk :id))

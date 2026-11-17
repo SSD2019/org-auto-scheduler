@@ -232,3 +232,79 @@ Time is Mon 2026-01-05 08:00 unless BODY rebinds `test-fixed-now'."
       (assert-true (and (string< (car before) (cadr before))
                         (string< (t39-sched file "Second") (t39-sched file "First")))
                    "Test 39.5b: In a parallel project, raising priority reorders on the second run"))))
+
+;;; Follow-up A: a known-late task still moves up once time frees, without
+;;; re-planning anything else (preserve-future on, as in #3).
+(t39-with-file (concat t39-meeting
+                       "* TODO Long report :AUTOSCH:\nDEADLINE: <2026-01-05 Mon>\n"
+                       ":PROPERTIES:\n:ID: t39-late2\n:Effort: 7:00\n:END:\n")
+  (let ((org-auto-scheduler-preserve-future-scheduled t))
+    (org-auto-scheduler-schedule-tasks)
+    (let ((first (t39-sched file "Long report")))
+      (org-auto-scheduler-schedule-tasks)
+      (assert-equal (list first (t39-sched file "Long report"))
+                    '("<2026-01-06 Tue 09:00-16:00>" "<2026-01-06 Tue 09:00-16:00>")
+                    "Test 39.7a: A late task with no better slot stays where it is")
+      ;; The meeting is cancelled: today now has room.
+      (with-current-buffer (get-file-buffer file)
+        (goto-char (point-min))
+        (re-search-forward "^\\* Planning meeting")
+        (org-cut-subtree))
+      (org-auto-scheduler-schedule-tasks)
+      (assert-equal (list (t39-sched file "Long report") (t39-risk-ids))
+                    '("<2026-01-05 Mon 09:00-16:00>" nil)
+                    "Test 39.7b: Once time frees up, the late task moves before its deadline"))))
+
+;;; Follow-up B: a re-plan request from the risk list survives a restart and
+;;; is removed by the next real run.
+(t39-with-file (concat t39-meeting
+                       "* TODO Review :AUTOSCH:\n"
+                       "SCHEDULED: <2026-01-05 Mon 12:05-16:05> DEADLINE: <2026-01-05 Mon 15:00>\n"
+                       ":PROPERTIES:\n:ID: t39-hint\n:Effort: 4:00\n:AUTOSCH_SCHEDULED: t\n:END:\n")
+  (cl-letf (((symbol-function 'pop-to-buffer) #'ignore))
+    (org-auto-scheduler-deadline-risks)
+    (with-current-buffer org-auto-scheduler--deadline-risks-buffer
+      (org-auto-scheduler-deadline-risks-set-effort "2:00")))
+  ;; "Restart": save, close the file, forget in-memory state, reopen.
+  (with-current-buffer (get-file-buffer file) (save-buffer) (kill-buffer))
+  (setq org-auto-scheduler--deadline-risks nil
+        org-auto-scheduler--deadline-candidates nil)
+  (assert-true (string-match-p ":AUTOSCH_REPLAN: t" (t39-disk file))
+               "Test 39.8a: The re-plan request is stored in the file")
+  (find-file-noselect file)
+  (org-auto-scheduler-schedule-tasks)
+  (assert-equal (list (t39-sched file "Review")
+                      (with-current-buffer (get-file-buffer file)
+                        (goto-char (point-min))
+                        (and (search-forward "AUTOSCH_REPLAN" nil t) t)))
+                '("<2026-01-05 Mon 12:05-14:05>" nil)
+                "Test 39.8b: After a restart the next real run re-places the task and drops the request"))
+
+;;; Follow-up C (#4.2, third point): with preserve-future-scheduled on, raising
+;;; a late task's priority from the risk list may displace an unpinned
+;;; lower-priority task already booked before its deadline; pinned tasks stay.
+(t39-with-file (concat t39-meeting
+                       "* TODO [#C] Other work :AUTOSCH:\n"
+                       "SCHEDULED: <2026-01-06 Tue 09:00-13:00>\n"
+                       ":PROPERTIES:\n:ID: t39-other\n:Effort: 4:00\n:AUTOSCH_SCHEDULED: t\n:END:\n"
+                       "* TODO [#C] Pinned call :AUTOSCH:\n"
+                       "SCHEDULED: <2026-01-06 Tue 16:00-16:30>\n"
+                       ":PROPERTIES:\n:ID: t39-pin\n:Effort: 0:30\n:PINNED: t\n"
+                       ":PINNED_TIME: 2026-01-06 16:00\n:AUTOSCH_SCHEDULED: t\n:END:\n"
+                       "* TODO [#B] Report :AUTOSCH:\nDEADLINE: <2026-01-06 Tue>\n"
+                       ":PROPERTIES:\n:ID: t39-report\n:Effort: 6:00\n:END:\n")
+  (let ((org-auto-scheduler-preserve-future-scheduled t))
+    (cl-letf (((symbol-function 'pop-to-buffer) #'ignore))
+      (org-auto-scheduler-deadline-risks)
+      (with-current-buffer org-auto-scheduler--deadline-risks-buffer
+        (assert-equal (t39-risk-ids) '("t39-report")
+                      "Test 39.9a: The report is late behind a booked lower-priority task")
+        (org-auto-scheduler-deadline-risks-raise-priority)
+        (assert-equal (t39-risk-ids) nil
+                      "Test 39.9b: Raising its priority lets it take that task's slot")))
+    (org-auto-scheduler-schedule-tasks)
+    (assert-equal (list (t39-sched file "Report") (t39-sched file "Other work")
+                        (t39-sched file "Pinned call"))
+                  '("<2026-01-06 Tue 09:00-15:00>" "<2026-01-05 Mon 12:05-16:05>"
+                    "<2026-01-06 Tue 16:00-16:30>")
+                  "Test 39.9c: The real run writes it; the displaced task moves, the pinned one stays")))
