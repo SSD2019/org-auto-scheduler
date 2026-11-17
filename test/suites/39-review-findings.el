@@ -279,3 +279,32 @@ Time is Mon 2026-01-05 08:00 unless BODY rebinds `test-fixed-now'."
                         (and (search-forward "AUTOSCH_REPLAN" nil t) t)))
                 '("<2026-01-05 Mon 12:05-14:05>" nil)
                 "Test 39.8b: After a restart the next real run re-places the task and drops the request"))
+
+;;; Follow-up C (#4.2, third point): with preserve-future-scheduled on, raising
+;;; a late task's priority from the risk list may displace an unpinned
+;;; lower-priority task already booked before its deadline; pinned tasks stay.
+(t39-with-file (concat t39-meeting
+                       "* TODO [#C] Other work :AUTOSCH:\n"
+                       "SCHEDULED: <2026-01-06 Tue 09:00-13:00>\n"
+                       ":PROPERTIES:\n:ID: t39-other\n:Effort: 4:00\n:AUTOSCH_SCHEDULED: t\n:END:\n"
+                       "* TODO [#C] Pinned call :AUTOSCH:\n"
+                       "SCHEDULED: <2026-01-06 Tue 16:00-16:30>\n"
+                       ":PROPERTIES:\n:ID: t39-pin\n:Effort: 0:30\n:PINNED: t\n"
+                       ":PINNED_TIME: 2026-01-06 16:00\n:AUTOSCH_SCHEDULED: t\n:END:\n"
+                       "* TODO [#B] Report :AUTOSCH:\nDEADLINE: <2026-01-06 Tue>\n"
+                       ":PROPERTIES:\n:ID: t39-report\n:Effort: 6:00\n:END:\n")
+  (let ((org-auto-scheduler-preserve-future-scheduled t))
+    (cl-letf (((symbol-function 'pop-to-buffer) #'ignore))
+      (org-auto-scheduler-deadline-risks)
+      (with-current-buffer org-auto-scheduler--deadline-risks-buffer
+        (assert-equal (t39-risk-ids) '("t39-report")
+                      "Test 39.9a: The report is late behind a booked lower-priority task")
+        (org-auto-scheduler-deadline-risks-raise-priority)
+        (assert-equal (t39-risk-ids) nil
+                      "Test 39.9b: Raising its priority lets it take that task's slot")))
+    (org-auto-scheduler-schedule-tasks)
+    (assert-equal (list (t39-sched file "Report") (t39-sched file "Other work")
+                        (t39-sched file "Pinned call"))
+                  '("<2026-01-06 Tue 09:00-15:00>" "<2026-01-05 Mon 12:05-16:05>"
+                    "<2026-01-06 Tue 16:00-16:30>")
+                  "Test 39.9c: The real run writes it; the displaced task moves, the pinned one stays")))
