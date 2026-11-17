@@ -310,6 +310,11 @@ and org-auto-scheduler-recurring-look-days-ahead."
 (defvaralias 'org-auto-scheduler-habit-integration 'org-auto-scheduler-repeater-integration)
 (defvaralias 'org-auto-scheduler-habit-look-days-ahead 'org-auto-scheduler-repeater-look-days-ahead)
 
+(defvar org-auto-scheduler--inhibit-yield nil
+  "When non-nil, a background run must not yield to other threads.
+Bound while the background runner writes to Org buffers, so user edits
+cannot interleave with a half-applied schedule.")
+
 (defvar org-auto-scheduler--preview-mode nil
   "When non-nil, task schedules are only calculated and saved, not applied to the Org buffer.")
 
@@ -4205,7 +4210,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                task-finish-times))))
                 (dolist (task-info final-schedule-list)
                   ;; Cooperative yield if running in a background worker thread
-                  (when (and (fboundp 'thread-yield)
+                  (when (and (not org-auto-scheduler--inhibit-yield)
+                             (fboundp 'thread-yield)
                              (fboundp 'current-thread)
                              (fboundp 'main-thread)
                              (not (eq (current-thread) (main-thread))))
