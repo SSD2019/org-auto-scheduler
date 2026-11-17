@@ -359,7 +359,8 @@ the user cannot edit a buffer while it is half-written, and return t."
                                                  (org-auto-scheduler--agenda-has-title-markers-p))
                                          (org-auto-scheduler-schedule-tasks)
                                          (setq direct-done t))))))
-                         (setq wrote (or direct-done (> resched-past-count 0))))
+                         (setq wrote (or (and direct-done org-auto-scheduler--last-run-changes t)
+                                         (> resched-past-count 0))))
                      ;; Two-Phase Execution:
                      ;; Phase 1: in-memory dry run (may yield to the UI).
                      (unless (or direct-done direct-blocked)
@@ -369,12 +370,16 @@ the user cannot edit a buffer while it is half-written, and return t."
                        ;; and disk mtimes / buffer clean state remain unchanged.
                        (if (and org-auto-scheduler--last-run-changes
                                 (> (length org-auto-scheduler--last-run-changes) 0))
+                           ;; Count it as written only if the commit itself changed
+                           ;; something; that drives saving and the notification.
                            (setq wrote
-                                 (org-auto-scheduler--daemon-write
-                                  mtime-snapshot
-                                  (lambda ()
-                                    (let ((org-auto-scheduler--preview-mode nil))
-                                      (org-auto-scheduler-schedule-tasks)))))
+                                 (and (org-auto-scheduler--daemon-write
+                                       mtime-snapshot
+                                       (lambda ()
+                                         (let ((org-auto-scheduler--preview-mode nil))
+                                           (org-auto-scheduler-schedule-tasks))))
+                                      org-auto-scheduler--last-run-changes
+                                      t))
                          ;; Only push when nothing changed locally during the dry-run.
                          ;; If changes were detected but disk mtimes moved, skip: the
                          ;; next run re-evaluates against the fresh files.
@@ -593,7 +598,12 @@ Returns a list of change plists."
              (file (or (and init-entry (plist-get init-entry :file))
                        (and (markerp marker) (buffer-file-name (marker-buffer marker)))))
              (m-res (and tid marker-data (gethash tid marker-data)))
-             (sched-changed (not (org-auto-scheduler--timestamps-equal-p orig-sched final-sched)))
+             ;; Failed, blocked and skipped entries are only recorded for display
+             ;; (e.g. the review buffer's "FAILED" rows); no SCHEDULED is written
+             ;; for them, so they never change a task's schedule.
+             (no-write (memq (nth 9 ct) '(:failed :blocked :skipped)))
+             (sched-changed (and (not no-write)
+                                 (not (org-auto-scheduler--timestamps-equal-p orig-sched final-sched))))
              (sched-change-type
               (when sched-changed
                 (cond

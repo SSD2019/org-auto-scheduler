@@ -81,3 +81,36 @@
                      "Test 34.5: An undisturbed run commits and saves the schedule"))
     (with-current-buffer buf (set-buffer-modified-p nil) (kill-buffer))
     (delete-directory dir t)))
+
+;; 34.6-34.7: a task with no slot in the search window must not make every
+;; background run commit and announce "0 task(s) updated".  The dry run used
+;; to count its preview-only FAILED entry as a change.
+(let* ((dir (make-temp-file "oas-t34c-" t))
+       (file (expand-file-name "bg.org" dir))
+       (buf nil)
+       (commits 0)
+       (notices '()))
+  (with-temp-file file
+    (insert "* TODO Write report :AUTOSCH:\n:PROPERTIES:\n:ID: t34-ok\n:Effort: 60\n:END:\n"
+            "* TODO Impossible :AUTOSCH:\n:PROPERTIES:\n:ID: t34-big\n:Effort: 20:00\n:END:\n"))
+  (setq buf (find-file-noselect file))
+  (unwind-protect
+      (t34-with-daemon file
+        (org-auto-scheduler-schedule-tasks)
+        (with-current-buffer buf (save-buffer))
+        (cl-letf* ((orig (symbol-function 'org-auto-scheduler-schedule-tasks))
+                   ((symbol-function 'org-auto-scheduler-schedule-tasks)
+                    (lambda (&rest args)
+                      (unless org-auto-scheduler--preview-mode (setq commits (1+ commits)))
+                      (apply orig args)))
+                   ((symbol-function 'message)
+                    (lambda (fmt &rest args)
+                      (when (and fmt (string-match-p "task(s) updated" fmt))
+                        (push (apply #'format fmt args) notices)))))
+          (org-auto-scheduler--execute-background-job))
+        (assert-equal commits 0
+                      "Test 34.6: An unplaceable task does not trigger a commit pass")
+        (assert-equal notices nil
+                      "Test 34.7: No \"task(s) updated\" notice when nothing changed"))
+    (with-current-buffer buf (set-buffer-modified-p nil) (kill-buffer))
+    (delete-directory dir t)))
