@@ -15,7 +15,7 @@
   '(("Architecture RFC: Real-time Event Streaming" . "+0 11:25-13:55")
     ("Architecture RFC: Real-time Event Streaming (Remaining)" . "+1 09:00-10:00")
     ("Fast CI/CD Build Pipeline Migration" . "+0 09:00-10:15")
-    ("Update Developer Onboarding & API Docs" . "+0 15:05-15:50")
+    ("Update Developer Onboarding & API Docs" . "+0 14:50-15:35")
     ("Security Audit & Incident Post-Mortem Review" . "+0 14:00-14:45")
     ("Kubernetes Cluster Node Pool Scaling" . "+0 10:20-11:20"))
   "Expected (HEADING . \"+DAYS HH:MM-HH:MM\") pairs, in buffer order.")

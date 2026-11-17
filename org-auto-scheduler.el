@@ -3291,7 +3291,11 @@ or scheduled date-only without a time."
                   (pt-day (and pt (format-time-string "%Y-%m-%d" pt))))
              (when (and pt-day (not (string< pt-day target-min)))
                (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
-                 (cons pt (or end-time (time-add pt (seconds-to-time 3600))))))))
+                 ;; Not yet SCHEDULED: the slot is the pin time plus Effort, the
+                 ;; same length the placement pass will give it.
+                 (cons pt (or end-time
+                              (time-add pt (seconds-to-time
+                                            (* 60 (or (org-auto-scheduler-get-effort nil) 60))))))))))
          ;; Case B: Task scheduled with HH:MM
          (when (and sched-str
                     ;; Must contain HH:MM
@@ -3319,7 +3323,11 @@ Returns nil if not scheduled/pinned, scheduled on another day, or scheduled date
                   (pt-day (and pt (format-time-string "%Y-%m-%d" pt))))
              (when (and pt-day (string= pt-day target-today))
                (let ((end-time (org-auto-scheduler-calculate-task-end-time (point))))
-                 (cons pt (or end-time (time-add pt (seconds-to-time 3600))))))))
+                 ;; Not yet SCHEDULED: the slot is the pin time plus Effort, the
+                 ;; same length the placement pass will give it.
+                 (cons pt (or end-time
+                              (time-add pt (seconds-to-time
+                                            (* 60 (or (org-auto-scheduler-get-effort nil) 60))))))))))
          ;; Case B: Task scheduled for today with HH:MM
          (when (and sched-str
                     ;; Must contain HH:MM
@@ -4154,7 +4162,10 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                          (gethash task-id org-auto-scheduler--last-preds-map)))
                              (dep-floor nil)
                              (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
-                             (has-saved-order (and saved-dec (not (plist-get saved-dec :is-new)) (plist-get saved-dec :order)))
+                             (has-saved-order (and saved-dec
+                                                  (not (plist-get saved-dec :is-new))
+                                                  (not (plist-get saved-dec :auto-order))
+                                                  (plist-get saved-dec :order)))
                              (proj-id (nth 2 task-info))
                              (allows-interleave (nth 9 task-info)))
                         (dolist (p-id preds)

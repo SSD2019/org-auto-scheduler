@@ -606,7 +606,8 @@ the task's Org properties."
                  (pinned-time (or prop-pinned-time (plist-get entry :pinned-time))))
             (list :order order :skipped skipped :target-date target-date
                   :freeset freeset :pinnable freeset :pinned pinned :pinned-time pinned-time
-                  :is-new is-new :saved-sig saved-sig :reranked-from reranked-from)))
+                  :is-new is-new :saved-sig saved-sig :reranked-from reranked-from
+                  :auto-order (plist-get entry :auto-order))))
       entry)))
 
 (defun org-auto-scheduler-review-save-decisions (&optional silent)
@@ -1062,6 +1063,13 @@ Returns a plist (:pruned N :new N :kept N)."
                           (saved-sig (or (and existing (plist-get existing-dec :saved-sig))
                                          (plist-get info :sig)))
                           (reranked-from (and existing (plist-get existing-dec :reranked-from)))
+                          ;; An order this merge generated (new task, or re-slotted after a
+                          ;; score change) is the scheduler's, not the user's.  It stays
+                          ;; marked until the user saves from the review buffer, so later
+                          ;; runs do not mistake it for an explicit sequence.
+                          (auto-order (or (null existing)
+                                          (gethash tid reranked-ids)
+                                          (plist-get existing-dec :auto-order)))
                           (decision (list :order (or order (setq max-rank (+ max-rank 100.0)))
                                           :skipped skipped
                                           :target-date target-date
@@ -1073,6 +1081,7 @@ Returns a plist (:pruned N :new N :kept N)."
                                           :is-new is-new
                                           :saved-sig saved-sig
                                           :reranked-from reranked-from
+                                          :auto-order auto-order
                                           :updated-at (current-time))))
                      (if existing
                          (setcdr existing decision)
