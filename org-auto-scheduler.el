@@ -156,9 +156,101 @@ Set to nil to disable daily catch-up blocks."
   :group 'org-auto-scheduler)
 
 (defcustom org-auto-scheduler-excluded-days '()
-  "List of days to exclude from scheduling. 0 is Sunday, 6 is Saturday."
+  "List of days to exclude from scheduling. 0 is Sunday, 6 is Saturday.
+For specific dates (vacations, holidays) see `org-auto-scheduler-days-off'."
   :type '(repeat integer)
   :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-days-off '()
+  "Dates on which nothing is scheduled, on top of `org-auto-scheduler-excluded-days'.
+Each element is a date \"YYYY-MM-DD\" or an inclusive range (FROM . TO)
+of such dates, for example:
+
+  (\"2026-12-24\" (\"2026-12-28\" . \"2027-01-02\"))"
+  :type '(repeat (choice (string :tag "Date (YYYY-MM-DD)")
+                         (cons :tag "Range" (string :tag "From") (string :tag "To"))))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-skip-holidays nil
+  "When non-nil, days listed in `calendar-holidays' are days off too."
+  :type 'boolean
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-day-hours '()
+  "Working hours for days that differ from the start and end time.
+An alist of (DAY . (START . END)).  DAY is a weekday number (0 = Sunday)
+or a date \"YYYY-MM-DD\"; START and END are \"HH:MM\".  A date entry
+wins over a weekday entry; days without an entry use
+`org-auto-scheduler-start-time' and `org-auto-scheduler-end-time'.
+Example: short Fridays and one late day:
+
+  ((5 . (\"09:00\" . \"13:00\")) (\"2026-12-03\" . (\"11:00\" . \"19:00\")))"
+  :type '(alist :key-type (choice (integer :tag "Weekday (0 = Sunday)")
+                                  (string :tag "Date (YYYY-MM-DD)"))
+                :value-type (cons (string :tag "Start") (string :tag "End")))
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--holiday-cache (make-hash-table :test 'equal)
+  "Date string -> t or `no', memoizing `calendar-check-holidays'.")
+
+(defun org-auto-scheduler--as-time (day)
+  "Return DAY as a time value; DAY is a time or a \"YYYY-MM-DD\" string."
+  (if (stringp day)
+      (org-auto-scheduler-parse-time-string (concat (substring day 0 10) " 12:00"))
+    day))
+
+(defun org-auto-scheduler--day-off-p (day)
+  "Return non-nil if nothing should be scheduled on DAY (a time or date string).
+True for weekdays in `org-auto-scheduler-excluded-days', dates in
+`org-auto-scheduler-days-off', and, with `org-auto-scheduler-skip-holidays',
+days in `calendar-holidays'."
+  (let ((time (org-auto-scheduler--as-time day)))
+    (or (and org-auto-scheduler-excluded-days
+             (member (string-to-number (format-time-string "%w" time))
+                     org-auto-scheduler-excluded-days))
+        (and (or org-auto-scheduler-days-off org-auto-scheduler-skip-holidays)
+             (let ((date (format-time-string "%Y-%m-%d" time)))
+               (or (cl-some (lambda (e)
+                              (if (consp e)
+                                  (and (not (string< date (car e)))
+                                       (not (string< (cdr e) date)))
+                                (string= e date)))
+                            org-auto-scheduler-days-off)
+                   (and org-auto-scheduler-skip-holidays
+                        (eq t (or (gethash date org-auto-scheduler--holiday-cache)
+                                  (puthash date
+                                           ;; A broken `calendar-holidays' entry must
+                                           ;; not stop scheduling: count it as no holiday.
+                                           (if (condition-case err
+                                                   (and (require 'holidays nil t)
+                                                        (let ((d (decode-time time)))
+                                                          (calendar-check-holidays
+                                                           (list (nth 4 d) (nth 3 d) (nth 5 d)))))
+                                                 (error
+                                                  (org-auto-scheduler--log-warn*
+                                                   "Holiday check failed for %s: %S" date err)
+                                                  nil))
+                                               t
+                                             'no)
+                                           org-auto-scheduler--holiday-cache))))))))))
+
+(defun org-auto-scheduler--day-hours (day)
+  "Return (START . END) \"HH:MM\" working hours for DAY (a time or date string).
+See `org-auto-scheduler-day-hours'."
+  (or (and org-auto-scheduler-day-hours
+           (let ((time (org-auto-scheduler--as-time day)))
+             (or (cdr (assoc (format-time-string "%Y-%m-%d" time) org-auto-scheduler-day-hours))
+                 (cdr (assoc (string-to-number (format-time-string "%w" time))
+                             org-auto-scheduler-day-hours)))))
+      (cons org-auto-scheduler-start-time org-auto-scheduler-end-time)))
+
+(defun org-auto-scheduler--day-start (time)
+  "Return the start of working hours on TIME's day."
+  (org-auto-scheduler-time-with-time-string time (car (org-auto-scheduler--day-hours time))))
+
+(defun org-auto-scheduler--day-end (time)
+  "Return the end of working hours on TIME's day."
+  (org-auto-scheduler-time-with-time-string time (cdr (org-auto-scheduler--day-hours time))))
 
 (defcustom org-auto-scheduler-time-interval 15
   "The interval in minutes for checking time slots. This determines the granularity of the scheduling."
@@ -1862,8 +1954,9 @@ Checks for what-if overrides in the review buffer if active."
   "Check if the time slot from START-TIME to END-TIME is within scheduling hours."
   (let* ((start-minutes (org-duration-to-minutes (format-time-string "%H:%M" start-time)))
          (end-minutes (org-duration-to-minutes (format-time-string "%H:%M" end-time)))
-         (scheduler-start-minutes (org-duration-to-minutes org-auto-scheduler-start-time))
-         (scheduler-end-minutes (org-duration-to-minutes org-auto-scheduler-end-time)))
+         (hours (org-auto-scheduler--day-hours start-time))
+         (scheduler-start-minutes (org-duration-to-minutes (car hours)))
+         (scheduler-end-minutes (org-duration-to-minutes (cdr hours))))
     (and (>= start-minutes scheduler-start-minutes)
          (<= end-minutes scheduler-end-minutes))))
 
@@ -2262,7 +2355,7 @@ Returns integer minutes (may be 0 or negative if the deadline has already passed
                (dl-base (org-time-string-to-time deadline-str))
                (dl-time (if has-time
                             dl-base
-                          (org-auto-scheduler-time-with-time-string dl-base org-auto-scheduler-end-time)))
+                          (org-auto-scheduler--day-end dl-base)))
                (start-mins-day (org-duration-to-minutes org-auto-scheduler-start-time))
                (end-mins-day (org-duration-to-minutes org-auto-scheduler-end-time))
                (daily-work-mins (max 60 (- end-mins-day start-mins-day))))
@@ -2272,16 +2365,15 @@ Returns integer minutes (may be 0 or negative if the deadline has already passed
                    (dl-days (time-to-days dl-time))
                    (day-diff (- dl-days from-days)))
               (if (= day-diff 0)
-                  (let* ((day-start (org-auto-scheduler-time-with-time-string from org-auto-scheduler-start-time))
-                         (day-end (org-auto-scheduler-time-with-time-string from org-auto-scheduler-end-time))
+                  (let* ((day-start (org-auto-scheduler--day-start from))
+                         (day-end (org-auto-scheduler--day-end from))
                          (eff-from (if (time-less-p from day-start) day-start from))
                          (eff-to (if (time-less-p day-end dl-time) day-end dl-time)))
                     (max 0 (floor (/ (float-time (time-subtract eff-to eff-from)) 60.0))))
                 ;; Multi-day span: remaining mins today + full intermediate working days + mins on deadline day
-                (let* ((today-start (org-auto-scheduler-time-with-time-string from org-auto-scheduler-start-time))
-                       (today-end (org-auto-scheduler-time-with-time-string from org-auto-scheduler-end-time))
-                       (today-dow (string-to-number (format-time-string "%w" from)))
-                       (today-rem (if (or (member today-dow org-auto-scheduler-excluded-days)
+                (let* ((today-start (org-auto-scheduler--day-start from))
+                       (today-end (org-auto-scheduler--day-end from))
+                       (today-rem (if (or (org-auto-scheduler--day-off-p from)
                                           (not (time-less-p from today-end)))
                                       0
                                     (max 0 (floor (/ (float-time (time-subtract today-end
@@ -2289,10 +2381,9 @@ Returns integer minutes (may be 0 or negative if the deadline has already passed
                                                                                     today-start
                                                                                   from)))
                                                      60.0)))))
-                       (dl-day-start (org-auto-scheduler-time-with-time-string dl-time org-auto-scheduler-start-time))
-                       (dl-day-end (org-auto-scheduler-time-with-time-string dl-time org-auto-scheduler-end-time))
-                       (dl-dow (string-to-number (format-time-string "%w" dl-time)))
-                       (dl-day-mins (if (or (member dl-dow org-auto-scheduler-excluded-days)
+                       (dl-day-start (org-auto-scheduler--day-start dl-time))
+                       (dl-day-end (org-auto-scheduler--day-end dl-time))
+                       (dl-day-mins (if (or (org-auto-scheduler--day-off-p dl-time)
                                             (not (time-less-p dl-day-start dl-time)))
                                         0
                                       (max 0 (floor (/ (float-time (time-subtract (if (time-less-p dl-day-end dl-time)
@@ -2302,10 +2393,15 @@ Returns integer minutes (may be 0 or negative if the deadline has already passed
                                                        60.0)))))
                        (mid-mins 0))
                   (cl-loop for d from 1 below day-diff do
-                           (let* ((t-day (time-add from (days-to-time d)))
-                                  (dow (string-to-number (format-time-string "%w" t-day))))
-                             (unless (member dow org-auto-scheduler-excluded-days)
-                               (setq mid-mins (+ mid-mins daily-work-mins)))))
+                           (let ((t-day (time-add from (days-to-time d))))
+                             (unless (org-auto-scheduler--day-off-p t-day)
+                               (setq mid-mins
+                                     (+ mid-mins
+                                        (if org-auto-scheduler-day-hours
+                                            (let ((h (org-auto-scheduler--day-hours t-day)))
+                                              (max 0 (- (org-duration-to-minutes (cdr h))
+                                                        (org-duration-to-minutes (car h)))))
+                                          daily-work-mins))))))
                   (+ today-rem mid-mins dl-day-mins))))))
       (error nil))))
 
@@ -2724,8 +2820,8 @@ Runs in a single O(k) forward pass per parent instead of O(k^2) repeated backwar
 PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calculate dynamic buffer times."
   (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
          (agenda-items (org-auto-scheduler-get-agenda-items start-time))
-         (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
-         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time))
+         (day-start (org-auto-scheduler--day-start start-time))
+         (day-end (org-auto-scheduler--day-end start-time))
          (is-freeset (or (bound-and-true-p org-auto-scheduler--scheduling-freeset-p)
                          (bound-and-true-p org-auto-scheduler--scheduling-pinnable-p)
                          (member org-auto-scheduler-freeset-tag proposed-tags)
@@ -2739,6 +2835,12 @@ PROPOSED-TAGS are the tags of the task we are trying to schedule, used to calcul
                                    (format-time-string "%Y-%m-%d %H:%M" start-time)
                                    (format-time-string "%Y-%m-%d %H:%M" end-time))
     (or
+     ;; Days off (excluded weekdays, `org-auto-scheduler-days-off', holidays): the
+     ;; whole day is taken, so jump to the next day's start.  Pinned tasks keep
+     ;; their explicit time.
+     (unless is-pinned
+       (when (org-auto-scheduler--day-off-p start-time)
+         (org-auto-scheduler-next-day-start start-time)))
      ;; Check day boundaries (bypassed for FREESET during review reordering or PINNED tasks)
      (unless (or is-freeset is-pinned)
        (or (and (time-less-p start-time day-start) day-start)
@@ -2864,16 +2966,16 @@ Excludes TASK-ID and non-blocking items."
         (found-slot nil)
         (max-time (time-add start-time (days-to-time org-auto-scheduler-max-days-to-check))))
     (while (and (not found-slot) (time-less-p current-time max-time))
-      (let* ((day-start (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-start-time))
-             (day-end (org-auto-scheduler-time-with-time-string current-time org-auto-scheduler-end-time))
+      (let* ((day-start (org-auto-scheduler--day-start current-time))
+             (day-end (org-auto-scheduler--day-end current-time))
              (day-of-week (string-to-number (format-time-string "%w" current-time)))
              (end-time (time-add current-time (seconds-to-time (* 60 duration))))
              (occupied-result (org-auto-scheduler-time-slot-occupied-p current-time duration nil proposed-tags)))
         (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Attempting to find next available time slot starting from %s for %d minutes, original start %s"
                                        (format-time-string "%Y-%m-%d %H:%M" current-time) duration (format-time-string "%Y-%m-%d %H:%M" start-time))
         (cond
-         ((member day-of-week org-auto-scheduler-excluded-days)
-          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Day %d is excluded, moving to next day" day-of-week)
+         ((org-auto-scheduler--day-off-p current-time)
+          (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Day %d is a day off, moving to next day" day-of-week)
           (setq current-time (org-auto-scheduler-next-day current-time)))
          ((time-less-p current-time day-start)
           (org-auto-scheduler--log-debug* "[org-auto-scheduler-next-available-time] Current time is before day start, setting to day start")
@@ -2970,7 +3072,7 @@ If POM is nil, use the current point."
   "Get the start time of the next day after TIME."
   (let* ((next-day (org-auto-scheduler-next-day time))
          (next-day-str (format-time-string "%Y-%m-%d" next-day))
-         (start-time-str (concat next-day-str " " org-auto-scheduler-start-time)))
+         (start-time-str (concat next-day-str " " (car (org-auto-scheduler--day-hours next-day)))))
     (org-time-string-to-time start-time-str)))
 
 
@@ -3260,7 +3362,7 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                 (org-schedule '(4))
                 (org-delete-property org-auto-scheduler-scheduled-property)
                 (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d" (current-time))))
-                       (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
+                       (not-before-time (concat tomorrow-str " " (car (org-auto-scheduler--day-hours tomorrow-str)))))
                   (org-entry-put nil "NOT_BEFORE" (format "<%s>" not-before-time))))
 
               ;; Update independent property & tag: -i- enables, -\\i- removes
@@ -3641,10 +3743,11 @@ Otherwise, adds `org-auto-scheduler-start-buffer-minutes' (default 5m) buffer."
          (decoded-time (decode-time now))
          (current-hour (nth 2 decoded-time))
          (current-minute (nth 1 decoded-time))
+         (today-hours (org-auto-scheduler--day-hours now))
          (start-time-components (mapcar #'string-to-number
-                                        (split-string org-auto-scheduler-start-time ":")))
+                                        (split-string (car today-hours) ":")))
          (end-time-components (mapcar #'string-to-number
-                                      (split-string org-auto-scheduler-end-time ":")))
+                                      (split-string (cdr today-hours) ":")))
          (start-hour (car start-time-components))
          (start-minute (cadr start-time-components))
          (end-hour (car end-time-components))
@@ -3662,11 +3765,7 @@ Otherwise, adds `org-auto-scheduler-start-buffer-minutes' (default 5m) buffer."
      ;; If after configured work end time today, start at start-time tomorrow
      ((or (> current-hour end-hour)
           (and (= current-hour end-hour) (>= current-minute end-minute)))
-      (let* ((tomorrow (time-add now (seconds-to-time (* 24 3600))))
-             (tomorrow-start (apply #'encode-time
-                                    (append (list 0 start-minute start-hour)
-                                            (nthcdr 3 (decode-time tomorrow))))))
-        tomorrow-start))
+      (org-auto-scheduler--day-start (time-add now (seconds-to-time (* 24 3600)))))
      ;; Otherwise during workday: start at current time + buffer (0 if clocked, 5m if not)
      (t
       (time-add now (seconds-to-time buffer-seconds))))))
@@ -3722,7 +3821,7 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
             (setf (nth 12 task-info) (plist-get m-res :effort)))
           (when (plist-get m-res :defer)
             (let* ((tomorrow-str (org-auto-scheduler--next-day-date-string (format-time-string "%Y-%m-%d" (current-time))))
-                   (not-before-time (concat tomorrow-str " " org-auto-scheduler-start-time)))
+                   (not-before-time (concat tomorrow-str " " (car (org-auto-scheduler--day-hours tomorrow-str)))))
               (setf (nth 10 task-info) (org-auto-scheduler-parse-time-string not-before-time))))
           (let* ((kept-times (when preserve-today
                                (if org-auto-scheduler-preserve-future-scheduled
@@ -4650,7 +4749,7 @@ If only HH:MM is specified, uses the date from MARKER, review override, or today
                   (format-time-string "%Y-%m-%d" (current-time)))))
         (org-auto-scheduler-parse-time-string (concat base-date " " time-part))))
      (date-part
-      (org-auto-scheduler-parse-time-string (concat date-part " " org-auto-scheduler-start-time)))
+      (org-auto-scheduler-parse-time-string (concat date-part " " (car (org-auto-scheduler--day-hours date-part)))))
      (t
       (condition-case nil
           (org-time-string-to-time clean)
@@ -5293,11 +5392,11 @@ Accepts plain minutes (\"10\") or any Org duration (\"0:10\", \"1h\"), like Effo
   "Calculate contiguous available minutes at START-TIME up to MAX-NEEDED minutes.
 Considers day boundaries (start/end times, excluded days) and existing agenda conflicts.
 Returns the number of available minutes (integer)."
-  (let* ((day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
-         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time))
+  (let* ((day-start (org-auto-scheduler--day-start start-time))
+         (day-end (org-auto-scheduler--day-end start-time))
          (day-of-week (string-to-number (format-time-string "%w" start-time))))
     (cond
-     ((member day-of-week org-auto-scheduler-excluded-days) 0)
+     ((org-auto-scheduler--day-off-p start-time) 0)
      ((time-less-p start-time day-start) 0)
      ((not (time-less-p start-time day-end)) 0)
      ;; Check if START-TIME itself is immediately occupied (test 1 minute)
@@ -5565,15 +5664,15 @@ TASK is the task info list, SCHEDULED is the scheduled timestamp."
 (defun org-auto-scheduler--describe-slot-conflict (start-time duration &optional ignore-id proposed-tags)
   "Return a human-readable reason why [START-TIME, START-TIME + DURATION] is occupied."
   (let* ((end-time (time-add start-time (seconds-to-time (* 60 duration))))
-         (day-start (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-start-time))
-         (day-end (org-auto-scheduler-time-with-time-string start-time org-auto-scheduler-end-time))
+         (day-start (org-auto-scheduler--day-start start-time))
+         (day-end (org-auto-scheduler--day-end start-time))
          (agenda-items (org-auto-scheduler-get-agenda-items start-time))
          (reason nil))
     (cond
      ((time-less-p start-time day-start)
-      (format "Before workday start (%s)" org-auto-scheduler-start-time))
+      (format "Before workday start (%s)" (car (org-auto-scheduler--day-hours start-time))))
      ((time-less-p day-end end-time)
-      (format "Exceeds workday end (%s, need %dm)" org-auto-scheduler-end-time duration))
+      (format "Exceeds workday end (%s, need %dm)" (cdr (org-auto-scheduler--day-hours start-time)) duration))
      (t
       (when org-auto-scheduler-daily-catchup-block
         (let* ((c-start-str (car org-auto-scheduler-daily-catchup-block))
@@ -5624,7 +5723,7 @@ on that day are full or already past (allowing soft fallback to normal working h
   (when (and day-time energy-blocks (> duration 0))
     (let ((day-of-week (string-to-number (format-time-string "%w" day-time)))
           (found nil))
-      (unless (member day-of-week org-auto-scheduler-excluded-days)
+      (unless (org-auto-scheduler--day-off-p day-time)
         (dolist (block energy-blocks)
           (unless found
             (let* ((b-start (org-auto-scheduler-time-with-time-string day-time (car block)))
@@ -6186,6 +6285,23 @@ configuration variables and raises errors if any are found."
     (dolist (day excluded-days)
       (unless (and (integerp day) (<= 0 day 6))
         (error "org-auto-scheduler-excluded-days must contain integers from 0 to 6")))
+    (let ((date-p (lambda (s) (and (stringp s)
+                                   (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" s))))
+          (hhmm-p (lambda (s) (and (stringp s) (string-match-p "\\`[0-9]\\{1,2\\}:[0-9]\\{2\\}\\'" s)))))
+      (dolist (e org-auto-scheduler-days-off)
+        (unless (if (consp e)
+                    (and (funcall date-p (car e)) (funcall date-p (cdr e))
+                         (not (string< (cdr e) (car e))))
+                  (funcall date-p e))
+          (error "org-auto-scheduler-days-off: %S is not a YYYY-MM-DD date or (FROM . TO) range" e)))
+      (dolist (e org-auto-scheduler-day-hours)
+        (unless (and (consp e)
+                     (or (and (integerp (car e)) (<= 0 (car e) 6))
+                         (funcall date-p (car e)))
+                     (consp (cdr e))
+                     (funcall hhmm-p (cadr e)) (funcall hhmm-p (cddr e))
+                     (< (org-duration-to-minutes (cadr e)) (org-duration-to-minutes (cddr e))))
+          (error "org-auto-scheduler-day-hours: %S must be (DAY . (\"HH:MM\" . \"HH:MM\")) with start before end" e))))
     (unless (and (stringp org-auto-scheduler-non-blocking-property)
                  (not (string-empty-p org-auto-scheduler-non-blocking-property)))
       (error "org-auto-scheduler-non-blocking-property must be a non-empty string"))

@@ -226,7 +226,7 @@ Returns non-nil if lease is held by this host, or nil if another host holds a fr
              org-auto-scheduler-eod-auto-trigger)
     (let* ((today-str (format-time-string "%Y-%m-%d" now))
            (now-mins (org-auto-scheduler-time-to-minutes (format-time-string "%H:%M" now)))
-           (end-mins (org-auto-scheduler-time-to-minutes org-auto-scheduler-end-time)))
+           (end-mins (org-auto-scheduler-time-to-minutes (cdr (org-auto-scheduler--day-hours now)))))
       (when (and (>= now-mins end-mins)
                  (not (equal org-auto-scheduler--last-eod-run-date today-str)))
         (setq org-auto-scheduler--last-eod-run-date today-str)

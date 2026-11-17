@@ -1088,6 +1088,9 @@ Access all options via =M-x customize-group RET org-auto-scheduler=.
 | =org-auto-scheduler-start-time=      | ="09:00"=  | Daily scheduling window start (24 h =HH:MM=).                              |
 | =org-auto-scheduler-end-time=        | ="17:00"=  | Daily scheduling window end.                                                |
 | =org-auto-scheduler-excluded-days=   | ='()=      | Day-of-week integers to skip (0 = Sun … 6 = Sat).                          |
+| =org-auto-scheduler-days-off=        | ='()=      | Dates (="YYYY-MM-DD"=) or inclusive ranges (=(FROM . TO)=) to skip.         |
+| =org-auto-scheduler-skip-holidays=   | =nil=      | Also skip days in =calendar-holidays=.                                      |
+| =org-auto-scheduler-day-hours=       | ='()=      | Per-weekday or per-date hours: =((5 . ("09:00" . "13:00")))=.               |
 | =org-auto-scheduler-time-interval=   | =15=       | Slot granularity in minutes (for collision scanning).                       |
 | =org-auto-scheduler-task-gap=        | =5=        | Minimum gap in minutes between consecutive tasks.                           |
 | =org-auto-scheduler-daily-catchup-block= | =nil=   | Daily protected catch-up slack window (e.g. '("16:00" . "17:00")) skipped by regular tasks. |

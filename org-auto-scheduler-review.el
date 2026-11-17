@@ -1449,9 +1449,10 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
     (tabulated-list-print-entry id cols))))
 
 (defun org-auto-scheduler-workday-duration-minutes ()
-  "Return the total configured workday duration in minutes."
-  (let* ((start-m (condition-case nil (org-duration-to-minutes org-auto-scheduler-start-time) (error 540)))
-         (end-m (condition-case nil (org-duration-to-minutes org-auto-scheduler-end-time) (error 1020)))
+  "Return today's configured workday duration in minutes."
+  (let* ((hours (org-auto-scheduler--day-hours (current-time)))
+         (start-m (condition-case nil (org-duration-to-minutes (car hours)) (error 540)))
+         (end-m (condition-case nil (org-duration-to-minutes (cdr hours)) (error 1020)))
          (diff (- (or end-m 1020) (or start-m 540))))
     (if (> diff 0) diff 480)))
 
@@ -2029,20 +2030,22 @@ Works across Org buffers, Org Agenda, the Review buffer, and Calendar."
   "Return the next non-excluded day's date string YYYY-MM-DD after DATE-STR."
   (let* ((current (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
          (next (time-add current (days-to-time 1)))
-         (dow (string-to-number (format-time-string "%w" next))))
-    (while (member dow org-auto-scheduler-excluded-days)
-      (setq next (time-add next (days-to-time 1)))
-      (setq dow (string-to-number (format-time-string "%w" next))))
+         (guard 0))
+    ;; Skip days off; give up after a year in case every day is excluded.
+    (while (and (org-auto-scheduler--day-off-p next) (< guard 366))
+      (setq next (time-add next (days-to-time 1))
+            guard (1+ guard)))
     (format-time-string "%Y-%m-%d" next)))
 
 (defun org-auto-scheduler--prev-day-date-string (date-str)
   "Return the previous non-excluded day's date string YYYY-MM-DD before DATE-STR."
   (let* ((current (org-auto-scheduler-parse-time-string (concat date-str " 12:00")))
          (prev (time-subtract current (days-to-time 1)))
-         (dow (string-to-number (format-time-string "%w" prev))))
-    (while (member dow org-auto-scheduler-excluded-days)
-      (setq prev (time-subtract prev (days-to-time 1)))
-      (setq dow (string-to-number (format-time-string "%w" prev))))
+         (guard 0))
+    ;; Skip days off; give up after a year in case every day is excluded.
+    (while (and (org-auto-scheduler--day-off-p prev) (< guard 366))
+      (setq prev (time-subtract prev (days-to-time 1))
+            guard (1+ guard)))
     (format-time-string "%Y-%m-%d" prev)))
 
 (defun org-auto-scheduler--review-first-day-sep-p (sep-id)
@@ -3019,9 +3022,8 @@ tasks are constrained to start on or after their current day section."
                   (let* ((task-pinned-time (org-auto-scheduler-task-pinned-time marker task-id))
                          (day-start (if (string= task-day today-str)
                                        (org-auto-scheduler-get-start-time)
-                                     (org-auto-scheduler-time-with-time-string
-                                      (org-auto-scheduler-parse-time-string (concat task-day " 00:00"))
-                                      org-auto-scheduler-start-time))))
+                                     (org-auto-scheduler--day-start
+                                      (org-auto-scheduler-parse-time-string (concat task-day " 00:00"))))))
                     (if (and task-pinned-time
                              (string= (format-time-string "%Y-%m-%d" task-pinned-time) task-day))
                         (setq current-time task-pinned-time)
