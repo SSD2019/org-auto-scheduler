@@ -4469,6 +4469,13 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
 
               ;; Normalize completed-tasks to chronological order (built via push)
               (setq org-auto-scheduler-completed-tasks (nreverse org-auto-scheduler-completed-tasks))
+              ;; Forecast deadline misses and tell the user on interactive runs.
+              (setq org-auto-scheduler--deadline-risks
+                    (org-auto-scheduler--compute-deadline-risks sorted-tasks-info now))
+              (when (and org-auto-scheduler--deadline-risks
+                         (not org-auto-scheduler-silent-mode))
+                (message "⚠ %s  [M-x org-auto-scheduler-deadline-risks]"
+                         (org-auto-scheduler--deadline-risk-summary)))
               ;; Detect and record changes
               (setq org-auto-scheduler--last-run-changes
                     (org-auto-scheduler--detect-task-changes initial-snapshot
@@ -6600,14 +6607,16 @@ Uses `transient` if available, otherwise falls back to a simple prompt."
                            " [k] Cleanup Placeholders\n"
                            " [E] End-of-Day Wrap-Up\n"
                            " [D] Explore Dependencies\n"
+                           " [R] Deadline Risks\n"
                            " [W] Weekly Retrospective\n"
                            "Choice: ")
-                   '(?s ?r ?t ?f ?F ?S ?M ?C ?c ?a ?b ?e ?E ?D ?N ?n ?k ?W ?w))))
+                   '(?s ?r ?t ?f ?F ?S ?M ?C ?c ?a ?b ?e ?E ?D ?N ?n ?k ?W ?w ?R))))
       (cond
        ((memq choice '(?f ?F)) (call-interactively 'org-auto-scheduler-focus))
        ((eq choice ?e) (call-interactively 'org-auto-scheduler-extend-current-task))
        ((eq choice ?E) (call-interactively 'org-auto-scheduler-eod-review))
        ((eq choice ?D) (call-interactively 'org-auto-scheduler-explore-dependencies))
+       ((eq choice ?R) (call-interactively 'org-auto-scheduler-deadline-risks))
        ((eq choice ?s) (call-interactively 'org-auto-scheduler-schedule-tasks))
        ((eq choice ?r) (call-interactively 'org-auto-scheduler-review-and-apply))
        ((eq choice ?t) (call-interactively 'org-auto-scheduler-schedule-today))
@@ -6641,12 +6650,124 @@ Uses `transient` if available, otherwise falls back to a simple prompt."
     ["Tools"
       ("f" "Focus HUD Cockpit"       org-auto-scheduler-focus)
       ("D" "Explore dependencies"    org-auto-scheduler-explore-dependencies)
+      ("R" "Deadline risks"          org-auto-scheduler-deadline-risks)
       ("b" "Bump agenda"             org-auto-scheduler-bump-agenda)
       ("e" "Extend current task"     org-auto-scheduler-extend-current-task)
       ("N" "Toggle non-blocking"     org-auto-scheduler-toggle-non-blocking)
       ("h" "Historical insights"     org-auto-scheduler-historical-insights)
       ("B" "Toggle background"       org-auto-scheduler-toggle-background)
       ("k" "Cleanup placeholders"    org-auto-scheduler-cleanup-placeholders)]))
+
+;;; Deadline-risk forecast
+
+(defvar org-auto-scheduler--deadline-risks nil
+  "Tasks the last run could not finish before their DEADLINE.
+A list of plists (:id :headline :marker :deadline :planned-end :reason),
+where :reason is `late' (last chunk ends after the deadline) or
+`unplaced' (no slot found, or blocked).  Set by every run, preview included.")
+
+(defun org-auto-scheduler--deadline-time (marker)
+  "Return the DEADLINE of the task at MARKER as a time, or nil.
+A date-only deadline means the end of working hours on that date."
+  (let ((dl-str (and marker (markerp marker) (marker-buffer marker)
+                     (org-entry-get marker "DEADLINE"))))
+    (when dl-str
+      (let ((dl (org-time-string-to-time dl-str)))
+        (if (string-match-p "[0-9]\\{1,2\\}:[0-9]\\{2\\}" dl-str)
+            dl
+          (org-auto-scheduler--day-end dl))))))
+
+(defun org-auto-scheduler--compute-deadline-risks (sorted-tasks-info now)
+  "Return the deadline risks for SORTED-TASKS-INFO after a run at NOW.
+See `org-auto-scheduler--deadline-risks'.  Split chunks and Pomodoro
+parts count towards their parent; deadlines already past at NOW are left
+to the agenda's own overdue display."
+  (let ((last-end (make-hash-table :test 'equal))
+        (status (make-hash-table :test 'equal))
+        (risks '()))
+    (dolist (tk org-auto-scheduler-completed-tasks)
+      (let* ((id (nth 0 tk))
+             (owner (if (and (stringp id)
+                             (string-match "\\`\\(.+\\)-\\(?:remaining\\|pomodoro\\)-[0-9]+\\'" id))
+                        (match-string 1 id)
+                      id))
+             (st (nth 9 tk))
+             (end (nth 2 tk)))
+        (when owner
+          (if (memq st '(:failed :blocked :skipped))
+              (unless (gethash owner status) (puthash owner st status))
+            (puthash owner 'placed status)
+            (when (and end (or (null (gethash owner last-end))
+                               (time-less-p (gethash owner last-end) end)))
+              (puthash owner end last-end))))))
+    (dolist (ti sorted-tasks-info)
+      (let* ((id (nth 5 ti))
+             (marker (car ti))
+             (deadline (and id (org-auto-scheduler--deadline-time marker)))
+             (st (and id (gethash id status)))
+             (end (and id (gethash id last-end))))
+        (when (and deadline (time-less-p now deadline) (not (eq st :skipped)))
+          (cond
+           ((and end (time-less-p deadline end))
+            (push (list :id id :headline (nth 6 ti) :marker marker
+                        :deadline deadline :planned-end end :reason 'late)
+                  risks))
+           ((not (eq st 'placed))
+            (push (list :id id :headline (nth 6 ti) :marker marker
+                        :deadline deadline :planned-end nil :reason 'unplaced)
+                  risks))))))
+    (sort (nreverse risks)
+          (lambda (a b) (time-less-p (plist-get a :deadline) (plist-get b :deadline))))))
+
+(defun org-auto-scheduler--deadline-risk-summary ()
+  "Return a one-line summary of `org-auto-scheduler--deadline-risks', or nil."
+  (when org-auto-scheduler--deadline-risks
+    (format "%d task%s will miss %s deadline: %s"
+            (length org-auto-scheduler--deadline-risks)
+            (if (cdr org-auto-scheduler--deadline-risks) "s" "")
+            (if (cdr org-auto-scheduler--deadline-risks) "their" "its")
+            (mapconcat (lambda (r) (plist-get r :headline))
+                       (seq-take org-auto-scheduler--deadline-risks 3) ", "))))
+
+(define-derived-mode org-auto-scheduler-deadline-risks-mode special-mode "AutoSch-Risks"
+  "Major mode for the deadline-risk report.")
+
+(defun org-auto-scheduler-deadline-risks ()
+  "Show the tasks the last scheduler run could not finish before their deadline.
+RET on a line jumps to the task.  Runs a preview first if nothing has run yet."
+  (interactive)
+  (unless (or org-auto-scheduler--deadline-risks org-auto-scheduler-completed-tasks)
+    (let ((org-auto-scheduler--preview-mode t))
+      (org-auto-scheduler-schedule-tasks)))
+  (let ((buf (get-buffer-create "*Org Auto Scheduler Deadline Risks*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (org-auto-scheduler-deadline-risks-mode)
+        (if (null org-auto-scheduler--deadline-risks)
+            (insert (propertize "No deadline risks: every task with a deadline is planned to finish in time.\n"
+                                'face 'success))
+          (insert (propertize (format "%s\n\n" (org-auto-scheduler--deadline-risk-summary))
+                              'face 'warning))
+          (insert (format "%-12s  %-16s  %s\n" "Deadline" "Planned finish" "Task"))
+          (dolist (r org-auto-scheduler--deadline-risks)
+            (let ((m (plist-get r :marker)))
+              (insert (format "%-12s  %-16s  "
+                              (format-time-string "%a %m-%d" (plist-get r :deadline))
+                              (if (plist-get r :planned-end)
+                                  (format-time-string "%a %m-%d %H:%M" (plist-get r :planned-end))
+                                "no slot")))
+              (insert-text-button (or (plist-get r :headline) "task")
+                                  'action (lambda (_)
+                                            (when (and m (marker-buffer m))
+                                              (pop-to-buffer (marker-buffer m))
+                                              (goto-char m)
+                                              (org-fold-show-context)))
+                                  'follow-link t)
+              (insert "\n")))
+          (insert "\nOptions: raise priority, cut effort, move the deadline, or pin less in front of it.\n"))
+        (goto-char (point-min))))
+    (pop-to-buffer buf)))
 
 ;;; Dynamic Repacking, Smart Bump & Real-Time Adaptation
 

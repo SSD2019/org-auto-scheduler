@@ -1535,6 +1535,13 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                                     (propertize (format "⛔ %d DEADLINE INFEASIBLE" neg-float-count)
                                                 'face 'error))
                           ""))
+             (risk-count (length (bound-and-true-p org-auto-scheduler--deadline-risks)))
+             (risk-badge (if (> risk-count 0)
+                             (format " │ %s"
+                                     (propertize (format "⚠ %d will miss deadline" risk-count)
+                                                 'face 'warning
+                                                 'help-echo "M-x org-auto-scheduler-deadline-risks"))
+                           ""))
              (marked-badge (if (and (boundp 'org-auto-scheduler--review-marked-ids)
                                     org-auto-scheduler--review-marked-ids)
                                (format " │ %s"
@@ -1551,8 +1558,9 @@ TASK is a list: (id start end tags consider headline sched-str marker depth stat
                            (format " │ %s"
                                    (propertize "📸 Snapshot: None [A]"
                                                'face 'shadow))))
-             (legend (format " %s │ %d scheduled (%.1fh)%s%s%s%s │%s"
-                             gauge total hours waiting-badge neg-badge marked-badge snap-badge proj-legend)))
+             (legend (format " %s │ %d scheduled (%.1fh)%s%s%s%s%s │%s"
+                             gauge total hours waiting-badge neg-badge risk-badge marked-badge snap-badge
+                             proj-legend)))
         (list "" (or (bound-and-true-p tabulated-list--header-string) "") "   " legend)))))
 
 ;;; Interactive Review Mode

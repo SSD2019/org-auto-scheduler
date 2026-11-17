@@ -222,6 +222,7 @@ M-x org-auto-scheduler-adherence-report
 | =org-auto-scheduler-overrun-mode-line-disable=      | Disable overrun indicator in the mode line.                                                |
 | =org-auto-scheduler-cleanup-placeholders=           | Clean up temporary placeholder subtasks and migrate any clock lines to parent tasks.       |
 | =org-auto-scheduler-validate-config=                | Verify configuration consistency.                                                          |
+| =org-auto-scheduler-deadline-risks=                 | List tasks the last run could not finish before their deadline (=R= in dispatch).          |
 | =org-auto-scheduler-adherence-mode-line-enable=     | Show live adherence score in the Emacs mode line.                                          |
 | =org-auto-scheduler-adherence-mode-line-disable=    | Remove adherence score from the mode line.                                                 |
 | =org-auto-scheduler-adherence-generate=             | Regenerate adherence scores for all available snapshot dates.                               |
@@ -1064,6 +1065,39 @@ Long uninterrupted blocks of deep work lead to cognitive fatigue, yet global Pom
   (setq org-auto-scheduler-pomodoro-work-minutes 25)      ;; Default work duration when omitted
   (setq org-auto-scheduler-pomodoro-break-minutes 5)      ;; Default break duration when omitted
   #+end_src
+
+** Deadline-Risk Warnings
+
+Every run (including the review preview) checks each task that has a =DEADLINE=
+against where it was actually placed. A task is at risk when its last chunk ends
+after the deadline, or when no slot was found for it at all. A date-only deadline
+means the end of working hours on that date; deadlines already past are left to the
+agenda's own overdue display.
+
+- After a manual run the echo area says, for example,
+  =⚠ 2 tasks will miss their deadline: Long report, Release notes=.
+- The review buffer header shows =⚠ N will miss deadline=.
+- =M-x org-auto-scheduler-deadline-risks= (or =R= in the dispatch menu) lists each
+  task with its deadline and planned finish; =RET= jumps to the task.
+
+This complements the =⛔ DEADLINE INFEASIBLE= badge, which only covers tasks in a
+dependency chain (critical-path float).
+
+** Days Off & Per-Day Working Hours
+
+#+begin_src emacs-lisp
+;; Vacation and one-off days off (dates or inclusive ranges)
+(setq org-auto-scheduler-days-off '("2026-12-24" ("2026-12-28" . "2027-01-02")))
+;; Also skip public holidays from `calendar-holidays'
+(setq org-auto-scheduler-skip-holidays t)
+;; Short Fridays, and a one-off late start
+(setq org-auto-scheduler-day-hours '((5 . ("09:00" . "13:00"))
+                                     ("2026-12-03" . ("11:00" . "19:00"))))
+#+end_src
+
+Days off apply to every task except pinned ones (a pin is an explicit time). A date
+entry in =org-auto-scheduler-day-hours= wins over a weekday entry; days without an
+entry use =org-auto-scheduler-start-time= / =org-auto-scheduler-end-time=.
 
 ** Protected Daily Catch-Up / Slack Window
 <<protected-daily-catchup--slack-window>>
