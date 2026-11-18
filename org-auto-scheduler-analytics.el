@@ -61,7 +61,9 @@ Prunes snapshots older than 30 days to prevent excessive file growth."
   (when (file-exists-p org-auto-scheduler-adherence-file)
     (load org-auto-scheduler-adherence-file t t t)))
 
-(add-hook 'kill-emacs-hook #'org-auto-scheduler-save-adherence)
+;; Not in batch Emacs: see the note above `org-auto-scheduler-save-history's hook.
+(unless noninteractive
+  (add-hook 'kill-emacs-hook #'org-auto-scheduler-save-adherence))
 (org-auto-scheduler-load-adherence)
 
 ;;; Schedule Adherence Tracking & Scoring

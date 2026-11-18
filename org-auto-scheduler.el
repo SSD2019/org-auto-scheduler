@@ -1508,8 +1508,11 @@ Defaults to `org-auto-scheduler-history.el` inside your Emacs directory."
   (when (file-exists-p org-auto-scheduler-history-file)
     (load org-auto-scheduler-history-file t t t)))
 
-;; Auto-save history when Emacs closes, and load when plugin loads
-(add-hook 'kill-emacs-hook #'org-auto-scheduler-save-history)
+;; Auto-save history when Emacs closes, and load when plugin loads.  Not in
+;; batch Emacs (`emacs -Q --batch', byte-compiling): it does not read your init
+;; file, so it would write default-path copies of the state files on exit.
+(unless noninteractive
+  (add-hook 'kill-emacs-hook #'org-auto-scheduler-save-history))
 (org-auto-scheduler-load-history)
 
 

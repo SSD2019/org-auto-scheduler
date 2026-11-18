@@ -454,7 +454,9 @@ and reconcile state from disk."
             (load org-auto-scheduler-review-state-file t t t)
             (setq org-auto-scheduler--state-file-last-mtime current-mtime)))))))
 
-(add-hook 'kill-emacs-hook #'org-auto-scheduler-save-review-decisions)
+;; Not in batch Emacs: see the note above `org-auto-scheduler-save-history's hook.
+(unless noninteractive
+  (add-hook 'kill-emacs-hook #'org-auto-scheduler-save-review-decisions))
 (org-auto-scheduler-load-review-decisions)
 
 (defun org-auto-scheduler-save-non-blocking-state (&optional no-merge)
