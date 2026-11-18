@@ -45,7 +45,7 @@ SCHEDULED: <2026-10-07 Wed 10:00-11:00>\n\
 :Effort: 1:00\n\
 :ID: co-low-c\n\
 :END:\n\
-** TODO [#B] Pinned Task :AUTOSCH:\n\
+** TODO [#B] Pinned Task :AUTOSCH:PINNED:\n\
 SCHEDULED: <2026-10-07 Wed 14:00-15:00>\n\
 :PROPERTIES:\n\
 :Effort: 1:00\n\

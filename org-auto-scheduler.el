@@ -2327,15 +2327,15 @@ Checks parent node properties (:ORDERED:, :PARALLEL:), tags (:PARALLEL:), then p
       sequential-setting)))
 
 (defun org-auto-scheduler-task-independent-p (marker)
-  "Return non-nil if task at MARKER is marked independent or parallel from siblings."
+  "Return non-nil if task at MARKER is marked independent or parallel from siblings.
+Only the INDEPENDENT or PARALLEL tag counts."
   (org-with-point-at marker
-    (let ((tags (org-get-tags nil t))
-          (independent (org-entry-get nil org-auto-scheduler-independent-property))
-          (parallel (org-entry-get nil org-auto-scheduler-parallel-property)))
-      (or (member "INDEPENDENT" tags)
-          (member "PARALLEL" tags)
-          (member (downcase (or independent "")) '("t" "yes" "1"))
-          (member (downcase (or parallel "")) '("t" "yes" "1"))))))
+    ;; The tag is the switch: a leftover :INDEPENDENT:/:PARALLEL: property
+    ;; does not count on its own.
+    (let ((tags (org-get-tags nil t)))
+      (and (or (member "INDEPENDENT" tags)
+               (member "PARALLEL" tags))
+           t))))
 
 (defun org-auto-scheduler--complex-sort-predicate (a b project-max-scores)
   "Return t if task A has higher priority than task B based on complex scheduling rules."
@@ -3437,7 +3437,6 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                 (let ((tags (delete "INDEPENDENT" (delete "PARALLEL" (org-get-tags nil t)))))
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
                (is-indep-on
-                (org-set-property org-auto-scheduler-independent-property "t")
                 (let ((tags (org-get-tags nil t)))
                   (cl-pushnew "INDEPENDENT" tags :test #'string=)
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))
@@ -3462,7 +3461,6 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                                     (delete "PINNABLE" (org-get-tags nil t)))))
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))
                (is-free-on
-                (org-set-property org-auto-scheduler-freeset-property "t")
                 (let ((tags (org-get-tags nil t)))
                   (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
                   (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))
@@ -3477,7 +3475,6 @@ and tags, updates priority and TODO state and Effort, processes clock-in/clock-o
                                           (org-entry-get nil org-auto-scheduler-pinned-time-property))))
                   (if incoming-time
                       (org-auto-scheduler-task-set-pinned-time marker task-id incoming-time)
-                    (org-set-property org-auto-scheduler-pinned-property "t")
                     (let ((tags (org-get-tags nil t)))
                       (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=)
                       (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags)))))))
@@ -4908,31 +4905,44 @@ The tag is the switch: removing it by hand turns splitting off.  A leftover
         (and (member org-auto-scheduler-splittable-tag (org-get-tags)) t)))
      (t nil))))
 
+(defun org-auto-scheduler--task-has-tag-p (marker task-id tags)
+  "Return non-nil if the task at MARKER (or with TASK-ID) has one of TAGS.
+When MARKER is nil the task is looked up by TASK-ID.  A task that cannot be
+found returns t, so an unknown task is not vetoed."
+  (let ((m (if (and marker (markerp marker) (marker-buffer marker))
+               marker
+             (and task-id (ignore-errors (org-id-find task-id 'marker))))))
+    (if (and m (markerp m) (marker-buffer m))
+        (org-with-point-at m
+          (let ((own (org-get-tags)))
+            (and (cl-some (lambda (tg) (member tg own)) tags) t)))
+      t)))
+
 (defun org-auto-scheduler-task-freeset-p (marker &optional task-id)
   "Return non-nil if task at MARKER or TASK-ID is marked as FREESET (or legacy PINNABLE).
 FREESET tasks can be scheduled or moved outside normal working hours,
-and split at midnight to the next day."
+and split at midnight to the next day.
+A review override from the current session wins; otherwise the tag
+\(`org-auto-scheduler-freeset-tag' or legacy PINNABLE) is the switch, so
+removing it by hand turns FREESET off.  Leftover properties and saved review
+decisions do not count on their own."
   (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
                             (org-with-point-at marker (org-id-get)))))
          (override (org-auto-scheduler--get-review-override tid))
          (override-freeset (and override (or (plist-get override :freeset)
                                              (plist-get override :pinnable))))
-         (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid marker)))
+         (live (and marker (markerp marker) (marker-buffer marker)))
+         (saved-dec (and tid (not live) (org-auto-scheduler-get-saved-decision tid marker)))
          (saved-freeset (and saved-dec (or (plist-get saved-dec :freeset)
                                            (plist-get saved-dec :pinnable)))))
     (cond
      (override-freeset t)
      ((and override (plist-member override :freeset) (null (plist-get override :freeset))) nil)
      ((and override (plist-member override :pinnable) (null (plist-get override :pinnable))) nil)
-     (saved-freeset t)
-     ((and marker (markerp marker) (marker-buffer marker))
-      (org-with-point-at marker
-        (let* ((tags (org-get-tags))
-               (prop (or (org-entry-get nil org-auto-scheduler-freeset-property)
-                         (org-entry-get nil "PINNABLE"))))
-          (or (member org-auto-scheduler-freeset-tag tags)
-              (member "PINNABLE" tags)
-              (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))))))
+     (live
+      (org-auto-scheduler--task-has-tag-p marker tid (list org-auto-scheduler-freeset-tag "PINNABLE")))
+     (saved-freeset
+      (org-auto-scheduler--task-has-tag-p nil tid (list org-auto-scheduler-freeset-tag "PINNABLE")))
      (t nil))))
 
 (defalias 'org-auto-scheduler-task-pinnable-p 'org-auto-scheduler-task-freeset-p)
@@ -4968,8 +4978,7 @@ Returns non-nil if now freeset."
               (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=)
               (if (fboundp 'org-set-tags-to)
                   (org-set-tags-to tags)
-                (org-set-tags tags))
-              (org-set-property org-auto-scheduler-freeset-property "t")))
+                (org-set-tags tags))))
           (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
             (let ((over (or (gethash tid org-auto-scheduler--review-overrides)
                             (list :order nil :skipped nil :target-date nil))))
@@ -5016,45 +5025,64 @@ Returns non-nil if task is now splittable, nil otherwise."
                      org-auto-scheduler--review-overrides)))
         new-split))))
 
+(defun org-auto-scheduler--task-raw-pinned-time (marker task-id)
+  "Return the pin time string stored for the task at MARKER or TASK-ID, or nil.
+Looks at the saved review decision, then `org-auto-scheduler-pinned-time-property'
+\(or a time given as the PINNED property's value)."
+  (let* ((m (if (and marker (markerp marker) (marker-buffer marker))
+                marker
+              (and task-id (ignore-errors (org-id-find task-id 'marker)))))
+         (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id m)))
+         (saved-time (and saved-dec (plist-get saved-dec :pinned-time)))
+         (prop-time (when (and m (markerp m) (marker-buffer m))
+                      (org-with-point-at m
+                        (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
+                            (let ((p (org-entry-get nil "PINNED")))
+                              (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p)))))))
+    (cl-find-if (lambda (v) (and (stringp v) (not (string-empty-p (string-trim v)))))
+                (list saved-time prop-time))))
+
 (defun org-auto-scheduler-task-pinned-p (marker &optional task-id)
-  "Return non-nil if task at MARKER or TASK-ID has an anchored pinned time."
+  "Return non-nil if task at MARKER or TASK-ID has an anchored pinned time.
+A review override from the current session wins.  Otherwise the task needs
+both the tag (`org-auto-scheduler-pinned-tag') and a pin time: removing the
+tag by hand unpins it, and a tag without a time anchors nothing."
   (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
                             (org-with-point-at marker (org-id-get)))))
          (override (org-auto-scheduler--get-review-override tid))
          (override-pinned (and override (or (plist-get override :pinned)
-                                            (plist-get override :pinned-time))))
-         (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid marker)))
-         (saved-pinned (and saved-dec (or (plist-get saved-dec :pinned)
-                                          (plist-get saved-dec :pinned-time)))))
+                                            (plist-get override :pinned-time)))))
     (cond
      (override-pinned t)
      ((and override (plist-member override :pinned) (null (plist-get override :pinned))) nil)
-     (saved-pinned t)
      ((and marker (markerp marker) (marker-buffer marker))
-      (org-with-point-at marker
-        (let* ((tags (org-get-tags))
-               (prop (org-entry-get nil org-auto-scheduler-pinned-property))
-               (time-prop (org-entry-get nil org-auto-scheduler-pinned-time-property)))
-          (or (member org-auto-scheduler-pinned-tag tags)
-              (and prop (not (member (downcase prop) '("nil" "no" "0" ""))))
-              (and time-prop (not (string-empty-p (string-trim time-prop))))))))
+      (and (org-auto-scheduler--task-has-tag-p marker tid (list org-auto-scheduler-pinned-tag))
+           (org-auto-scheduler--task-raw-pinned-time marker tid)
+           t))
+     ;; Only a task ID (e.g. every slot probe): cheap check of the saved
+     ;; decision first; look the task up for its tag only if it has a pin.
+     (tid
+      (let ((saved-dec (org-auto-scheduler-get-saved-decision tid nil)))
+        (and saved-dec (plist-get saved-dec :pinned-time)
+             (org-auto-scheduler--task-has-tag-p nil tid (list org-auto-scheduler-pinned-tag))
+             t)))
      (t nil))))
 
 (defun org-auto-scheduler-task-pinned-time (marker &optional task-id)
-  "Return the parsed pinned time for task at MARKER or TASK-ID as an Emacs time value, or nil."
+  "Return the parsed pinned time for task at MARKER or TASK-ID as an Emacs time value, or nil.
+Returns nil unless the task is pinned (see `org-auto-scheduler-task-pinned-p')."
   (let* ((tid (or task-id (when (and marker (markerp marker) (marker-buffer marker))
                             (org-with-point-at marker (org-id-get)))))
          (override (and tid (bound-and-true-p org-auto-scheduler--review-overrides)
                         (gethash tid org-auto-scheduler--review-overrides)))
          (override-time (and override (plist-get override :pinned-time)))
-         (saved-dec (and tid (org-auto-scheduler-get-saved-decision tid marker)))
-         (saved-time (and saved-dec (plist-get saved-dec :pinned-time)))
-         (prop-time (when (and marker (markerp marker) (marker-buffer marker))
-                      (org-with-point-at marker
-                        (or (org-entry-get nil org-auto-scheduler-pinned-time-property)
-                            (let ((p (org-entry-get nil "PINNED")))
-                              (and p (not (member (downcase p) '("t" "nil" "no" "1" ""))) p))))))
-         (raw-time (or override-time saved-time prop-time)))
+         (live (and marker (markerp marker) (marker-buffer marker)))
+         (raw-time (or override-time
+                       (and (org-auto-scheduler-task-pinned-p marker tid)
+                            (if live
+                                (org-auto-scheduler--task-raw-pinned-time marker tid)
+                              (plist-get (org-auto-scheduler-get-saved-decision tid nil)
+                                         :pinned-time))))))
     (when raw-time
       (org-auto-scheduler--parse-flexible-time raw-time marker))))
 
@@ -5096,7 +5124,7 @@ Otherwise pins the task to TIME-STR.  Returns the formatted pinned time or nil."
                 (if (fboundp 'org-set-tags-to)
                     (org-set-tags-to tags)
                   (org-set-tags tags))
-                (org-set-property org-auto-scheduler-pinned-property "t")
+                (org-entry-delete nil org-auto-scheduler-pinned-property)
                 (org-set-property org-auto-scheduler-pinned-time-property formatted-time)
                 (when (and tid (bound-and-true-p org-auto-scheduler--review-overrides))
                   (let ((over (gethash tid org-auto-scheduler--review-overrides)))

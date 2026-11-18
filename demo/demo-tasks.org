@@ -34,7 +34,7 @@
 :END:
 
 * Operations & Security :PROJECT:
-*** TODO [#A] Security Audit & Incident Post-Mortem Review :AUTOSCH:PINNABLE:
+*** TODO [#A] Security Audit & Incident Post-Mortem Review :AUTOSCH:PINNABLE:PINNED:
 :PROPERTIES:
 :Effort: 0:45
 :PINNED_TIME: 14:00

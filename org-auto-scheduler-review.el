@@ -693,6 +693,18 @@ When SILENT is non-nil, suppress confirmation message."
               (if existing
                   (setcdr existing decision)
                 (push (cons row-id decision) org-auto-scheduler--saved-review-decisions)))
+            ;; The tag is the switch for FREESET and PINNED, so a saved review
+            ;; pin or FREESET also adds the tag (removing it later by hand undoes it).
+            (when (and marker (markerp marker) (marker-buffer marker)
+                       (or freeset (and pinned pinned-time)))
+              (org-with-point-at marker
+                (let ((tags (org-get-tags nil t)))
+                  (when freeset
+                    (cl-pushnew org-auto-scheduler-freeset-tag tags :test #'string=))
+                  (when (and pinned pinned-time)
+                    (cl-pushnew org-auto-scheduler-pinned-tag tags :test #'string=))
+                  (unless (equal tags (org-get-tags nil t))
+                    (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))))))
             ;; Optionally write to Org properties
             (when (and marker (markerp marker) (marker-buffer marker)
                        (memq org-auto-scheduler-review-persistence-backend '(org-properties both)))
@@ -702,15 +714,10 @@ When SILENT is non-nil, suppress confirmation message."
                 (if target-date
                     (org-set-property org-auto-scheduler-target-date-property target-date)
                   (org-delete-property org-auto-scheduler-target-date-property))
-                (if freeset
-                    (progn
-                      (org-set-property org-auto-scheduler-freeset-property "t")
-                      (org-delete-property "PINNABLE"))
-                  (org-delete-property org-auto-scheduler-freeset-property)
-                  (org-delete-property "PINNABLE"))
-                (if pinned
-                    (org-set-property org-auto-scheduler-pinned-property "t")
-                  (org-delete-property org-auto-scheduler-pinned-property))
+                ;; FREESET/PINNED are tags now; drop the legacy flag properties.
+                (org-entry-delete nil org-auto-scheduler-freeset-property)
+                (org-entry-delete nil "PINNABLE")
+                (org-entry-delete nil org-auto-scheduler-pinned-property)
                 (if pinned-time
                     (org-set-property org-auto-scheduler-pinned-time-property pinned-time)
                   (org-delete-property org-auto-scheduler-pinned-time-property)))))))))
@@ -5664,15 +5671,19 @@ Bound strictly to `I' in `org-auto-scheduler-review-mode'."
       (user-error "Not on a task line"))
     (org-with-point-at m
       (org-back-to-heading t)
-      (let* ((curr (org-entry-get nil "INDEPENDENT"))
-             (is-ind (and curr (member (downcase curr) '("t" "yes" "true" "1"))))
+      ;; The INDEPENDENT tag is the switch; a legacy property is removed with it.
+      (let* ((tags (org-get-tags nil t))
+             (is-ind (member "INDEPENDENT" tags))
              (hl (org-get-heading t t t t)))
+        (org-entry-delete nil "INDEPENDENT")
         (if is-ind
             (progn
-              (org-delete-property "INDEPENDENT")
-              (message "Removed :INDEPENDENT: from '%s' (now part of sibling chain)." hl))
-          (org-set-property "INDEPENDENT" "t")
-          (message "Set :INDEPENDENT: t on '%s' (detached from sibling chain)." hl))))
+              (setq tags (delete "INDEPENDENT" tags))
+              (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))
+              (message "Removed INDEPENDENT tag from '%s' (now part of sibling chain)." hl))
+          (cl-pushnew "INDEPENDENT" tags :test #'string=)
+          (if (fboundp 'org-set-tags-to) (org-set-tags-to tags) (org-set-tags tags))
+          (message "Tagged '%s' INDEPENDENT (detached from sibling chain)." hl))))
     (org-auto-scheduler-dep-explorer-refresh)))
 
 (defun org-auto-scheduler-dep-explorer-toggle-ordered ()
@@ -5778,8 +5789,8 @@ Bound strictly to `I' in `org-auto-scheduler-review-mode'."
                        (todo (org-get-todo-state))
                        (hl (org-get-heading t t t t))
                        (tid (org-id-get))
-                       (ind-prop (org-entry-get nil "INDEPENDENT"))
-                       (is-ind (and ind-prop (member (downcase ind-prop) '("t" "yes" "true" "1"))))
+                       ;; Same rule as the scheduler: the INDEPENDENT/PARALLEL tag decides.
+                       (is-ind (org-auto-scheduler-task-independent-p (point-marker)))
                        (idx (if (and parent-seq (not is-ind))
                                 (let ((c (gethash parent-pos parent-counters 0)))
                                   (puthash parent-pos (1+ c) parent-counters)

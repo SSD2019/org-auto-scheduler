@@ -145,7 +145,7 @@
     (assert-equal (plist-get res :title) "Event to pin" "T13 cleaned title")
     (assert-true (org-auto-scheduler-task-pinned-p m) "T13 task-pinned-p is t")
     (assert-true (string-match-p "15:30" (or (org-entry-get nil "PINNED_TIME") "")) "T13 PINNED_TIME is 15:30")
-    (assert-equal (org-entry-get nil "PINNED") "t" "T13 PINNED property is t")
+    (assert-true (null (org-entry-get nil "PINNED")) "T13 no legacy PINNED property (the tag is the switch)")
     (assert-true (member "PINNED" (org-get-tags nil t)) "T13 has PINNED tag"))
 
   (outline-next-heading)

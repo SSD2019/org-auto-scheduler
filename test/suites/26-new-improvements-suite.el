@@ -225,8 +225,8 @@
     (with-current-buffer (find-file-noselect test-org)
       (goto-char (point-min))
       (re-search-forward ":ID:[ \t]*ui-task-2")
-      (assert-equal (org-entry-get nil "INDEPENDENT") "t"
-                    "Test 26.7h: Pressing 'i' in Dependency Explorer sets :INDEPENDENT: t on heading")))
+      (assert-true (member "INDEPENDENT" (org-get-tags nil t))
+                   "Test 26.7h: Pressing 'i' in Dependency Explorer tags the heading INDEPENDENT")))
   ;; End-of-Day Wrap-Up buffer
   (org-auto-scheduler-eod-review)
   (assert-true (get-buffer "*Org Auto Scheduler End-of-Day*")
