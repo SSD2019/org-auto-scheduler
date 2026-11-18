@@ -230,7 +230,7 @@ Return the list of task ids whose saved order was reset."
     (with-temp-file test-org
       (insert "* Tasks :PROJECT:\n:PROPERTIES:\n:PARALLEL: t\n:END:\n\
 ** TODO [#B] Unpinned X :AUTOSCH:\nSCHEDULED: <2026-10-07 Wed 10:00-11:00>\n:PROPERTIES:\n:Effort: 1:00\n:ID: t28-ov-x\n:END:\n\
-** TODO [#B] Pinned P :AUTOSCH:\nSCHEDULED: <2026-10-07 Wed 10:30-11:30>\n:PROPERTIES:\n:Effort: 1:00\n:PINNED: t\n:PINNED_TIME: 2026-10-07 10:30\n:ID: t28-ov-p\n:END:\n"))
+** TODO [#B] Pinned P :AUTOSCH:PINNED:\nSCHEDULED: <2026-10-07 Wed 10:30-11:30>\n:PROPERTIES:\n:Effort: 1:00\n:PINNED: t\n:PINNED_TIME: 2026-10-07 10:30\n:ID: t28-ov-p\n:END:\n"))
     (setq org-agenda-files (list test-org))
     (cl-letf (((symbol-function 'current-time) (lambda () fake-now)))
       (org-auto-scheduler-schedule-tasks))

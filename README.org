@@ -74,7 +74,7 @@ Tag it =AUTOSCH=, press a key, and your day is planned.
 - *Critical Path Method (CPM) & Float Analysis:* Computes forward/backward passes ($LS - ES$) on task dependency DAGs to identify bottlenecks, applying a score boost (=⚡=) to critical path tasks.
 - *Soft Project Batching:* Heuristically clusters tasks from the currently active project within a score tolerance (default 15%) to eliminate jarring context switching.
 - *Smart Non-Blocking Title Regexp:* Automatically treats calendar events matching patterns like Lunch, Gym, Commute, OOO as non-blocking free time, with explicit =:NON_BLOCKING: nil= overrides.
-- *Protected Daily Catch-Up / Slack Window:* Configurable daily slack window (e.g. 16:00–17:00) that standard tasks skip over, while allowing lightweight =:FREESET: t= tasks to schedule into it.
+- *Protected Daily Catch-Up / Slack Window:* Configurable daily slack window (e.g. 16:00–17:00) that standard tasks skip over, while allowing lightweight =:FREESET:=-tagged tasks to schedule into it.
 - *Smart Start Buffer:* 0-minute immediate scheduling when actively clocked into a task, and a 5-minute buffer when unclocked.
 - *Historical Effort Learning:* Learns from your actual vs. estimated times per category.
 - *Time & Energy Blocks:* Hard and soft constraints for context-based scheduling.
@@ -280,8 +280,7 @@ These properties go inside the task's =:PROPERTIES:= drawer.
 | =PROJECT_PRIORITY=        | Integer                                         | Explicit priority for the whole project (set on the =:PROJECT:= heading).          |
 | =PROJECT_INTERLEAVE=      | =t= / =yes= / =nil= / =no=                     | Override interleaving policy for this project. Unset = use global default.         |
 | =ORDERED=                 | =t= / =yes= / =nil= / =no=                      | Sibling ordering policy on parent headings. When =nil= or =no=, subtasks are scheduled concurrently by score. |
-| =PARALLEL=                | =t= / =yes= / =nil= / =no=                      | Set on parent to schedule subtasks concurrently in parallel, or on an individual task to decouple it from siblings. |
-| =INDEPENDENT=             | =t= / =yes=                                     | Decouples this task from sibling outline sequencing chains, allowing it to schedule as soon as its score permits. |
+| =PARALLEL=                | =t= / =yes= / =nil= / =no=                      | Set on parent to schedule subtasks concurrently in parallel. (To decouple one task, tag it =:INDEPENDENT:= or =:PARALLEL:=.) |
 | =PROJECT_ORDERED=         | =t= / =yes= / =nil= / =no=                      | Project-wide default for whether subtasks under headings are sequential (=t=) or parallel (=nil=). |
 | =PROJECT_PARALLEL=        | =t= / =yes= / =nil= / =no=                      | Project-wide default to allow subtasks across the project to be scheduled concurrently in parallel (=t=). |
 
@@ -457,7 +456,7 @@ Tasks are sorted with an advanced DAG topological sort (Kahn's algorithm) augmen
    keep their textual outline order by default (=org-auto-scheduler-siblings-sequential=).
    Siblings can be scheduled concurrently in parallel (prioritized by score instead
    of outline position) by setting =:ORDERED: nil= or =:PARALLEL: t= on the parent heading,
-   =:PROJECT_ORDERED: nil= on the project root, or =:INDEPENDENT: t= on a specific task.
+   =:PROJECT_ORDERED: nil= on the project root, or the =:INDEPENDENT:= tag on a specific task.
 3. Project-level priority (=PROJECT_PRIORITY= property).
 4. *Critical Path & Float Time Analysis (CPM):*
    When =org-auto-scheduler-critical-path-enabled= is =t= (default), the scheduler performs a forward pass to compute Early Start (=ES=) and a backward DAG pass from project endpoints to compute Late Start (=LS=). The difference ($LS - ES$) gives the *Total Float* in hours. Tasks with zero or near-zero float ($\le$ =org-auto-scheduler-critical-path-max-float-hours=, default 0.5 hours) are critical bottlenecks whose delay would postpone the entire project chain. These tasks:
@@ -646,7 +645,7 @@ If you run Emacs on multiple devices (e.g. desktop and laptop synchronized via G
 | *Move Before Task*                    | =O=                           | =O=                  | Pick target task by name (keyboard drag)                |
 | *Toggle Non-Blocking (Fixed Events)*  | =B=, =b=                      | =B=                  | Toggle 🔒 on fixed agenda event                         |
 | *Toggle SPLITTABLE*                   | =s=                           | =s=                  | Toggle the =SPLITTABLE= tag (splits across gaps/days)   |
-| *Toggle FREESET*                      | =F=                           | =F=                  | Toggle ⚡ property (off-hours flexible; midnight split)  |
+| *Toggle FREESET*                      | =F=                           | =F=                  | Toggle the =FREESET= tag (off-hours; midnight split)    |
 | *Edit Effort (What-If)*               | =e=                           | =e=                  | Edit effort in minutes (redirects chunks to parent)     |
 | *Undo Review Action*                  | =U=, =u=                      | =U=                  | Restore overrides, entries, and tasks; refresh grid     |
 | *Move Up / Earlier*                   | =K=                           | =K=                  | Move earlier in scheduling order (crosses days)         |
@@ -783,7 +782,7 @@ Org Auto Scheduler solves this with *Safe Preservation* (=org-auto-scheduler-pre
   - Keeps all of today's scheduled tasks anchored at their existing times during background runs unless displaced by a newly added task, a calendar collision, a stale =BLOCKER= inversion, or an explicit =-r-= / =-r-all-= marker.
   - Prevents background runs from reshuffling your afternoon when you work from a mobile calendar without clocking in on Emacs.
 - *=clocked-only= (Opt-In — Best for Active =org-clock= Workflows):*
-  - Protects *only* the actively clocked-in task and pinned tasks (=:PINNED: t= / =-p-=).
+  - Protects *only* the actively clocked-in task and pinned tasks (=:PINNED:= tag / =-p-=).
   - Keeps today's schedule completely still (zero drift) on idle runs *as long as* three invariants hold:
     1. Upcoming unpinned tasks are in score/dependency order (checked via drift-free input fingerprints that ignore intraday CPM float changes, and excluding intentional hard time blocks, soft energy blocks, =NOT_BEFORE=, or backfilled gap tasks).
     2. No unfinished, unclocked task has lapsed beyond the grace period (=org-auto-scheduler-background-lapse-grace-minutes=, default =30= minutes, measured according to =org-auto-scheduler-background-lapse-reference=: ='start-or-end= = $\min(\text{start} + \text{grace}, \text{end})$, ='start=, or ='end=).
@@ -807,10 +806,10 @@ You can add lightweight modifier markers directly to the task title in any calen
 | =-r-= or =(-r-)= | *Reschedule Cascade* | Reschedules this task and all subsequent tasks today in their previously scheduled relative order. Tasks scheduled before it remain preserved. Pinned tasks stay fixed at their =PINNED_TIME=. |
 | =-s-= or =(-s-)= | *Enable Splittable* | Marks the task as =SPLITTABLE= (adds the =:SPLITTABLE:= tag). |
 | =-\s-= or =(-\s-)= | *Remove Splittable* | Unsets the =SPLITTABLE= behavior (removes the =:SPLITTABLE:= tag and any legacy =:SPLITTABLE:= property). |
-| =-f-= or =(-f-)= | *Enable Freeset* | Marks the task as =FREESET= (allows scheduling outside normal workday hours or across midnight; sets property and tag). |
-| =-\f-= or =(-\f-)= | *Remove Freeset* | Unsets the =FREESET= behavior (deletes =:FREESET:= and =:PINNABLE:= properties and removes tags). |
-| =-p-= or =(-p-)= | *Pin Task* | Pins the task to the incoming/updated scheduled time (sets =:PINNED: t=, records =:PINNED_TIME:=, adds =:PINNED:= tag), locking it from being moved. |
-| =-\p-= or =(-\p-)= | *Unpin Task* | Unpins the task (deletes =:PINNED:= and =:PINNED_TIME:= properties, removes =:PINNED:= tag), allowing the scheduler to freely reschedule it. |
+| =-f-= or =(-f-)= | *Enable Freeset* | Marks the task as =FREESET= (allows scheduling outside normal workday hours or across midnight; adds the =:FREESET:= tag). |
+| =-\f-= or =(-\f-)= | *Remove Freeset* | Unsets the =FREESET= behavior (removes the =:FREESET:= / =:PINNABLE:= tags and any legacy properties). |
+| =-p-= or =(-p-)= | *Pin Task* | Pins the task to the incoming/updated scheduled time (records =:PINNED_TIME:= and adds the =:PINNED:= tag), locking it from being moved. |
+| =-\p-= or =(-\p-)= | *Unpin Task* | Unpins the task (removes the =:PINNED:= tag and deletes =:PINNED_TIME:= and any legacy =:PINNED:= property), allowing the scheduler to freely reschedule it. |
 | =-x-= or =(-x-)= or =(-done-)= | *Mark DONE* | Immediately completes the task (sets TODO state to =DONE=, removes =AUTOSCH_SCHEDULED= and scheduled timestamp), freeing subsequent time slots. |
 | =-kill-=, =(-kill-)=, =(-drop-)=, =(-c-)= | *Cancel / Drop Task* | Cancels the task with the configured kill state (default =DROPPED=, customizable via =org-auto-scheduler-kill-todo-state=), removing its schedule. |
 | =-e<dur>-= (e.g. =(-e30m-)=, =(-e1h-)=, =(-e1:30-)=) | *Update Effort* | Updates the task's =:Effort:= property in place (e.g. =00:30=, =01:00=, =01:30=) and reschedules with the new duration. |
@@ -821,8 +820,8 @@ You can add lightweight modifier markers directly to the task title in any calen
 | =-#B-=, =(-#B-)=, =(-#b-)=, =(-pri-b-)=, =(-!b-)= | *Set Priority B* | Sets Org task priority to =B= (=org-priority ?B=) and triggers a reschedule. |
 | =-#C-=, =(-#C-)=, =(-#c-)=, =(-pri-c-)=, =(-!c-)= | *Set Priority C* | Sets Org task priority to =C= (=org-priority ?C=) and triggers a reschedule. |
 | =-\#-=, =(-\!-)=, =(-pri-none-)= | *Clear Priority* | Removes the priority cookie from the task heading. |
-| =-i-= or =(-i-)= or =(-indep-)= | *Independent of Siblings* | Decouples the task from sequential outline sibling chains (sets =:INDEPENDENT: t= property and =:INDEPENDENT:= tag), allowing it to schedule as soon as its score permits. Triggers a reschedule. |
-| =-\i-= or =(-\i-)= or =(-\indep-)= | *Remove Independent* | Restores outline sibling sequencing (removes =:INDEPENDENT:= and =:PARALLEL:= properties and tags). |
+| =-i-= or =(-i-)= or =(-indep-)= | *Independent of Siblings* | Decouples the task from sequential outline sibling chains (adds the =:INDEPENDENT:= tag), allowing it to schedule as soon as its score permits. Triggers a reschedule. |
+| =-\i-= or =(-\i-)= or =(-\indep-)= | *Remove Independent* | Restores outline sibling sequencing (removes the =:INDEPENDENT:= / =:PARALLEL:= tags and any legacy properties). |
 | =-ci-=, =(-ci-)=, =(-clockin-)= | *Clock In (Now or Slot Start)* | Starts the Org clock on this task. If =now= is within the task's scheduled window =[start, end]= and no clock is running, clocks in at =start=; otherwise clocks in at =now=. |
 | =-ci<time>-= (e.g. =(-ci14:30-)=, =(-ci10:15am-)=, =(-ci2:30pm-)=, =(-ci2pm-)=) | *Clock In at Time* | Starts the Org clock on this task at the specified 24-hour or 12-hour (=am=/=pm=) time today. |
 | =-co-=, =(-co-)=, =(-clockout-)= | *Clock Out (Now)* | Clocks out of the task at =now= (if currently clocked into this task, closes the running clock; otherwise records a closed =:LOGBOOK:= clock entry from the task's scheduled start to =now=), reducing remaining effort and triggering a reschedule. |
@@ -842,7 +841,7 @@ When you add a *newly added task* (an =AUTOSCH= task that is unscheduled or sche
 - *Strict Protection for Lapsed & Current Work:*
   - *Lapsed tasks* (tasks that started earlier today in the past) are *never moved automatically*.
   - *Current tasks* (tasks currently in progress or actively clocked in) are *never moved automatically*.
-  - *Pinned tasks* (tasks with =:PINNED: t= or =:PINNED_TIME:=) are *never moved automatically*.
+  - *Pinned tasks* (tagged =:PINNED:= with a =:PINNED_TIME:=) are *never moved automatically*.
 - *Zero Churn on Idle Runs:* If no unscheduled tasks exist (and no =-r-= marker is present), upcoming unpinned tasks remain locked in place across background idle syncs.
 
 *** Background Run Change Logging
@@ -980,13 +979,13 @@ Inside the Review & Apply buffer:
 ** FREESET Tasks (Flexible Hours & Midnight Splitting)
 <<freeset-tasks-flexible-hours--midnight-splitting>>
 
-A task marked as =FREESET= (via tag =:freeset:= or property =:FREESET: t=) bypasses normal working hour constraints during review and reordering:
+A task tagged =:FREESET:= bypasses normal working hour constraints during review and reordering. The tag is the switch: removing it by hand turns =FREESET= off, and a leftover =:FREESET: t= property is ignored:
 
 - *Initial Automatic Scheduling:* Scheduled according to usual order, priority, and working hours (=org-auto-scheduler-start-time= to =org-auto-scheduler-end-time=).
 - *Freely Reorderable:* In the review table and timegrid buffers, =FREESET= tasks can be moved anywhere, including before workday start or after workday end.
 - *Midnight Splitting:* If a =FREESET= task extends past midnight (=24:00=), it automatically splits across midnight: today's chunk runs until 00:00, and the remainder rolls over to the next day as a placeholder subtask.
 - *Toggle Shortcut:* Press =F= in the Review buffer or timegrid to toggle =FREESET= without any prompt. Displays the =⚡ = badge in the review table.
-- *Backwards Compatibility:* Legacy tag =:pinnable:= and property =:PINNABLE: t= are fully supported as aliases for =FREESET=.
+- *Backwards Compatibility:* The legacy =:PINNABLE:= tag is supported as an alias for =FREESET=; the =:PINNABLE: t= property is ignored.
 
 ** PINNED Tasks (Exact-Time Anchoring)
 <<pinned-tasks-exact-time-anchoring>>
@@ -998,7 +997,7 @@ A task marked as =PINNED= is anchored to an exact designated time (=YYYY-MM-DD H
 - *Subsequent Operations:* Pinned times persist across subsequent scheduler runs and review recalculations until explicitly cleared.
 - *Review Shortcut:* Press =P= (or =p= in review) to pin a task. By default, the prompt is pre-filled with the task's current preview start time in the buffer.
 - *Unpinning:* To unpin, press =C-u P= (or =C-u p=) or submit an empty string at the prompt. Displays the =📌 = badge in the review table.
-- *Properties & Tags:* Saved as property =:PINNED_TIME: YYYY-MM-DD HH:MM= and =:PINNED: t= (or tag =:pinned:=).
+- *Tag & Time:* A pin is the =:PINNED:= tag plus the time in property =:PINNED_TIME: YYYY-MM-DD HH:MM=. The tag is the switch: removing it by hand unpins the task, and the tag without a time anchors nothing. A legacy =:PINNED: t= property is ignored. Pins saved from the review buffer add the tag.
 
 ** Dynamic Real-Time Adaptation & Execution
 <<dynamic-real-time-adaptation--execution>>
@@ -1124,7 +1123,7 @@ To protect against afternoon schedule compression, unplanned meetings, and task 
   (setq org-auto-scheduler-daily-catchup-block '("16:00" . "17:00"))
   #+end_src
 - *Protected Slack Buffer:* Standard autoscheduled tasks treat this time window as strictly unavailable, automatically jumping over it to subsequent open slots or rolling over to the next morning.
-- *Flexible Task Exception (=:FREESET: t=):* Tasks marked with =:FREESET: t= (or tagged =:FREESET:=) are allowed to schedule into this catch-up window. This makes the block perfect for lightweight end-of-day email triage, inbox zero, or daily planning tasks.
+- *Flexible Task Exception (=:FREESET:= tag):* Tasks tagged =:FREESET:= are allowed to schedule into this catch-up window. This makes the block perfect for lightweight end-of-day email triage, inbox zero, or daily planning tasks.
 
 ** Customization Reference
 
@@ -1217,7 +1216,7 @@ Same format as time blocks, but these are preferences, not hard constraints.
 | =org-auto-scheduler-siblings-sequential=  | =t=                    | When =t= (default), subtasks under the same parent schedule sequentially in outline order unless marked parallel. |
 | =org-auto-scheduler-ordered-property=     | ="ORDERED"=            | Heading property for sequence ordering (matches Org's built-in =:ORDERED:= property). |
 | =org-auto-scheduler-parallel-property=    | ="PARALLEL"=           | Property name on parent headings or tasks to enable parallel / concurrent scheduling. |
-| =org-auto-scheduler-independent-property= | ="INDEPENDENT"=        | Property name to mark an individual task as independent from its siblings. |
+| =org-auto-scheduler-independent-property= | ="INDEPENDENT"=        | Legacy property; ignored now (the =INDEPENDENT= tag decides).                         |
 | =org-auto-scheduler-interleave-projects=   | =t=                    | When =t=, tasks from different projects interleave by score.            |
 | =org-auto-scheduler-project-interleave-property= | ="PROJECT_INTERLEAVE"= | Property name on =:PROJECT:= headings to override the global default.  |
 | =org-auto-scheduler-project-priority-property=   | ="PROJECT_PRIORITY"=  | Property name for an explicit numeric project priority.                 |

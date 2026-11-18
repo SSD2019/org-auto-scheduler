@@ -38,7 +38,7 @@ SCHEDULED: <%s %s 21:00-22:00>\n\
 :Effort: 1:00\n\
 :ID: newtest-id-2\n\
 :END:\n\
-*** TODO Upcoming Pinned 3 :AUTOSCH:\n\
+*** TODO Upcoming Pinned 3 :AUTOSCH:PINNED:\n\
 SCHEDULED: <%s %s 22:00-23:00>\n\
 :PROPERTIES:\n\
 :Effort: 1:00\n\

@@ -13,7 +13,7 @@
          (today-str (format-time-string "%Y-%m-%d" now))
          (tmr (time-add now (days-to-time 1)))
          (yesterday (time-subtract now (days-to-time 1))))
-    (insert (format "* TODO Due today\nDEADLINE: <%s>\n* TODO Due yesterday\nDEADLINE: <%s>\n* TODO Pinned due today :PINNED:\nDEADLINE: <%s>\n* TODO No deadline\n"
+    (insert (format "* TODO Due today\nDEADLINE: <%s>\n* TODO Due yesterday\nDEADLINE: <%s>\n* TODO Pinned due today :PINNED:\nDEADLINE: <%s>\n:PROPERTIES:\n:PINNED_TIME: 09:00\n:END:\n* TODO No deadline\n"
                     today-str
                     (format-time-string "%Y-%m-%d" yesterday)
                     today-str))
