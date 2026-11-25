@@ -3981,6 +3981,42 @@ CLOCKED-ONLY-MODE and REPLAN-LAPSED are the run settings from
           :past-deadline has-slot-past-deadline
           :replan-until replan-until)))
 
+(defvar org-auto-scheduler--has-incomplete-predecessor nil
+  "Non-nil while placing a task whose predecessor has unplaced effort.")
+
+(defun org-auto-scheduler--set-unplaced-effort (task-id minutes)
+  "Record MINUTES of unplaced effort on TASK-ID's parent placement."
+  (let ((parent (assoc task-id org-auto-scheduler-completed-tasks)))
+    (when parent
+      (when (< (length parent) 11)
+        (nconc parent (make-list (- 11 (length parent)) nil)))
+      (setcdr (nthcdr 10 parent)
+              (plist-put (nthcdr 11 parent) :unplaced-effort minutes)))))
+
+(defun org-auto-scheduler--get-task-placement (task-id &optional marker)
+  "Return (COMPLETE-P . END-TIME) for TASK-ID and all its placed chunks.
+Return nil if the parent is not scheduled.  MARKER is a fallback for tasks
+without an ID.  A partial placement is never considered complete."
+  (let* ((parent (or (and task-id (assoc task-id org-auto-scheduler-completed-tasks))
+                     (and marker
+                          (cl-find-if (lambda (entry)
+                                        (and (eq (nth 7 entry) marker)
+                                             (not (eq (nth 9 entry) :placeholder))))
+                                      org-auto-scheduler-completed-tasks))))
+         (status (and parent (nth 9 parent)))
+         (end (and parent (nth 2 parent)))
+         (unplaced (and parent (plist-get (nthcdr 11 parent) :unplaced-effort))))
+    (when parent
+      (dolist (entry org-auto-scheduler-completed-tasks)
+        (let ((is-part (and task-id (eq (nth 9 entry) :placeholder)
+                            (equal (plist-get (nthcdr 11 entry) :origin-id) task-id)))
+              (part-end (nth 2 entry)))
+          (when (and is-part part-end (or (null end) (time-less-p end part-end)))
+            (setq end part-end))))
+      (cons (and end (not (memq status '(:failed :blocked :skipped)))
+                 (not (and unplaced (> unplaced 0))))
+            end))))
+
 (defun org-auto-scheduler--evict-invalid-preserved (preserved-entries final-schedule-list
                                                      sorted-tasks-info has-r-trigger now)
   "Drop kept slots that can no longer stand and queue their tasks for placement.
@@ -4026,6 +4062,14 @@ one of its unfinished BLOCKERs finishes."
                    (blocker-invalid
                     (and (not protected)
                          m (markerp m) (marker-buffer m)
+                         (or (and (hash-table-p org-auto-scheduler--last-preds-map)
+                                  (cl-some
+                                   (lambda (pred-id)
+                                     (let* ((pred (gethash pred-id pres-map))
+                                            (pred-marker (plist-get pred :marker)))
+                                       (and pred-marker
+                                            (org-auto-scheduler--find-child-placeholders pred-marker pred-id))))
+                                   (gethash tid org-auto-scheduler--last-preds-map)))
                          (let ((blockers (org-auto-scheduler-get-blockers m))
                                (inv nil))
                            (dolist (bm blockers)
@@ -4037,14 +4081,16 @@ one of its unfinished BLOCKERs finishes."
                                   ((or b-in-sched (gethash bid evicted-ids))
                                    (setq inv t))
                                   (b-pres
-                                   (let ((b-et (plist-get b-pres :end-time)))
-                                     (when (and b-et st (time-less-p st b-et))
+                                   (let ((b-et (plist-get b-pres :end-time))
+                                         (has-parts (and bid (org-auto-scheduler--find-child-placeholders bm bid))))
+                                     (when (or has-parts (and b-et st (time-less-p st b-et)))
                                        (setq inv t))))
                                   (t
-                                   (let ((b-et (org-auto-scheduler-calculate-task-end-time bm)))
-                                     (when (or (null b-et) (and st (time-less-p st b-et)))
+                                   (let ((b-et (org-auto-scheduler-calculate-task-end-time bm))
+                                         (has-parts (and bid (org-auto-scheduler--find-child-placeholders bm bid))))
+                                     (when (or has-parts (null b-et) (and st (time-less-p st b-et)))
                                        (setq inv t))))))))
-                           inv))))
+                           inv)))))
               ;; A pinned/clocked entry is never evicted itself, so when it overlaps
               ;; an earlier unprotected entry, evict that earlier entry instead.
               (when (and protected st et)
@@ -4118,6 +4164,7 @@ Returns (CURRENT-TIME . TASKS-SCHEDULED) after the last placement."
   (let ((reporter (unless org-auto-scheduler-silent-mode
                     (make-progress-reporter "Scheduling tasks..." 0 total-tasks)))
         (task-finish-times (make-hash-table :test 'equal))
+        (unplaced-task-ids (make-hash-table :test 'equal))
         (open-gap-floor nil)
         (prev-ordered-finish nil)
         (last-non-interleave-proj nil)
@@ -4125,7 +4172,8 @@ Returns (CURRENT-TIME . TASKS-SCHEDULED) after the last placement."
     ;; Seed task-finish-times with preserved entries
     (dolist (e preserved-entries)
       (let* ((tid (plist-get e :task-id))
-             (eff-et (org-auto-scheduler--preserved-entry-end e now)))
+             (placement (org-auto-scheduler--get-task-placement tid))
+             (eff-et (and (car placement) (cdr placement))))
         (when (and tid eff-et)
           (puthash tid (time-add eff-et (seconds-to-time (* 60 org-auto-scheduler-task-gap)))
                    task-finish-times))))
@@ -4152,6 +4200,7 @@ Returns (CURRENT-TIME . TASKS-SCHEDULED) after the last placement."
                              (hash-table-p org-auto-scheduler--last-preds-map)
                              (gethash task-id org-auto-scheduler--last-preds-map)))
                  (dep-floor nil)
+                 (has-incomplete-predecessor nil)
                  (saved-dec (and task-id (org-auto-scheduler-get-saved-decision task-id marker)))
                  (has-saved-order (and saved-dec
                                       (not (plist-get saved-dec :is-new))
@@ -4160,7 +4209,11 @@ Returns (CURRENT-TIME . TASKS-SCHEDULED) after the last placement."
                  (proj-id (nth 2 task-info))
                  (allows-interleave (nth 9 task-info)))
             (dolist (p-id preds)
-              (let ((pf (gethash p-id task-finish-times)))
+              (let ((pf (gethash p-id task-finish-times))
+                    (placement (org-auto-scheduler--get-task-placement p-id)))
+                (when (or (gethash p-id unplaced-task-ids)
+                          (and placement (not (car placement))))
+                  (setq has-incomplete-predecessor t))
                 (when (and pf (or (null dep-floor) (time-less-p dep-floor pf)))
                   (setq dep-floor pf))))
             (when (and has-saved-order prev-ordered-finish
@@ -4178,17 +4231,23 @@ Returns (CURRENT-TIME . TASKS-SCHEDULED) after the last placement."
                         (let ((cand (if (and dep-floor (time-less-p open-gap-floor dep-floor))
                                         dep-floor
                                       open-gap-floor)))
-                          (if (time-less-p cand current-time) cand current-time))
-                      current-time))
-                   (next-t (org-auto-scheduler-schedule-single-task marker search-start (nth 14 task-info)))
+                          (let ((start (if (time-less-p cand current-time) cand current-time)))
+                            (if (and dep-floor (time-less-p start dep-floor)) dep-floor start)))
+                      (if (and dep-floor (time-less-p current-time dep-floor)) dep-floor current-time)))
+                   (next-t (let ((org-auto-scheduler--has-incomplete-predecessor has-incomplete-predecessor))
+                             (org-auto-scheduler-schedule-single-task marker search-start (nth 14 task-info))))
                    (newly-scheduled (> (length org-auto-scheduler-completed-tasks) prev-completed-count))
                    (top-entry (and newly-scheduled (car org-auto-scheduler-completed-tasks)))
                    (top-status (and top-entry (nth 9 top-entry)))
                    (actual-start (and top-entry
                                       (not (memq top-status '(:failed :blocked :skipped)))
                                       (nth 1 top-entry))))
-              (when (and task-id next-t)
-                (puthash task-id next-t task-finish-times))
+              (let ((placement (and task-id (org-auto-scheduler--get-task-placement task-id marker))))
+                (when task-id
+                  (if (and placement (car placement))
+                      (puthash task-id (time-add (cdr placement) (seconds-to-time (* 60 org-auto-scheduler-task-gap)))
+                               task-finish-times)
+                    (puthash task-id t unplaced-task-ids))))
               (when has-saved-order
                 (setq prev-ordered-finish next-t))
               (when (and proj-id (not allows-interleave))
@@ -5322,6 +5381,7 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
          (max-attempts (* 10 (max 1 org-auto-scheduler-max-days-to-check)))
          (attempts 0)
          (last-today-end search-time)
+         (first-search-day (time-to-days search-time))
          (existing-phs (unless org-auto-scheduler--preview-mode
                          (org-auto-scheduler--find-child-placeholders marker origin-id)))
          (handled-part-nums '()))
@@ -5333,6 +5393,10 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
              (ph-slot (if time-block
                           (org-auto-scheduler-next-available-time-in-block search-time time-block req-dur)
                         (org-auto-scheduler-next-available-time search-time req-dur tags))))
+        (when (and ph-slot
+                   (>= (- (time-to-days ph-slot) first-search-day)
+                       org-auto-scheduler-max-days-to-check))
+          (setq ph-slot nil attempts max-attempts))
         (if (null ph-slot)
             (progn
               (setq search-time (org-auto-scheduler-next-day-start search-time))
@@ -5442,6 +5506,7 @@ Returns the end-time of the last placeholder scheduled today, or SEARCH-TIME."
                   (when (and clocks marker (markerp marker) (marker-buffer marker))
                     (org-with-point-at marker
                       (org-auto-scheduler--insert-clock-entries (nreverse clocks)))))))))))
+    (org-auto-scheduler--set-unplaced-effort origin-id rem-effort)
     last-today-end))
 
 (defun org-auto-scheduler--clocked-minutes-in-window (marker start end)
@@ -5614,6 +5679,7 @@ Returns the end-time of the last Pomodoro chunk."
                 (org-cut-subtree)
                 (setq org-auto-scheduler--session-cleaned-placeholders
                       (1+ (or org-auto-scheduler--session-cleaned-placeholders 0)))))))))
+    (org-auto-scheduler--set-unplaced-effort origin-id rem-effort)
     last-end))
 
 (defun org-auto-scheduler-get-min-chunk (marker)
@@ -5743,14 +5809,12 @@ START-TIME and END-TIME define the scheduled window."
 When ALL-PLACEHOLDERS is non-nil (or called interactively), removes ALL placeholders.
 When ALL-PLACEHOLDERS is nil, only removes:
 1. Placeholders with clock entries (clocks transferred to parent task).
-2. Placeholders marked DONE (parent task marked DONE as well).
+2. Placeholders marked DONE (the parent remains in its current state).
 3. Orphaned placeholders whose parent task no longer exists, is DONE, is
    waiting, lost its AUTOSCH tag, or is no longer splittable.
 Active valid placeholders of TODO splittable tasks are preserved to avoid churn.
 
-Safeguards:
-1. If any cleaned placeholder contains clock entries, transfer them to the parent task.
-2. If any cleaned placeholder was marked DONE, mark the parent task DONE as well."
+Any clock entries in a cleaned placeholder are transferred to its parent."
   (interactive (list t))
   (let ((total-deleted 0)
         (total-clocks-preserved 0)
@@ -5839,12 +5903,7 @@ Safeguards:
                                   (org-auto-scheduler--insert-clock-entries clock-lines))
                                 (setq total-clocks-preserved (+ total-clocks-preserved (length clock-lines)))
                                 (org-auto-scheduler--log-info* "[org-auto-scheduler-cleanup-placeholders] Preserved %d clock entries from placeholder to parent task"
-                                                              (length clock-lines))))
-                            ;; If placeholder was marked DONE, mark parent DONE
-                            (when (and is-done parent-exists)
-                              (org-with-point-at parent-marker
-                                (org-todo (or (car org-done-keywords) "DONE")))
-                              (org-auto-scheduler--log-info* "[org-auto-scheduler-cleanup-placeholders] Marked parent task DONE based on completed placeholder"))))))))
+                                                              (length clock-lines))))))))))
                 (when modified
                   (save-buffer))))))))
     (when (or (> total-deleted 0) (> total-clocks-preserved 0))
@@ -6237,13 +6296,13 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                                   (format-time-string "%Y-%m-%d %a %H:%M" today-end))))
                                        (origin-id (or task-id (org-with-point-at marker (org-id-get-create)))))
                                   (if org-auto-scheduler--preview-mode
-                                      (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
+                                      (push (list origin-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :split-today nil :split-today t)
                                             org-auto-scheduler-completed-tasks)
                                     (org-auto-scheduler--set-scheduled schedule-string)
                                     (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
                                       (org-set-property org-auto-scheduler-scheduled-property "t"))
                                     (org-auto-scheduler--cleanup-task-placeholders marker origin-id)
-                                    (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
+                                    (push (list origin-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :split-today nil :split-today t)
                                           org-auto-scheduler-completed-tasks))
                                   (let* ((next-day-start (org-auto-scheduler-next-day-start available-time))
                                          (last-end (org-auto-scheduler--place-split-placeholders
@@ -6303,12 +6362,12 @@ TOPO-DEPTH represents Kahn's Topological Sort computed depth."
                                  (total-parts (+ (/ remaining-effort pomo-work)
                                                  (if (> (% remaining-effort pomo-work) 0) 1 0))))
                             (if org-auto-scheduler--preview-mode
-                                (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :pomodoro-parent nil)
+                                (push (list origin-id available-time today-end '("AUTOSCH") t headline schedule-string marker topo-depth :pomodoro-parent nil)
                                       org-auto-scheduler-completed-tasks)
                               (org-auto-scheduler--set-scheduled schedule-string)
                               (unless (equal (org-entry-get nil org-auto-scheduler-scheduled-property) "t")
                                 (org-set-property org-auto-scheduler-scheduled-property "t"))
-                              (push (list task-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :pomodoro-parent nil)
+                              (push (list origin-id available-time today-end '("AUTOSCH") t headline schedule-string nil topo-depth :pomodoro-parent nil)
                                     org-auto-scheduler-completed-tasks))
                             (let ((last-end (org-auto-scheduler--place-pomodoro-placeholders
                                              origin-id headline marker topo-depth rem-effort pomo-work pomo-break
@@ -6398,31 +6457,23 @@ respecting working hours and task score.")
   "Internal flag to dynamically bypass all dependency blockers when recalculating visual order.")
 
 (defun org-auto-scheduler--evaluate-blockers (marker)
-  "Evaluate if all blockers for MARKER have been met for current scheduling.
-A blocker is met if it's either already DONE, or it has been scheduled
-in the current run (`org-auto-scheduler-completed-tasks`).
-If `org-auto-scheduler--ignore-blockers-p` is dynamically bound to t, ignores dependencies entirely.
-Returns a cons cell `(all-met-p . latest-end-time)` where `latest-end-time`
-is the maximum end time of any blocker scheduled (or nil if none)."
+  "Return (ALL-MET-P . LATEST-END-TIME) for the blockers of MARKER.
+A scheduled blocker is met only when all of its effort has been placed.
+Its end time is the latest end of its parent and placeholder chunks."
   (if org-auto-scheduler--ignore-blockers-p
       (cons t nil)
     (let ((blockers (org-auto-scheduler-get-blockers marker))
-          (all-met t)
+          (all-met (not org-auto-scheduler--has-incomplete-predecessor))
           (latest-end nil))
       (dolist (b-marker blockers)
-        (when all-met ; Short-circuit checking
+        (when all-met
           (let* ((b-id (org-with-point-at b-marker (org-id-get)))
-                 ;; Search for blocker in freshly scheduled tasks
-                 (scheduled-b (or (cl-find b-marker org-auto-scheduler-completed-tasks
-                                           :key (lambda (x) (nth 7 x)))
-                                  (and b-id (assoc b-id org-auto-scheduler-completed-tasks)))))
-            (if (and scheduled-b (not (memq (nth 9 scheduled-b) '(:failed :blocked :skipped))))
-                ;; Blocker was scheduled cleanly; we must start after it ends.
-                (let ((b-end-time (nth 2 scheduled-b)))
-                  (when (or (null latest-end) (time-less-p latest-end b-end-time))
-                    (setq latest-end b-end-time)))
-              ;; Blocker is NOT DONE (since it's in active blockers) AND NOT scheduled cleanly
-              (setq all-met nil)))))
+                 (placement (org-auto-scheduler--get-task-placement b-id b-marker))
+                 (end (cdr placement)))
+            (if (not (car placement))
+                (setq all-met nil)
+              (when (or (null latest-end) (time-less-p latest-end end))
+                (setq latest-end end))))))
       (cons all-met latest-end))))
 
 ;; NOTE: Using Org's built-in `org-with-point-at` macro.
