@@ -967,7 +967,7 @@ Placeholder subtasks are generated as regular Org subheadings with their own uni
 Placeholder subtasks are completely ephemeral:
 - *Automatic Cleanup:* Whenever you run =org-auto-scheduler-schedule-tasks= or open the Review buffer, all existing placeholder tasks across your agenda files are automatically swept and recalculated based on actual clocked time and latest availability.
 - *Clock Entry Safeguard:* If you clocked in on a temporary placeholder subtask, its =:LOGBOOK:= entries are preserved and migrated automatically to the parent task before the placeholder is removed.
-- *Completion Sync:* If you marked a placeholder subtask =DONE=, the parent task is automatically marked =DONE=.
+- *Completion:* Mark the parent task =DONE= when the entire task is complete. Completing a placeholder alone leaves its parent open.
 - *Manual Cleanup:* You can also run =M-x org-auto-scheduler-cleanup-placeholders= or press =k= in the dispatch menu (=M-x org-auto-scheduler-dispatch=) anytime.
 
 *** Review Shortcuts for Splittable Tasks
